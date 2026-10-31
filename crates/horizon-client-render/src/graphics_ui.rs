@@ -284,7 +284,7 @@ pub fn rows(level: Level) -> Vec<Row> {
             h(
                 H::Upscaling,
                 High,
-                "Native, Quality, Balanced, Performance, Ultra. Used by both upscalers.",
+                "Off skips both. Otherwise Native through Ultra, shared.",
             ),
             h(H::DlssStatus, None, "Actual renderer and fallback reason."),
             h(

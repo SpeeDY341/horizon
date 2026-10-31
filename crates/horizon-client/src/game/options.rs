@@ -381,12 +381,13 @@ impl Game<'_> {
                 s.file.int("textureFiltering"),
                 s.file.int("maxAnisotropyBit"),
             );
+            let dlss_on = s.horizon.dlss_mode() != horizon_client::graphics::Dlss::Off;
             r.set_dlss(s.horizon.dlss_mode());
             r.set_dlss_options(s.horizon.dlss_preset, s.horizon.dlss_monitor);
             r.set_world_post(
                 s.horizon.resolution_scale as f32 / 100.0,
                 s.horizon.fxaa,
-                s.horizon.taa || s.horizon.dlss_upscaler(),
+                s.horizon.taa || dlss_on,
                 s.horizon.upscaling.ratio(),
             );
             r.set_hdr(

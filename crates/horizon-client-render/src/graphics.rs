@@ -256,6 +256,8 @@ impl FarDetail {
 /// and TAA builds the full-size picture from the jittered frames (FSR's and DLSS's ratios).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Upscaling {
+    /// No upscaler. Full resolution, without DLSS and without a TAA rebuild.
+    Off,
     #[default]
     Native,
     Quality,
@@ -264,7 +266,8 @@ pub enum Upscaling {
     UltraPerformance,
 }
 impl Upscaling {
-    pub const ALL: [Upscaling; 5] = [
+    pub const ALL: [Upscaling; 6] = [
+        Upscaling::Off,
         Upscaling::Native,
         Upscaling::Quality,
         Upscaling::Balanced,
@@ -273,6 +276,7 @@ impl Upscaling {
     ];
     pub fn name(self) -> &'static str {
         match self {
+            Upscaling::Off => "off",
             Upscaling::Native => "native",
             Upscaling::Quality => "quality",
             Upscaling::Balanced => "balanced",
@@ -282,6 +286,7 @@ impl Upscaling {
     }
     pub fn label(self) -> &'static str {
         match self {
+            Upscaling::Off => "Off",
             Upscaling::Native => "Native",
             Upscaling::Quality => "Quality",
             Upscaling::Balanced => "Balanced",
@@ -289,19 +294,25 @@ impl Upscaling {
             Upscaling::UltraPerformance => "Ultra Performance",
         }
     }
-    /// Output pixels per rendered pixel, along each axis.
+    /// Output pixels per rendered pixel, along each axis. Off and Native are 1×.
     pub fn ratio(self) -> f32 {
         match self {
-            Upscaling::Native => 1.0,
+            Upscaling::Off | Upscaling::Native => 1.0,
             Upscaling::Quality => 1.5,
             Upscaling::Balanced => 1.7,
             Upscaling::Performance => 2.0,
             Upscaling::UltraPerformance => 3.0,
         }
     }
+    /// The built-in upscaler renders smaller and lets TAA rebuild the picture.
+    pub fn scales(self) -> bool {
+        !matches!(self, Upscaling::Off | Upscaling::Native)
+    }
     /// The DLSS mode of the same quality. Native is full-resolution DLAA.
+    /// Off has no DLSS mode.
     pub fn as_dlss(self) -> Dlss {
         match self {
+            Upscaling::Off => Dlss::Off,
             Upscaling::Native => Dlss::Dlaa,
             Upscaling::Quality => Dlss::Quality,
             Upscaling::Balanced => Dlss::Balanced,
@@ -564,6 +575,9 @@ impl Graphics {
     }
     pub fn parse(text: &str) -> Self {
         let mut g = Self::default();
+        // `upscaling:off` is explicit. An older file stored the DLSS quality
+        // separately and must still win, but it must not turn Off back into DLAA.
+        let mut upscaling_off = false;
         for line in text.lines() {
             let Some((key, value)) = line.split_once(':') else {
                 continue;
@@ -599,7 +613,10 @@ impl Graphics {
                 "resolutionScale" => g.resolution_scale = number(g.resolution_scale).clamp(50, 200),
                 "fxaa" => g.fxaa = flag(g.fxaa),
                 "taa" => g.taa = flag(g.taa),
-                "upscaling" => g.upscaling = Upscaling::parse(value),
+                "upscaling" => {
+                    g.upscaling = Upscaling::parse(value);
+                    upscaling_off = g.upscaling == Upscaling::Off;
+                }
                 "dlss" => g.dlss = Dlss::parse(value),
                 "dlssPreset" => g.dlss_preset = DlssPreset::parse(value),
                 "dlssMonitor" => g.dlss_monitor = flag(g.dlss_monitor),
@@ -636,7 +653,9 @@ impl Graphics {
         }
         // Older menus stored the DLSS quality separately and could hide the
         // shared quality. The DLSS value was the one on screen, so it wins.
-        if let Some(quality) = g.dlss.quality() {
+        if !upscaling_off
+            && let Some(quality) = g.dlss.quality()
+        {
             g.upscaling = quality;
             g.fxaa = false;
             g.taa = false;
@@ -648,35 +667,50 @@ impl Graphics {
         self.dlss != Dlss::Off
     }
     /// Mode sent to DLSS. While DLSS is selected, quality comes from `upscaling`.
+    /// Off runs neither DLSS nor DLAA.
     pub fn dlss_mode(&self) -> Dlss {
-        if self.dlss_upscaler() {
-            self.upscaling.as_dlss()
-        } else {
+        if self.upscaling == Upscaling::Off || !self.dlss_upscaler() {
             Dlss::Off
+        } else {
+            self.upscaling.as_dlss()
         }
     }
-    /// Leave DLSS for the built-in upscaler. A non-native quality needs TAA.
+    /// Leave DLSS for the built-in upscaler. A reduced quality needs TAA.
     pub fn select_standard_upscaler(&mut self) {
         self.dlss = Dlss::Off;
-        if self.upscaling != Upscaling::Native {
+        if self.upscaling.scales() {
             self.fxaa = false;
             self.taa = true;
         }
     }
     /// Select DLSS at the shared quality and clear TAA and FXAA.
+    /// Off keeps DLSS selected without running it.
     pub fn select_dlss_upscaler(&mut self) {
         self.fxaa = false;
         self.taa = false;
-        self.dlss = self.upscaling.as_dlss();
+        self.dlss = if self.upscaling == Upscaling::Off {
+            Dlss::Dlaa
+        } else {
+            self.upscaling.as_dlss()
+        };
     }
     /// One quality for whichever upscaler is selected.
     pub fn set_upscale_quality(&mut self, quality: Upscaling) {
+        let previous = self.upscaling;
         self.upscaling = quality;
+        if quality == Upscaling::Off {
+            // TAA that only rebuilt a smaller frame is the upscaler. Turn that off.
+            // A chosen anti-aliasing mode at Native stays.
+            if previous.scales() && !self.dlss_upscaler() {
+                self.taa = false;
+            }
+            return;
+        }
         if self.dlss_upscaler() {
             self.fxaa = false;
             self.taa = false;
             self.dlss = quality.as_dlss();
-        } else if quality != Upscaling::Native {
+        } else if quality.scales() {
             self.fxaa = false;
             self.taa = true;
         }
@@ -878,6 +912,21 @@ mod tests {
         assert_eq!(old.upscaling, Upscaling::Performance);
         assert!(!old.taa);
         assert!(!old.fxaa);
+        // Off is explicit and is not the fallback for an unknown quality.
+        let off = Graphics::parse("upscaling:off\ndlss:quality\ntaa:true\n");
+        assert_eq!(off.upscaling, Upscaling::Off);
+        assert_eq!(off.dlss, Dlss::Quality);
+        assert_eq!(off.dlss_mode(), Dlss::Off);
+        assert!(off.taa);
+        assert_eq!(Graphics::parse("upscaling:nope\n").upscaling, Upscaling::Native);
+        let mut chosen = Graphics::default();
+        chosen.select_dlss_upscaler();
+        chosen.set_upscale_quality(Upscaling::Off);
+        assert!(chosen.dlss_upscaler());
+        assert_eq!(chosen.dlss_mode(), Dlss::Off);
+        assert!(!chosen.taa);
+        chosen.set_upscale_quality(Upscaling::Quality);
+        assert_eq!(chosen.dlss_mode(), Dlss::Quality);
         // 0 is Auto; anything else is a peak the slider reaches.
         assert_eq!(Graphics::parse("hdrPeak:0\n").hdr_peak, 0);
         assert_eq!(Graphics::parse("hdrPeak:50\n").hdr_peak, 200);
