@@ -10,8 +10,9 @@ lifetime fix passed fresh independent `fix_f1_review2` on `aad4e963f`.
 F2's gameplay/screen/loading gate passed fresh independent `fix_f2_review2` on
 `534b9ff4a`. F3's report microseconds fix passed fresh independent
 `fix_f3_review` on `b15183c53`. F4's entity motion registration and GPU
-regressions are implemented; fresh independent F4 review is pending. F5 and
-hardware acceptance remain open. Earlier per-part
+regressions passed fresh independent `fix_f4_review` on `a7b0d7907` (including
+`934ebb35b`). F5 startup diagnostics are implemented and await fresh independent
+review. F1–F4 are accepted; F5 and hardware acceptance remain open. Earlier per-part
 PASS results do not close the repeat review.
 
 ## Implementation and independent review
@@ -166,7 +167,36 @@ pixel: particles, name tags/text and transparent effects retain their existing
 behavior. No particle identity/lifecycle system was added. Texture/material or
 topology changes can deliberately select camera fallback. No game, real FG,
 visual-quality, full pr_ready, parity oracle or Linux/macOS run was performed
-for F4. Fresh independent F4 review and hardware acceptance remain open.
+for F4. Fresh independent `fix_f4_review` accepted `a7b0d7907` (PASS); F5 and
+hardware acceptance remain open.
+
+F5 keeps startup requests and load failures beside the device, separately from
+an optional runtime. SDK/path/optional-plugin errors and the original native
+device fallback failure now produce `unavailable (reason)`. Only a function
+first selected after it was Off when the device was created requires restart.
+Off hides failures; reenable preserves the reason. Resource reload reuses the
+same metadata; new devices start fresh. SR no longer infers a startup failure
+from the global overlay. Native support/bind reports retain their reason.
+Ordinary rendering and retry policy are unchanged.
+
+```powershell
+cargo test --locked -p horizon-client-render --lib gfx::dlss::tests:: -- --test-threads=1
+cargo test --locked -p horizon-client-render --lib graphics::tests:: -- --test-threads=1
+cargo clippy --locked -p horizon-client-render -p horizon-client --lib --bins --tests -- -D warnings
+cargo fmt --all -- --check
+```
+
+Results: **7 DLSS/status tests**, **8 graphics tests**, targeted Clippy,
+formatting, public-tree and diff checks passed. Status tests include empty,
+missing and relative SDK directories through the real loader, absent optional
+DLL names/dependencies, unsupported API, first enable after Off,
+disable/reenable, device fallback reason, reload metadata and a fresh device.
+Optional DLL tests use the production file-check boundary with an empty
+directory; no fake DLL is created or loaded and no signature check is bypassed.
+Support/bind reason precedence and fallback/reload metadata are CPU regressions,
+not a new windowed hardware acceptance run. Fresh independent F5 review remains
+required. No game, actual FG, full pr_ready, parity oracle or Linux/macOS run
+was performed for F5.
 
 F1's explicit regression command is:
 

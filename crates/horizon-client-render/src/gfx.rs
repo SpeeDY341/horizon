@@ -453,6 +453,7 @@ pub struct Renderer {
     /// surface for the window can come back lost (Wayland on Mesa).
     spare_surface: std::sync::Mutex<Option<wgpu::Surface<'static>>>,
     streamline: Option<dlss::Shared>,
+    streamline_startup: dlss::Startup,
     dlss: dlss::State,
     /// Reflex as saved. The SDK is loaded only when this was On or Boost at startup.
     reflex_mode: crate::graphics::Reflex,
@@ -1009,6 +1010,7 @@ fn backends_name(backends: wgpu::Backends) -> &'static str {
 /// A device and what it came from.
 struct Opened {
     streamline: Option<dlss::Shared>,
+    streamline_startup: dlss::Startup,
     instance: wgpu::Instance,
     surface: Option<wgpu::Surface<'static>>,
     adapter: wgpu::Adapter,
@@ -1152,14 +1154,23 @@ async fn open_with_retry(
     )
     .await;
     let streamline = enable_dlss || enable_reflex || enable_framegen;
+    let mut startup_failure = None;
     let first = match first {
         Err(NoDevice::Failed(e) | NoDevice::NoAdapter(e)) if streamline => {
-            crate::graphics::report_dlss("TAA: startup");
+            startup_failure = Some(format!("device startup: {e}"));
             log::warn!("Streamline startup failed, retrying without it: {e}");
             open_backend(
                 backends, window, offscreen, false, layers, false, false, false,
             )
             .await
+            .map(|mut opened| {
+                opened.streamline_startup =
+                    dlss::Startup::new(enable_dlss, enable_reflex, enable_framegen);
+                opened
+                    .streamline_startup
+                    .fail(&format!("device startup: {e}"));
+                opened
+            })
         }
         result => result,
     };
@@ -1175,7 +1186,12 @@ async fn open_with_retry(
             )
             .await
             {
-                Ok(opened) => {
+                Ok(mut opened) => {
+                    if let Some(error) = &startup_failure {
+                        opened.streamline_startup =
+                            dlss::Startup::new(enable_dlss, enable_reflex, enable_framegen);
+                        opened.streamline_startup.fail(error);
+                    }
                     log::warn!(
                         "Horizon renderer: using {} although its driver reports no Vulkan \
                          conformance version",
@@ -1203,7 +1219,10 @@ async fn open_backend(
     enable_framegen: bool,
 ) -> std::result::Result<Opened, NoDevice> {
     let name = backends_name(backends);
-    let streamline = dlss::load(enable_dlss, enable_reflex, enable_framegen, backends);
+    let dlss::Loaded {
+        shared: streamline,
+        startup: streamline_startup,
+    } = dlss::load(enable_dlss, enable_reflex, enable_framegen, backends);
     let descriptor = instance_descriptor(backends, Some(window), allow_nonconformant);
     #[cfg(target_os = "windows")]
     let instance = match &streamline {
@@ -1307,6 +1326,7 @@ async fn open_backend(
             }
             Ok(Opened {
                 streamline,
+                streamline_startup,
                 instance,
                 surface,
                 adapter,
@@ -1409,6 +1429,7 @@ impl Renderer {
         }
         let Opened {
             streamline,
+            streamline_startup,
             instance,
             surface,
             adapter,
@@ -1424,6 +1445,7 @@ impl Renderer {
                 frame_gen::prepare_presentation(&renderer.streamline, &renderer.device)?;
                 Opened {
                     streamline: renderer.streamline.clone(),
+                    streamline_startup: renderer.streamline_startup.clone(),
                     surface: if offscreen {
                         None
                     } else {
@@ -2946,8 +2968,9 @@ impl Renderer {
         #[cfg(not(target_os = "windows"))]
         let framegen_loaded = false;
         let mut renderer = Self {
-            dlss: dlss::State::new(streamline.clone(), enable_dlss, &info),
+            dlss: dlss::State::new(streamline.clone(), &streamline_startup, &info),
             streamline,
+            streamline_startup,
             display: DisplayWatch::default(),
             display_fresh: false,
             instance,
@@ -3996,7 +4019,11 @@ impl Renderer {
             }
             if self.reflex_loaded || runtime.reflex_requested() {
                 runtime.set_reflex_mode(mode.sdk());
-                let line = runtime.reflex_line();
+                let line = self.streamline_startup.reflex.line(
+                    mode != crate::graphics::Reflex::Off,
+                    "Reflex",
+                    Some(runtime.reflex_line()),
+                );
                 drop(runtime);
                 crate::graphics::report_reflex(line);
                 return;
@@ -4006,32 +4033,11 @@ impl Renderer {
     }
 
     fn report_reflex_unloaded(&self) {
-        let line = if self.reflex_mode == crate::graphics::Reflex::Off {
-            String::new()
-        } else if cfg!(not(target_os = "windows")) || self.reflex_failed_to_bind() {
-            "Reflex: unavailable".into()
-        } else {
-            "Reflex: restart".into()
-        };
-        crate::graphics::report_reflex(line);
-    }
-
-    /// Plugins were requested and the SDK started, but the device never bound
-    /// Reflex. Choosing it while it was off at startup is not this case.
-    fn reflex_failed_to_bind(&self) -> bool {
-        #[cfg(target_os = "windows")]
-        {
-            self.streamline.as_ref().is_some_and(|runtime| {
-                runtime
-                    .lock()
-                    .ok()
-                    .is_some_and(|runtime| runtime.reflex_requested() && !runtime.reflex_loaded())
-            })
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            false
-        }
+        crate::graphics::report_reflex(self.streamline_startup.reflex.line(
+            self.reflex_mode != crate::graphics::Reflex::Off,
+            "Reflex",
+            None,
+        ));
     }
 
     #[cfg(target_os = "windows")]
@@ -4046,7 +4052,11 @@ impl Renderer {
         if let Some(error) = runtime.take_reflex_error() {
             log::warn!("Reflex: {error}");
         }
-        let line = runtime.reflex_line();
+        let line = self.streamline_startup.reflex.line(
+            self.reflex_mode != crate::graphics::Reflex::Off,
+            "Reflex",
+            Some(runtime.reflex_line()),
+        );
         drop(runtime);
         if self.reflex_loaded {
             crate::graphics::report_reflex(line);
@@ -4124,7 +4134,11 @@ impl Renderer {
             if self.framegen_loaded || runtime.framegen_requested() {
                 runtime.set_framegen_wanted(mode.generated());
                 crate::graphics::report_framegen_cap(runtime.framegen_max_generated());
-                let line = runtime.framegen_line();
+                let line = self.streamline_startup.framegen.line(
+                    mode != crate::graphics::FrameGen::Off,
+                    "Frame Gen",
+                    Some(runtime.framegen_line()),
+                );
                 drop(runtime);
                 crate::graphics::report_framegen(line);
                 return;
@@ -4135,31 +4149,11 @@ impl Renderer {
 
     fn report_framegen_unloaded(&self) {
         crate::graphics::report_framegen_cap(0);
-        let line = if self.framegen_mode == crate::graphics::FrameGen::Off {
-            String::new()
-        } else if cfg!(not(target_os = "windows")) || self.framegen_failed_to_bind() {
-            "Frame Gen: unavailable".into()
-        } else {
-            "Frame Gen: restart".into()
-        };
-        crate::graphics::report_framegen(line);
-    }
-
-    /// The plugin was in this process's startup list, but it never bound.
-    /// Choosing it while it was off at startup is not this case.
-    fn framegen_failed_to_bind(&self) -> bool {
-        #[cfg(target_os = "windows")]
-        {
-            self.streamline.as_ref().is_some_and(|runtime| {
-                runtime.lock().ok().is_some_and(|runtime| {
-                    runtime.framegen_requested() && !runtime.framegen_loaded()
-                })
-            })
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            false
-        }
+        crate::graphics::report_framegen(self.streamline_startup.framegen.line(
+            self.framegen_mode != crate::graphics::FrameGen::Off,
+            "Frame Gen",
+            None,
+        ));
     }
 
     /// Tag depth and motion, then set this present's options. Barriers stay on
@@ -4273,7 +4267,11 @@ impl Renderer {
             if let Some(error) = runtime.take_framegen_error() {
                 log::warn!("Frame Generation: {error}");
             }
-            let line = runtime.framegen_line();
+            let line = self.streamline_startup.framegen.line(
+                self.framegen_mode != crate::graphics::FrameGen::Off,
+                "Frame Gen",
+                Some(runtime.framegen_line()),
+            );
             drop(runtime);
             crate::graphics::report_framegen(line);
         }

@@ -2,16 +2,17 @@
 
 Дата: 31 октября 2026 года. Обновлено 1 ноября. **Код A–H принят независимыми
 review после исправлений, включая review_g2 и review_h3 PASS. Часть I обновляет
-документацию и сводит итоговые проверки; её review ещё требуется. Настоящий FG 2×,
+документацию и сводит итоговые проверки; `review_i` принят (PASS). Настоящий FG 2×,
 полная аппаратная lifecycle/визуальная приёмка и сборки Linux/macOS открыты.**
 Итоговые результаты и команды: [dlss-validation.md](dlss-validation.md).
 
 Повторный полный review `8b33c7954` открыл F1–F5. Исправление F1 принято
 `fix_f1_review2` на `aad4e963f`: **PASS**. F2 с семантическим разрешением FG
 по gameplay/screen/loading state принят `fix_f2_review2` на `534b9ff4a`:
-**PASS**. F3 принят `fix_f3_review` на `b15183c53`: **PASS**. Для F4
-реализованы регистрация движущихся сущностей и GPU-регрессии; свежий независимый
-review F4 требуется. F5 и аппаратная приёмка открыты.
+**PASS**. F3 принят `fix_f3_review` на `b15183c53`: **PASS**. F4 принят
+`fix_f4_review` на `a7b0d7907`: **PASS** (включая `934ebb35b`). F5: startup
+requests/reasons сохранены в коде, свежий независимый review требуется.
+F1–F4 приняты; F5 и полная аппаратная приёмка остаются открыты.
 Прежние PASS не означают полной приёмки интеграции; активная FG 2× остаётся
 недоказанной.
 
@@ -594,7 +595,7 @@ swapchain получает hook; стресс-проверка не зависа
   `e5a51229a5ec6c5f7682bdb6da29c968356fe34e`. На этапе F флаг G не включался;
   полный pr_ready/parity не запускались. SDK и игровые файлы не добавлялись.
 
-### Повторное исправление F4 (1 ноября 2026, fresh review pending)
+### Повторное исправление F4 (1 ноября 2026, fix_f4_review PASS)
 
 - Production commit `934ebb35b`: отдельные typed keys для каждого renderer,
   entity ID/UUID и позиции block entity. Известный UUID не даёт новой сетевой
@@ -624,7 +625,30 @@ swapchain получает hook; стресс-проверка не зависа
   nametags/text и transparent effects сохраняют прежние ограничения; новая
   particle lifecycle-система не добавлялась. Игра/настоящая FG, визуальная
   приёмка, full pr_ready, parity oracle и Linux/macOS не запускались. Свежий
-  независимый review F4 требуется; F5 и аппаратная приёмка остаются открыты.
+  независимый `fix_f4_review` принял `a7b0d7907`: **PASS**. F5 и аппаратная
+  приёмка остаются открыты.
+
+### Повторное исправление F5 (1 ноября 2026, fresh review pending)
+
+- Startup intent и отказ сохраняются рядом с device, независимо от наличия
+  runtime и текущей настройки. Отсутствующий SDK, неверный путь, optional DLL,
+  unsupported API и device fallback дают `unavailable` с причиной. Только
+  первое включение функции, не запрошенной при создании device, даёт `restart`.
+- Resource reload копирует исходную metadata; Off скрывает статус, повторное
+  включение сохраняет реальную причину отказа. Новый device не наследует
+  process-global сообщения старого renderer; SR также использует metadata.
+  Runtime support/bind diagnostics сохраняются. Обычный renderer и retry policy
+  не меняются; failed startup не запускает новый restart/retry цикл.
+- Регрессии production status/loader покрывают пустой/отсутствующий/relative
+  SDK path, имена optional DLL и зависимость FG от Reflex, unsupported API,
+  первый выбор после Off, Off/re-enable, fallback reason, metadata reuse и
+  независимость нового device. Поддельные DLL не создаются и проверки подписей
+  не обходятся. Fallback/reload проверены на metadata boundary, без оконного
+  прогона. Пройдены 7 DLSS/status и 8 graphics tests, targeted client/render
+  Clippy с `-D warnings`, fmt/public-tree/diff checks.
+- Команды и ограничения: [dlss-validation.md](dlss-validation.md). Свежий
+  независимый review F5 требуется. Настоящий FG 2×, lifecycle/визуальная
+  приёмка, Linux/macOS и общий pr_ready остаются открыты.
 
 ## 7. Исправить контракт Streamline и доказать работу FG — R2
 

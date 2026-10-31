@@ -39,24 +39,111 @@ pub(super) fn hook_presentation(
     Ok(())
 }
 
-pub(super) fn load(
-    dlss: bool,
-    reflex: bool,
-    framegen: bool,
-    backend: wgpu::Backends,
-) -> Option<Shared> {
-    if (!dlss && !reflex && !framegen)
-        || !matches!(backend, wgpu::Backends::VULKAN | wgpu::Backends::DX12)
-    {
-        return None;
+/// Immutable device-startup intent and failures. Kept beside the device, never
+/// inferred from the current UI selection or the process-wide status overlay.
+#[derive(Clone, Default)]
+pub(super) struct Request {
+    requested: bool,
+    failure: Option<String>,
+}
+impl Request {
+    pub(super) fn line(&self, enabled: bool, name: &str, runtime: Option<String>) -> String {
+        if !enabled {
+            return String::new();
+        }
+        if let Some(error) = &self.failure {
+            return format!("{name}: unavailable ({error})");
+        }
+        if let Some(line) = runtime.filter(|line| !line.is_empty()) {
+            return line;
+        }
+        if self.requested {
+            format!("{name}: unavailable (startup plugin did not bind)")
+        } else if !cfg!(target_os = "windows") {
+            format!("{name}: unavailable (Windows required)")
+        } else {
+            format!("{name}: restart")
+        }
+    }
+    fn fail(&mut self, error: &str) {
+        if self.requested && self.failure.is_none() {
+            self.failure = Some(error.into());
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(super) struct Startup {
+    sr: Request,
+    pub reflex: Request,
+    pub framegen: Request,
+}
+impl Startup {
+    pub(super) fn new(sr: bool, reflex: bool, framegen: bool) -> Self {
+        let request = |requested| Request {
+            requested,
+            failure: None,
+        };
+        Self {
+            sr: request(sr),
+            reflex: request(reflex || framegen),
+            framegen: request(framegen),
+        }
+    }
+    pub(super) fn fail(&mut self, error: &str) {
+        self.sr.fail(error);
+        self.reflex.fail(error);
+        self.framegen.fail(error);
+    }
+    #[cfg(any(target_os = "windows", test))]
+    fn check_plugins(&mut self, directory: &std::path::Path) {
+        let missing = |names: &[&'static str]| {
+            names
+                .iter()
+                .copied()
+                .filter(|name| !directory.join(name).is_file())
+                .collect::<Vec<_>>()
+        };
+        let reflex = missing(&["sl.reflex.dll", "sl.pcl.dll"]);
+        let fg = missing(&["sl.dlss_g.dll", "nvngx_dlssg.dll"]);
+        let mut errors = Vec::new();
+        if !fg.is_empty() {
+            errors.push(format!("missing {}", fg.join(", ")));
+        }
+        if !reflex.is_empty() {
+            let error = format!("missing {}", reflex.join(", "));
+            self.reflex.fail(&error);
+            errors.push(format!("Reflex required: {error}"));
+        }
+        if !errors.is_empty() {
+            self.framegen.fail(&errors.join("; "));
+        }
+    }
+}
+
+pub(super) struct Loaded {
+    pub shared: Option<Shared>,
+    pub startup: Startup,
+}
+
+pub(super) fn load(dlss: bool, reflex: bool, framegen: bool, backend: wgpu::Backends) -> Loaded {
+    let mut loaded = Loaded {
+        shared: None,
+        startup: Startup::new(dlss, reflex, framegen),
+    };
+    if !dlss && !reflex && !framegen {
+        return loaded;
+    }
+    if !cfg!(target_os = "windows") {
+        loaded.startup.fail("Windows required");
+        return loaded;
+    }
+    if !matches!(backend, wgpu::Backends::VULKAN | wgpu::Backends::DX12) {
+        loaded.startup.fail("Vulkan or DirectX 12 required");
+        return loaded;
     }
     #[cfg(target_os = "windows")]
     {
-        let api = if backend == wgpu::Backends::DX12 {
-            horizon_streamline::Api::Dx12
-        } else {
-            horizon_streamline::Api::Vulkan
-        };
         let path = std::env::var_os("HORIZON_STREAMLINE_SDK")
             .map(std::path::PathBuf::from)
             .or_else(|| {
@@ -64,49 +151,52 @@ pub(super) fn load(
                     .ok()
                     .and_then(|p| p.parent().map(|p| p.join("streamline")))
             });
-        let result = path
-            .ok_or("Streamline directory missing".to_owned())
-            .and_then(|p| {
-                horizon_streamline::Runtime::load_with(
-                    &p,
-                    "00a6bdb2-6386-4e37-8ff9-dcda4642628a",
-                    api,
-                    dlss,
-                    reflex,
-                    framegen,
-                )
-            });
-        match result {
-            Ok(runtime) => {
-                if reflex && !runtime.reflex_requested() {
-                    log::warn!("Reflex plugins were not found beside the Streamline SDK");
-                }
-                if framegen && !runtime.framegen_requested() {
-                    log::warn!("Frame Generation plugins were not found beside the Streamline SDK");
-                }
-                if framegen && !runtime.reflex_requested() {
-                    log::warn!("Reflex plugins were not found; Frame Generation needs them");
-                }
-                let shared = std::sync::Arc::new(std::sync::Mutex::new(runtime));
-                horizon_streamline::install_reflex(&shared);
-                Some(shared)
-            }
-            Err(e) => {
-                if dlss {
-                    graphics::report_dlss("TAA: SDK error");
-                }
-                log::warn!("Streamline unavailable: {e}");
-                None
-            }
-        }
+        load_directory(loaded, path.as_deref(), backend)
     }
     #[cfg(not(target_os = "windows"))]
-    {
-        if dlss {
-            graphics::report_dlss("TAA: Windows");
+    loaded
+}
+
+#[cfg(target_os = "windows")]
+fn load_directory(
+    mut loaded: Loaded,
+    path: Option<&std::path::Path>,
+    backend: wgpu::Backends,
+) -> Loaded {
+    let result = path
+        .ok_or("Streamline directory missing".to_owned())
+        .and_then(|path| {
+            // Check only real files; the native loader still enforces SDK signatures.
+            // Avoid replacing an SDK/path failure with a misleading plugin failure.
+            if path.is_absolute() && path.join("sl.interposer.dll").is_file() {
+                loaded.startup.check_plugins(path);
+            }
+            horizon_streamline::Runtime::load_with(
+                path,
+                "00a6bdb2-6386-4e37-8ff9-dcda4642628a",
+                if backend == wgpu::Backends::DX12 {
+                    horizon_streamline::Api::Dx12
+                } else {
+                    horizon_streamline::Api::Vulkan
+                },
+                loaded.startup.sr.requested,
+                loaded.startup.reflex.requested,
+                loaded.startup.framegen.requested,
+            )
+            .map_err(|error| format!("SDK {}: {error}", path.display()))
+        });
+    match result {
+        Ok(runtime) => {
+            let shared = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+            horizon_streamline::install_reflex(&shared);
+            loaded.shared = Some(shared);
         }
-        None
+        Err(error) => {
+            log::warn!("Streamline unavailable: {error}");
+            loaded.startup.fail(&error);
+        }
     }
+    loaded
 }
 
 /// Matrices without jitter, plus the jitter in pixels. Super Resolution and
@@ -173,7 +263,7 @@ impl State {
         self.reset = true;
     }
 
-    pub fn new(shared: Option<Shared>, requested: bool, info: &wgpu::AdapterInfo) -> Self {
+    pub fn new(shared: Option<Shared>, startup: &Startup, info: &wgpu::AdapterInfo) -> Self {
         Self {
             requested: Dlss::Off,
             shared,
@@ -188,9 +278,11 @@ impl State {
             {
                 Some("TAA: RTX".into())
             } else {
-                requested
-                    .then(graphics::dlss_status)
-                    .filter(|s| s.starts_with("TAA:"))
+                startup
+                    .sr
+                    .failure
+                    .as_ref()
+                    .map(|error| format!("TAA: {error}"))
             },
             configuration: None,
             reset: true,
@@ -426,15 +518,149 @@ impl State {
 mod tests {
     use super::*;
 
+    #[test]
+    fn startup_diagnostics_preserve_requests_across_off_and_resource_reload() {
+        let mut startup = Startup::new(true, true, true);
+        startup.fail("device startup: adapter unsupported (code 7)");
+        let reloaded = startup.clone(); // Renderer::new reuses the same device and metadata.
+        for request in [&reloaded.reflex, &reloaded.framegen] {
+            assert_eq!(request.line(false, "Feature", None), "");
+            let line = request.line(true, "Feature", None);
+            assert_eq!(
+                line,
+                "Feature: unavailable (device startup: adapter unsupported (code 7))"
+            );
+            assert_eq!(request.line(false, "Feature", Some(line.clone())), "");
+            assert_eq!(request.line(true, "Feature", None), line);
+            assert_eq!(
+                request.line(true, "Feature", Some("Feature: off".into())),
+                line
+            );
+        }
+        let bound = Startup::new(false, true, true);
+        for request in [&bound.reflex, &bound.framegen] {
+            for reason in [
+                "bind function missing (code 7)",
+                "adapter unsupported (code 9)",
+            ] {
+                let line = format!("Feature: unavailable ({reason})");
+                assert_eq!(request.line(true, "Feature", Some(line.clone())), line);
+            }
+        }
+        let new_device = Startup::default();
+        let expected = if cfg!(target_os = "windows") {
+            "Reflex: restart"
+        } else {
+            "Reflex: unavailable (Windows required)"
+        };
+        assert_eq!(new_device.reflex.line(true, "Reflex", None), expected);
+        assert!(new_device.sr.failure.is_none());
+        assert!(
+            startup
+                .sr
+                .failure
+                .as_ref()
+                .unwrap()
+                .contains("adapter unsupported")
+        );
+    }
+
+    #[test]
+    fn startup_unsupported_api_is_unavailable_and_off_is_hidden() {
+        let loaded = load(true, true, true, wgpu::Backends::GL);
+        assert!(loaded.shared.is_none());
+        for request in [&loaded.startup.reflex, &loaded.startup.framegen] {
+            let line = request.line(true, "Feature", None);
+            assert!(
+                line.contains(if cfg!(target_os = "windows") {
+                    "Vulkan or DirectX 12 required"
+                } else {
+                    "Windows required"
+                }),
+                "{line}"
+            );
+            assert!(!line.contains("restart"));
+            assert!(request.line(false, "Feature", None).is_empty());
+        }
+    }
+
+    #[test]
+    fn absent_optional_plugins_keep_original_request_and_exact_names() {
+        let scratch = std::env::temp_dir().join(format!(
+            "horizon-f5-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&scratch).unwrap();
+        let mut startup = Startup::new(true, true, true);
+        startup.check_plugins(&scratch); // No DLLs, real or fake, are loaded.
+        startup.fail("Streamline has no requested plugins");
+        let reflex = startup.reflex.line(true, "Reflex", None);
+        let fg = startup.framegen.line(true, "Frame Gen", None);
+        for name in ["sl.reflex.dll", "sl.pcl.dll"] {
+            assert!(reflex.contains(name), "{reflex}");
+        }
+        for name in ["sl.dlss_g.dll", "nvngx_dlssg.dll", "Reflex required"] {
+            assert!(fg.contains(name), "{fg}");
+        }
+        assert!(startup.reflex.requested && startup.framegen.requested);
+        std::fs::remove_dir(scratch).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn missing_sdk_and_wrong_path_report_load_error_instead_of_restart() {
+        let scratch = std::env::temp_dir().join(format!(
+            "horizon-f5-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&scratch).unwrap();
+        for path in [
+            scratch.clone(),
+            scratch.join("missing"),
+            std::path::PathBuf::from("relative-sdk"),
+        ] {
+            let loaded = load_directory(
+                Loaded {
+                    shared: None,
+                    startup: Startup::new(true, true, true),
+                },
+                Some(&path),
+                wgpu::Backends::DX12,
+            );
+            assert!(loaded.shared.is_none());
+            for request in [&loaded.startup.reflex, &loaded.startup.framegen] {
+                let line = request.line(true, "Feature", None);
+                assert!(
+                    line.contains("unavailable") && line.contains("SDK"),
+                    "{line}"
+                );
+                assert!(!line.contains("restart"), "{line}");
+            }
+            let state = State::new(
+                None,
+                &loaded.startup,
+                &adapter(wgpu::Backend::Dx12, 0x10de, "RTX 5090"),
+            );
+            assert!(state.startup_failure.as_ref().unwrap().contains("SDK"));
+        }
+        std::fs::remove_dir(scratch).unwrap();
+    }
+
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn unsupported_platform_never_loads_a_streamline_session() {
         for backend in [wgpu::Backends::VULKAN, wgpu::Backends::METAL] {
-            assert!(load(true, true, true, backend).is_none());
+            assert!(load(true, true, true, backend).shared.is_none());
         }
         let state = State::new(
             None,
-            true,
+            &Startup::new(true, false, false),
             &adapter(wgpu::Backend::Vulkan, 0x10de, "RTX 5090"),
         );
         assert_eq!(state.startup_failure.as_deref(), Some("TAA: Windows"));
@@ -453,7 +679,7 @@ mod tests {
             adapter(wgpu::Backend::Vulkan, 0x1002, "Radeon"),
             adapter(wgpu::Backend::Gl, 0x10de, "RTX 5090"),
         ] {
-            let mut state = State::new(None, true, &info);
+            let mut state = State::new(None, &Startup::new(true, false, false), &info);
             state.set(Dlss::Quality);
             assert!(state.startup_failure.as_ref().unwrap().starts_with("TAA:"));
             assert!(state.configuration.is_none());
@@ -465,7 +691,7 @@ mod tests {
         for backend in [wgpu::Backend::Dx12, wgpu::Backend::Vulkan] {
             let state = State::new(
                 None,
-                false,
+                &Startup::default(),
                 &adapter(backend, 0x10de, "NVIDIA GeForce RTX 5090"),
             );
             assert!(state.startup_failure.is_none(), "{backend:?}");
@@ -476,7 +702,7 @@ mod tests {
     fn an_error_stays_on_taa_until_the_user_changes_the_selection() {
         let mut state = State::new(
             None,
-            false,
+            &Startup::default(),
             &adapter(wgpu::Backend::Vulkan, 0x10de, "RTX 5090"),
         );
         state.set(Dlss::Quality);
