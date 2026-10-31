@@ -627,6 +627,10 @@ impl Runtime {
         self.framegen.loaded()
     }
 
+    pub fn framegen_max_generated(&self) -> u32 {
+        self.framegen.max_generated()
+    }
+
     /// `generated` is the number of extra frames. Zero turns generation off.
     pub fn set_framegen_wanted(&mut self, generated: u32) {
         self.framegen.set_wanted(generated);
@@ -660,7 +664,7 @@ impl Runtime {
             return Err("Frame Generation has no graphics device".into());
         };
         let dx12 = self.api == Api::Dx12;
-        input.allow &= !self.frame.failed;
+        input.allow &= !self.frame.failed && self.reflex.active();
         let token = if input.allow {
             if let Some(constants) = input.constants {
                 match self.common_constants(constants) {
@@ -669,7 +673,14 @@ impl Runtime {
                         self.fail_render_frame();
                         self.framegen.suspend()?;
                         self.framegen.note(error);
-                        return Ok(None);
+                        input.allow = false;
+                        return self.framegen.record(
+                            dx12,
+                            self.frame.token as *mut _,
+                            &device,
+                            encoder,
+                            input,
+                        );
                     }
                 }
             } else {

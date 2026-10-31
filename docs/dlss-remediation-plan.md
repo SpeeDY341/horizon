@@ -574,8 +574,47 @@ swapchain получает hook; стресс-проверка не зависа
   **18 ordinary tests passed, 5 SDK tests ignored** в этом повторном прогоне.
   Clippy Streamline/render/client lib/bins/tests с `-D warnings`, fmt,
   diff check и public-tree прошли.
-  Проверка GTX на настоящем оборудовании не выполнялась. Нужен новый review G;
+  Проверка GTX на настоящем оборудовании не выполнялась. Независимый
+  `review_g2` дал **PASS** коду `8d100b1dd0ef9f81f2416a40a151831fd95bef93`;
   прежние ограничения actual FG 2× остаются открытыми.
+
+### Результат кода H и границы проверки (1 ноября 2026)
+
+- `numFramesToGenerateMax = 0` означает отсутствие подтверждённого лимита:
+  FG ждёт новый успешный GetState, прежний высокий cap не сохраняется.
+  3×/4×/6× появляются при переключении меню только в пределах cap SDK;
+  2× остаётся выбираемым запросом для загрузки при restart. Native On тоже
+  ждёт ненулевой cap. Запрос из сохранённых настроек ограничивается cap,
+  runtime показывает **configured/requested**, отдельно SDK shown/rendered FPS.
+  Нулевые SDK presents остаются нулевыми, настройка не доказывает генерацию.
+- Неуспех GetState, ненулевой `DLSSGState.status`, SetOptions или live tags
+  переводит FG в fallback: checked Off, reset, очистка tags того же token.
+  Неуспешный live tag list не отправляется. Следующий On требует явной смены
+  режима; повторная та же ошибка не логируется каждый кадр. Минимальный размер
+  SDK тоже ограничивает eligibility. Отказ Off по-прежнему передаётся вызывающему
+  коду; неподтверждённое выключение не объявляется безопасным.
+- FG требует успешно включённый Reflex с подтверждённой доступностью.
+  Неуспешные Reflex options пробуются один раз на режим; смена режима разрешает
+  повтор. Статус различает Off, ошибку, отсутствие latency reports и ожидание
+  отчётов; старое latency после ошибки/отсутствия отчётов не показывается.
+  Отключение FG сохраняет Reflex; правило Off → Reflex On сохранено.
+- Ordinary Streamline: **20 passed, 6 ignored**. Новый ignored production record
+  test запущен явно и прошёл (**1 passed**); он
+  использует настоящие Vulkan/DX12 encoders и mock SDK: отказы tags/options,
+  только cleared tags в submit, checked Off, retry, cap 1 при запросе 5,
+  нулевые presents и minimum size. Отдельные mock tests проверяют status/code
+  GetState, сброс cap, дедупликацию ошибок и Reflex options/availability.
+  Renderer graphics/UI — **25 passed**, `gfx::tests` — **23 passed**.
+  Clippy Streamline/render/client lib/bins/tests с `-D warnings`, fmt,
+  diff check и public-tree прошли. Полный pr_ready/parity не запускался.
+- Пять ignored tests официального SDK повторно прошли последовательно с новыми
+  scratch homes (**5 passed**): support/Reflex на обоих API, requirements и два SR
+  pixel tests. Локальный лог: `.local/dlss/logs/h-sdk-tests.txt`.
+- Это обработка ошибок и статусов, а не доказательство реальной генерации.
+  Фокусированный оконный FG Present на Vulkan/DX12, HUD/рука, stress и advisory
+  синхронизации GetState остаются открытыми после недоступности CUA в G.
+  Обходы ограничений доступа или проверки подписей не применялись.
+  Нужен независимый review H.
 
 ## 8. Выполнить итоговую проверку качества
 
@@ -656,8 +695,9 @@ swapchain получает hook; стресс-проверка не зависа
 - [ ] Часть F: сохранение depth/motion и headless GPU readback на Vulkan/DX12
   реализованы и проверены; review_f PASS, native FG/game проверка открыта.
 - [ ] Часть G: код frame-based tagging, support и FPS реализован, SDK-контракты
-  прошли; review G и настоящая FG 2× остаются открытыми.
-- [ ] Часть H: обработка ошибок, подтверждённые множители и диагностические статусы.
+  и review_g2 прошли; настоящая FG 2× остаётся открытой.
+- [ ] Часть H: обработка ошибок, подтверждённые множители и статусы реализованы;
+  targeted tests прошли, независимый review и аппаратная проверка открыты.
 - [ ] Часть I: финальная документация, результаты матрицы и повторный review.
 
 ### Финальный критерий приёмки

@@ -130,7 +130,7 @@ pub(crate) struct Session {
     api: Option<Api>,
     /// Generated frames the player asked for. Zero is off.
     wanted: u32,
-    /// Driver cap. One until `GetState` says more, so 2× is the first guess.
+    /// Zero until the driver confirms a nonzero upper bound.
     max_generated: u32,
     actual: u32,
     paused: bool,
@@ -139,6 +139,9 @@ pub(crate) struct Session {
     second_at: Instant,
     last_color: Option<[u32; 2]>,
     error: Option<String>,
+    fault: Option<String>,
+    reported: Option<String>,
+    min_side: u32,
     needs_reset: bool,
     off_confirmed: bool,
 }
@@ -151,7 +154,7 @@ impl Session {
             loaded: false,
             api: None,
             wanted: 0,
-            max_generated: 1,
+            max_generated: 0,
             actual: 0,
             paused: true,
             status: 0,
@@ -159,6 +162,9 @@ impl Session {
             second_at: Instant::now(),
             last_color: None,
             error: None,
+            fault: None,
+            reported: None,
+            min_side: 0,
             needs_reset: true,
             off_confirmed: false,
         }
@@ -181,12 +187,22 @@ impl Session {
     }
 
     fn frame_ready(&self, allow: bool, inputs_ready: bool, reset: bool) -> bool {
-        allow && inputs_ready && self.wanted > 0 && (!self.needs_reset || reset)
+        allow
+            && inputs_ready
+            && self.wanted > 0
+            && self.max_generated > 0
+            && self.fault.is_none()
+            && (!self.needs_reset || reset)
     }
 
     pub(crate) fn set_wanted(&mut self, generated: u32) {
         if self.wanted != generated {
             self.needs_reset = true;
+            if self.loaded {
+                self.fault = None; // Explicit mode change retries a failed SDK frame.
+            }
+            self.rate = PresentRate::default();
+            self.second_at = Instant::now();
         }
         self.wanted = generated;
         if generated == 0 {
@@ -202,7 +218,15 @@ impl Session {
     pub(crate) fn fail(&mut self, error: String) {
         self.loaded = false;
         self.off_confirmed = false;
-        self.error = Some(error);
+        self.note(error);
+    }
+
+    pub(crate) fn max_generated(&self) -> u32 {
+        if self.loaded && self.fault.is_none() {
+            self.max_generated
+        } else {
+            0
+        }
     }
 
     /// Must succeed before touching a swapchain or releasing its inputs. Do
@@ -288,9 +312,10 @@ impl Session {
         let generate = if self.wanted == 0 {
             1
         } else {
-            self.wanted.min(self.max_generated.max(1))
+            self.wanted.min(self.max_generated)
         };
         let inputs_ready = !resized
+            && input.color.into_iter().all(|side| side >= self.min_side)
             && input.depth.is_some()
             && input.motion.is_some()
             && input.constants.is_some()
@@ -303,10 +328,7 @@ impl Session {
         self.actual = if interpolate { generate } else { 0 };
         self.paused = self.wanted > 0 && !interpolate;
         if interpolate && let Err(error) = self.transition(encoder, &input) {
-            self.actual = 0;
-            self.paused = true;
-            let _ = self.apply(dx12, false, 1, &input);
-            return Err(error);
+            return self.fallback(dx12, token, device, error);
         }
         let tags = if token.is_null() {
             None
@@ -314,15 +336,48 @@ impl Session {
             match self.record_tags(dx12, token, device, interpolate, &input) {
                 Ok(buffer) => Some(buffer),
                 Err(error) => {
-                    self.actual = 0;
-                    self.paused = true;
-                    let _ = self.apply(dx12, false, 1, &input);
-                    return Err(error);
+                    return self.fallback(dx12, token, device, error);
                 }
             }
         };
-        self.apply(dx12, interpolate, generate, &input)?;
+        if let Err(error) = self.apply(dx12, interpolate, generate.max(1), &input) {
+            drop(tags);
+            return self.fallback(dx12, token, device, error);
+        }
         Ok(tags)
+    }
+
+    fn fallback(
+        &mut self,
+        dx12: bool,
+        token: *mut c_void,
+        device: &wgpu::Device,
+        error: String,
+    ) -> Result<Option<wgpu::CommandBuffer>, String> {
+        self.note(error);
+        self.suspend()?;
+        // Replace any live frame tags installed before failure, on the same
+        // token. Only the cleared list is allowed to reach the submit.
+        if token.is_null() {
+            Ok(None)
+        } else {
+            self.record_tags(
+                dx12,
+                token,
+                device,
+                false,
+                &Inputs {
+                    depth: None,
+                    motion: None,
+                    constants: None,
+                    color: [0; 2],
+                    depth_size: [0; 2],
+                    color_format: wgpu::TextureFormat::Rgba8Unorm,
+                    allow: false,
+                },
+            )
+            .map(Some)
+        }
     }
 
     /// `numFramesActuallyPresented` since the previous call, on this thread only.
@@ -339,12 +394,15 @@ impl Session {
         // The state struct is the writable v4 ABI.
         let code = unsafe { (api.state)(&viewport, &mut state, std::ptr::null()) };
         if code != 0 {
+            self.max_generated = 0;
             self.note(format!("Frame Generation state failed ({code})"));
+            if let Err(error) = self.suspend() {
+                self.note(error);
+            }
             return;
         }
-        if state.max_generated > 0 {
-            self.max_generated = state.max_generated;
-        }
+        self.max_generated = state.max_generated;
+        self.min_side = state.min_side;
         let now = Instant::now();
         if self
             .rate
@@ -352,37 +410,58 @@ impl Session {
         {
             self.second_at = now;
         }
-        if state.status != self.status {
-            self.status = state.status;
-            if state.status != 0 {
-                self.note(format!(
-                    "Frame Generation status {status:#x}",
-                    status = state.status
-                ));
+        self.status = state.status;
+        if self.wanted > 0 && state.status != 0 {
+            self.note(format!("Frame Generation status {:#x}", state.status));
+            if let Err(error) = self.suspend() {
+                self.note(error);
+            }
+        } else if self.wanted > 0 && state.max_generated == 0 {
+            if let Err(error) = self.suspend() {
+                self.note(error);
             }
         }
     }
 
     pub(crate) fn line(&self) -> String {
+        if let Some(error) = &self.fault {
+            let retry = if self.loaded {
+                "; change mode to retry"
+            } else {
+                ""
+            };
+            return format!("Frame Gen: unavailable ({error}{retry})");
+        }
         if !self.loaded {
             return String::new();
         }
         if self.wanted == 0 {
             return "Frame Gen: off".into();
         }
+        if self.max_generated == 0 {
+            return "Frame Gen: paused (waiting for driver capabilities)".into();
+        }
         if self.paused || self.status != 0 || self.actual == 0 {
             return "Frame Gen: paused".into();
         }
         format!(
-            "Frame Gen: {}x · {:.0} shown FPS · {:.0} rendered FPS",
+            "Frame Gen: {}x configured ({}x requested) · {:.0} SDK shown FPS · {:.0} rendered FPS",
             self.actual + 1,
+            self.wanted + 1,
             self.rate.shown,
             self.rate.rendered
         )
     }
 
     pub(crate) fn note(&mut self, error: String) {
-        self.error = Some(error);
+        if self.reported.as_ref() != Some(&error) {
+            self.error = Some(error.clone());
+            self.reported = Some(error.clone());
+        }
+        self.fault = Some(error);
+        self.actual = 0;
+        self.paused = self.wanted > 0;
+        self.needs_reset = true;
     }
 
     fn apply(
@@ -853,28 +932,48 @@ mod tests {
 
     thread_local! {
         static OPTIONS: std::cell::RefCell<(Vec<u32>, i32)> = const { std::cell::RefCell::new((Vec::new(), 0)) };
+        static STATE: std::cell::Cell<(u32, u32, u32, i32)> = const { std::cell::Cell::new((1, 0, 0, 0)) };
+        static TAGS: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+        static FAIL: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) };
+        static GENERATED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
     unsafe extern "C" fn options(_: *const sl::Viewport, options: *const GOptions) -> i32 {
         // Safety: Session passes a live options value during this call.
         let options = unsafe { &*options };
         assert_eq!(options.queue_parallelism, 0);
+        GENERATED.set(options.generated);
+        if options.mode == MODE_ON && FAIL.get().0 {
+            return 7;
+        }
         OPTIONS.with_borrow_mut(|(calls, result)| {
             calls.push(options.mode);
             *result
         })
     }
-    unsafe extern "C" fn state(_: *const sl::Viewport, _: *mut GState, _: *const GOptions) -> i32 {
-        0
+    unsafe extern "C" fn state(
+        _: *const sl::Viewport,
+        state: *mut GState,
+        _: *const GOptions,
+    ) -> i32 {
+        let (cap, status, presented, code) = STATE.get();
+        let state = unsafe { &mut *state };
+        state.max_generated = cap;
+        state.status = status;
+        state.presented = presented;
+        code
     }
     unsafe extern "C" fn tag(
         _: *const c_void,
         _: *const sl::Viewport,
-        _: *const sl::Tag,
-        _: u32,
+        tags: *const sl::Tag,
+        count: u32,
         _: *mut c_void,
     ) -> i32 {
-        0
+        assert_eq!(count, 2);
+        let live = unsafe { !(*tags).resource.is_null() };
+        TAGS.with_borrow_mut(|calls| calls.push(live));
+        if live && FAIL.get().1 { 9 } else { 0 }
     }
 
     #[test]
@@ -912,6 +1011,7 @@ mod tests {
             tag,
         });
         session.wanted = 1;
+        session.max_generated = 1;
         OPTIONS.with_borrow_mut(|state| *state = (Vec::new(), 0));
         session.suspend().unwrap();
         session.suspend().unwrap(); // already confirmed Off before any Present
@@ -945,6 +1045,162 @@ mod tests {
         assert!(session.frame_ready(true, true, false));
         session.apply(false, true, 1, &input).unwrap();
         OPTIONS.with_borrow(|(calls, _)| assert_eq!(calls, &[MODE_OFF, MODE_ON, MODE_ON, MODE_ON]));
+    }
+
+    #[test]
+    fn sdk_state_errors_stop_generation_until_explicit_retry() {
+        for (status, code) in [(8, 0), (0, 42)] {
+            let mut session = Session::new(true, true);
+            session.api = Some(Api {
+                options,
+                state,
+                tag,
+            });
+            session.loaded = true;
+            session.set_wanted(5);
+            OPTIONS.with_borrow_mut(|state| *state = (Vec::new(), 0));
+            STATE.set((5, status, 0, code));
+            session.sample();
+            assert!(!session.frame_ready(true, true, true));
+            assert!(session.off_confirmed);
+            assert_eq!(session.actual, 0);
+            assert_eq!(session.max_generated(), 0);
+            assert!(session.line().contains("unavailable"));
+            assert!(session.take_error().is_some());
+            session.sample();
+            assert!(
+                session.take_error().is_none(),
+                "repeated error must not log every frame"
+            );
+            STATE.set((1, 0, 0, 0));
+            session.sample();
+            assert!(!session.frame_ready(true, true, true));
+            session.set_wanted(0);
+            session.set_wanted(5);
+            assert!(session.frame_ready(true, true, true));
+            // A later unknown cap must discard the previous confirmed 6x.
+            STATE.set((0, 0, 0, 0));
+            session.sample();
+            assert_eq!(session.max_generated(), 0);
+            assert!(!session.frame_ready(true, true, true));
+            assert!(session.line().contains("driver capabilities"));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Vulkan and DirectX 12 devices; SDK calls are mocked"]
+    fn failed_live_tags_or_options_submit_only_cleared_tags_on_both_apis() {
+        for backend in [wgpu::Backends::VULKAN, wgpu::Backends::DX12] {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: backend,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let adapter =
+                pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+            let (device, queue) =
+                pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+            let texture = |format| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: None,
+                    size: wgpu::Extent3d {
+                        width: 64,
+                        height: 64,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                })
+            };
+            let depth = texture(wgpu::TextureFormat::Depth32Float);
+            let motion = texture(wgpu::TextureFormat::Rg16Float);
+            let depth_view = depth.create_view(&Default::default());
+            let motion_view = motion.create_view(&Default::default());
+            for failure in [(true, false), (false, true)] {
+                let mut session = Session::new(true, true);
+                session.api = Some(Api {
+                    options,
+                    state,
+                    tag,
+                });
+                session.loaded = true;
+                session.set_wanted(5);
+                OPTIONS.with_borrow_mut(|state| *state = (Vec::new(), 0));
+                STATE.set((1, 0, 0, 0));
+                session.sample();
+                let input = || Inputs {
+                    depth: Some((&depth, &depth_view)),
+                    motion: Some((&motion, &motion_view)),
+                    constants: Some(FrameConstants {
+                        projection: [[0.; 4]; 4],
+                        inverse_projection: [[0.; 4]; 4],
+                        reprojection: [[0.; 4]; 4],
+                        inverse_reprojection: [[0.; 4]; 4],
+                        jitter_pixels: [0.; 2],
+                        camera: [[0.; 3]; 4],
+                        near: 0.05,
+                        far: 1000.,
+                        fov: 1.2,
+                        aspect: 1.,
+                        reset: true,
+                    }),
+                    color: [64; 2],
+                    depth_size: [64; 2],
+                    color_format: wgpu::TextureFormat::Rgba8Unorm,
+                    allow: true,
+                };
+                let record = |session: &mut Session| {
+                    let mut encoder = device.create_command_encoder(&Default::default());
+                    let tags = session
+                        .record(
+                            backend == wgpu::Backends::DX12,
+                            std::ptr::dangling_mut(),
+                            &device,
+                            &mut encoder,
+                            input(),
+                        )
+                        .unwrap();
+                    queue.submit(std::iter::once(encoder.finish()).chain(tags));
+                };
+                TAGS.with_borrow_mut(Vec::clear);
+                FAIL.set(failure);
+                record(&mut session);
+                TAGS.with_borrow(|calls| assert_eq!(calls, &[true, false]));
+                assert!(session.off_confirmed);
+                assert_eq!(session.actual, 0);
+                assert!(session.reset_pending());
+                FAIL.set((false, false));
+                record(&mut session);
+                assert_eq!(
+                    session.actual, 0,
+                    "no implicit retry after failed SDK frame"
+                );
+                session.set_wanted(0);
+                session.set_wanted(5);
+                record(&mut session);
+                assert_eq!(
+                    session.actual, 1,
+                    "driver cap, not request, selects the options"
+                );
+                assert_eq!(GENERATED.get(), 1);
+                session.second_at = Instant::now() - Duration::from_secs(2);
+                session.sample();
+                assert!(session.line().contains("2x configured (6x requested)"));
+                assert!(session.line().contains("0 SDK shown FPS"));
+                assert!(session.rate.rendered > 0.);
+                session.min_side = 128;
+                record(&mut session);
+                assert_eq!(session.actual, 0, "below driver minimum must pause");
+                TAGS.with_borrow(|calls| assert_eq!(calls.last(), Some(&false)));
+                session.suspend().unwrap();
+            }
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        }
     }
 
     #[test]

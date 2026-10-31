@@ -110,6 +110,7 @@ pub struct Session {
     api: Option<Api>,
     mode: u32,
     options_sent: bool,
+    options_attempted: bool,
     /// Address of the token whose frame is on screen. Zero means none.
     current: usize,
     index: u32,
@@ -120,6 +121,7 @@ pub struct Session {
     submitting: bool,
     error: Option<String>,
     reported: bool,
+    diagnostic: Option<String>,
     latency_us: u64,
     qpf: u64,
     state: StateBuf,
@@ -137,6 +139,7 @@ impl Session {
             api: None,
             mode: 0,
             options_sent: false,
+            options_attempted: false,
             current: 0,
             index: 0,
             pending: 0,
@@ -145,6 +148,7 @@ impl Session {
             submitting: false,
             error: None,
             reported: false,
+            diagnostic: None,
             latency_us: 0,
             qpf: qpf.max(1) as u64,
             state: StateBuf([0; 16384]),
@@ -159,6 +163,14 @@ impl Session {
         self.loaded
     }
 
+    pub fn active(&self) -> bool {
+        self.loaded
+            && self.options_sent
+            && self.mode > 0
+            && self.state.0[32] != 0
+            && self.diagnostic.is_none()
+    }
+
     pub fn is_open(&self) -> bool {
         self.open
     }
@@ -168,8 +180,20 @@ impl Session {
     }
 
     pub fn line(&self) -> String {
+        if let Some(error) = &self.diagnostic {
+            return format!("Reflex: unavailable ({error})");
+        }
         if !self.loaded {
             return String::new();
+        }
+        if self.mode == 0 {
+            return "Reflex: off".into();
+        }
+        if self.state.0[33] == 0 {
+            return "Reflex: latency reports unavailable".into();
+        }
+        if self.latency_us == 0 {
+            return "Reflex: waiting for latency reports".into();
         }
         format!("Reflex: {:.1} ms", self.latency_us as f64 / 1000.0)
     }
@@ -187,6 +211,12 @@ impl Session {
         if self.mode != mode {
             self.mode = mode;
             self.options_sent = false;
+            self.options_attempted = false;
+            if self.loaded {
+                self.diagnostic = None;
+            }
+            self.reported = false;
+            self.latency_us = 0;
         }
         self.send_options();
     }
@@ -403,9 +433,10 @@ impl Session {
         let Some(api) = &self.api else {
             return;
         };
-        if self.options_sent {
+        if !self.loaded || self.options_attempted {
             return;
         }
+        self.options_attempted = true;
         let options = ReflexOptions {
             base: Base::new(
                 0xf03af81a,
@@ -432,7 +463,17 @@ impl Session {
 
     fn read_latency(&mut self) {
         if let Err(error) = self.query_state() {
+            self.latency_us = 0;
             self.note_error(error);
+            return;
+        }
+        if self.state.0[32] == 0 {
+            self.latency_us = 0;
+            self.note_error("Reflex low latency is unavailable on this device".into());
+            return;
+        }
+        if self.state.0[33] == 0 {
+            self.latency_us = 0;
             return;
         }
         self.read_reports();
@@ -452,6 +493,7 @@ impl Session {
         // Safety: the buffer is 16 KiB and aligned. ReflexState v2 is smaller
         // than that. The header tells the SDK which version to fill.
         let code = unsafe {
+            self.state.0.fill(0);
             std::ptr::write(self.state.0.as_mut_ptr() as *mut Base, base);
             (api.get_state)(self.state.0.as_mut_ptr() as *mut c_void)
         };
@@ -483,12 +525,11 @@ impl Session {
                 best = (end - start).saturating_mul(1_000_000) / self.qpf;
             }
         }
-        if best != 0 {
-            self.latency_us = best;
-        }
+        self.latency_us = best;
     }
 
     fn note_error(&mut self, error: String) {
+        self.diagnostic = Some(error.clone());
         if self.reported {
             return;
         }
@@ -559,6 +600,64 @@ impl Drop for ReflexServerTick {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        static MOCK: std::cell::RefCell<(Vec<u32>, i32, u8)> = const { std::cell::RefCell::new((Vec::new(), 0, 1)) };
+    }
+    unsafe extern "C" fn mock_options(options: *const ReflexOptions) -> i32 {
+        MOCK.with_borrow_mut(|(calls, code, _)| {
+            calls.push(unsafe { (*options).mode });
+            *code
+        })
+    }
+    unsafe extern "C" fn mock_state(state: *mut c_void) -> i32 {
+        unsafe { *(state as *mut u8).add(32) = MOCK.with_borrow(|(_, _, available)| *available) };
+        0
+    }
+    unsafe extern "C" fn mock_token(_: *mut *mut c_void, _: *const u32) -> i32 {
+        1
+    }
+    unsafe extern "C" fn mock_sleep(_: *const c_void) -> i32 {
+        0
+    }
+    unsafe extern "C" fn mock_marker(_: u32, _: *const c_void) -> i32 {
+        0
+    }
+
+    #[test]
+    fn failed_options_are_not_retried_each_frame_and_mode_change_recovers() {
+        let mut session = Session::new(true);
+        session.api = Some(Api {
+            new_token: mock_token,
+            set_options: mock_options,
+            get_state: mock_state,
+            sleep: mock_sleep,
+            marker: mock_marker,
+        });
+        session.loaded = true;
+        session.state.0[32] = 1;
+        MOCK.with_borrow_mut(|state| *state = (Vec::new(), 42, 1));
+        session.set_mode(1);
+        assert!(!session.active());
+        assert!(session.line().contains("options failed (42)"));
+        assert!(session.take_error().is_some());
+        for _ in 0..3 {
+            session.set_mode(1);
+        }
+        assert!(session.take_error().is_none());
+        MOCK.with_borrow_mut(|(_, code, _)| *code = 0);
+        session.set_mode(2);
+        assert!(session.active());
+        MOCK.with_borrow(|(calls, _, _)| assert_eq!(calls, &[1, 2]));
+        session.latency_us = 1234;
+        session.read_latency();
+        assert_eq!(session.latency_us, 0);
+        assert_eq!(session.line(), "Reflex: latency reports unavailable");
+        MOCK.with_borrow_mut(|(_, _, available)| *available = 0);
+        session.read_latency();
+        assert!(!session.active());
+        assert!(session.line().contains("low latency is unavailable"));
+    }
 
     #[test]
     fn unsupported_reflex_cannot_open_a_frame() {

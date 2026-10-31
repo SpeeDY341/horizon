@@ -675,7 +675,9 @@ impl H {
                 }
             }
             H::FrameGen => {
-                g.framegen = step(&FrameGen::ALL, g.framegen, back);
+                g.framegen = g
+                    .framegen
+                    .next_supported(crate::graphics::framegen_cap(), back);
                 if g.framegen != FrameGen::Off && g.reflex == Reflex::Off {
                     g.reflex = Reflex::On;
                 }

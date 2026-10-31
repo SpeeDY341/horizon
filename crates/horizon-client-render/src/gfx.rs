@@ -3989,7 +3989,7 @@ impl Renderer {
             if let Some(error) = runtime.take_reflex_error() {
                 log::warn!("Reflex: {error}");
             }
-            if self.reflex_loaded {
+            if self.reflex_loaded || runtime.reflex_requested() {
                 runtime.set_reflex_mode(mode.sdk());
                 let line = runtime.reflex_line();
                 drop(runtime);
@@ -4116,8 +4116,9 @@ impl Renderer {
             if let Some(error) = runtime.take_framegen_error() {
                 log::warn!("Frame Generation: {error}");
             }
-            if self.framegen_loaded {
+            if self.framegen_loaded || runtime.framegen_requested() {
                 runtime.set_framegen_wanted(mode.generated());
+                crate::graphics::report_framegen_cap(runtime.framegen_max_generated());
                 let line = runtime.framegen_line();
                 drop(runtime);
                 crate::graphics::report_framegen(line);
@@ -4128,6 +4129,7 @@ impl Renderer {
     }
 
     fn report_framegen_unloaded(&self) {
+        crate::graphics::report_framegen_cap(0);
         let line = if self.framegen_mode == crate::graphics::FrameGen::Off {
             String::new()
         } else if cfg!(not(target_os = "windows")) || self.framegen_failed_to_bind() {
@@ -4262,6 +4264,7 @@ impl Renderer {
             && let Ok(mut runtime) = shared.lock()
         {
             runtime.framegen_sample();
+            crate::graphics::report_framegen_cap(runtime.framegen_max_generated());
             if let Some(error) = runtime.take_framegen_error() {
                 log::warn!("Frame Generation: {error}");
             }

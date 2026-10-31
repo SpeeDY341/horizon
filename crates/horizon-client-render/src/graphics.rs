@@ -514,15 +514,19 @@ impl FrameGen {
             Self::X6 => 5,
         }
     }
-    /// Generated frames the driver can accept. `max` is that cap, and it is
-    /// treated as 1 until the driver reports a higher one.
+    /// Generated frames the driver confirmed. Zero means no confirmed cap.
     pub fn clamp_generated(self, max: u32) -> u32 {
-        let wanted = self.generated();
-        if wanted == 0 {
-            0
-        } else {
-            wanted.min(max.max(1))
-        }
+        self.generated().min(max)
+    }
+    pub fn next_supported(self, max: u32, back: bool) -> Self {
+        // 2x remains selectable for startup/restart. Higher modes require a
+        // driver-confirmed cap; the native path also gates 2x until confirmed.
+        let choices: Vec<_> = Self::ALL
+            .into_iter()
+            .filter(|mode| mode.generated() <= max.max(1))
+            .collect();
+        let at = choices.iter().position(|mode| *mode == self).unwrap_or(0);
+        choices[(at + if back { choices.len() - 1 } else { 1 }) % choices.len()]
     }
     fn parse(s: &str) -> Self {
         Self::ALL
@@ -559,6 +563,13 @@ pub fn reflex_overlay_line() -> Option<String> {
 }
 
 static FRAMEGEN_LINE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static FRAMEGEN_CAP: AtomicU32 = AtomicU32::new(0);
+pub fn report_framegen_cap(max: u32) {
+    FRAMEGEN_CAP.store(max, Ordering::Relaxed);
+}
+pub fn framegen_cap() -> u32 {
+    FRAMEGEN_CAP.load(Ordering::Relaxed)
+}
 /// The frame-generation line for the performance overlay. Empty hides it.
 pub fn report_framegen(line: impl Into<String>) {
     *FRAMEGEN_LINE.lock().unwrap_or_else(|e| e.into_inner()) = line.into();
@@ -1153,8 +1164,16 @@ mod tests {
         assert_eq!(Graphics::parse("framegen:nope\n").framegen, FrameGen::Off);
         assert_eq!(FrameGen::X6.clamp_generated(1), 1);
         assert_eq!(FrameGen::X6.clamp_generated(5), 5);
-        assert_eq!(FrameGen::X4.clamp_generated(0), 1);
+        assert_eq!(FrameGen::X4.clamp_generated(0), 0);
         assert_eq!(FrameGen::Off.clamp_generated(5), 0);
+        for cap in [0, 1] {
+            assert_eq!(FrameGen::Off.next_supported(cap, false), FrameGen::X2);
+            assert_eq!(FrameGen::X2.next_supported(cap, false), FrameGen::Off);
+            assert_eq!(FrameGen::Off.next_supported(cap, true), FrameGen::X2);
+        }
+        assert_eq!(FrameGen::X2.next_supported(2, false), FrameGen::X3);
+        assert_eq!(FrameGen::X3.next_supported(2, false), FrameGen::Off);
+        assert_eq!(FrameGen::Off.next_supported(5, true), FrameGen::X6);
         let mut chosen = Graphics::default();
         chosen.set_upscaler(Upscaler::Off);
         chosen.set_upscale_quality(Upscaling::Quality);
