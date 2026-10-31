@@ -50,6 +50,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 rustix = { version = "1", default-features = false, features = ["std", "time"] }
 
 [target.'cfg(windows)'.dependencies]
+horizon-streamline = { path = "../horizon-streamline" }
 wgpu = { version = "30.0.1", default-features = false, features = ["dx12"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]

@@ -63,6 +63,7 @@ pub struct Post {
     /// Output pixels per rendered pixel while TAA is on (1: native): the world renders
     /// this much smaller and TAA rebuilds it at the resolution scale's size.
     pub upscale: f32,
+    internal_size: Option<[u32; 2]>,
     /// TAA runs this frame (`jitter`): not on the title screen or under a shader pack.
     taa_on: bool,
     target: Option<WorldTarget>,
@@ -242,6 +243,7 @@ impl Post {
             antialias: false,
             taa: false,
             upscale: 1.0,
+            internal_size: None,
             taa_on: false,
             target: None,
             taa_resources,
@@ -261,9 +263,24 @@ impl Post {
         let output = window.map(|v| ((v as f32 * self.scale).round() as u32).clamp(1, 8192));
         let upscale = if self.taa_on { self.upscale } else { 1.0 };
         (
-            output.map(|v| ((v as f32 / upscale).round() as u32).max(1)),
+            self.internal_size
+                .filter(|_| self.taa_on)
+                .unwrap_or_else(|| output.map(|v| ((v as f32 / upscale).round() as u32).max(1))),
             output,
         )
+    }
+
+    pub fn set_internal_size(&mut self, size: Option<[u32; 2]>) {
+        if self.internal_size != size {
+            self.taa_previous = None;
+            self.internal_size = size;
+        }
+    }
+    pub fn invalidate_history(&mut self) {
+        self.taa_this_frame.jitter[2] = 1.0;
+    }
+    pub fn reprojection(&self) -> Mat4 {
+        Mat4::from_cols_array_2d(&self.taa_this_frame.reproject)
     }
 
     /// TAA's sub-pixel jitter this frame, as a clip-space matrix to multiply into the
@@ -279,7 +296,10 @@ impl Post {
         let (size, _) = self.sizes(window);
         // Halton (2, 3) over 8 frames per output pixel (FSR's count), in rendered
         // pixels around the centre.
-        let phases = (8.0 * self.upscale * self.upscale).ceil() as u32;
+        let ratio = self.internal_size.map_or(self.upscale, |_| {
+            self.sizes(window).1[0] as f32 / size[0] as f32
+        });
+        let phases = (8.0 * ratio * ratio).ceil() as u32;
         let i = self.taa_frame % phases + 1;
         let offset = Vec2::new(halton(i, 2), halton(i, 3)) - 0.5;
         let jitter = offset * 2.0 / Vec2::new(size[0] as f32, size[1] as f32);

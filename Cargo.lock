@@ -1212,6 +1212,7 @@ dependencies = [
  "horizon-protocol",
  "horizon-shader-api",
  "horizon-shaders",
+ "horizon-streamline",
  "horizon-telemetry",
  "horizon-theme",
  "horizon-threads",

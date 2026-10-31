@@ -75,6 +75,7 @@ mod animate;
 mod arena;
 pub mod compositor;
 mod cull;
+mod dlss;
 mod end_sky;
 mod flat;
 mod frame_gen;
@@ -429,6 +430,8 @@ pub struct ScreenshotRequest {
     pub size: Option<[u32; 2]>,
 }
 pub struct Renderer {
+    streamline: Option<dlss::Shared>,
+    dlss: dlss::State,
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     /// The window's swapchain; `None` when rendering offscreen (`--offscreen`).
@@ -981,6 +984,7 @@ fn backends_name(backends: wgpu::Backends) -> &'static str {
 }
 /// A device and what it came from.
 struct Opened {
+    streamline: Option<dlss::Shared>,
     instance: wgpu::Instance,
     surface: Option<wgpu::Surface<'static>>,
     adapter: wgpu::Adapter,
@@ -1059,6 +1063,7 @@ async fn open_device(
     offscreen: bool,
     api: GraphicsApi,
     layers: u32,
+    enable_dlss: bool,
 ) -> Result<Opened> {
     let order = backend_order(
         api.with_env(),
@@ -1071,7 +1076,7 @@ async fn open_device(
         if attempt > 0 {
             log::warn!("Horizon renderer: trying {name} ({})", failures.join("; "));
         }
-        match open_with_retry(backends, window, offscreen, layers).await {
+        match open_with_retry(backends, window, offscreen, layers, enable_dlss).await {
             Ok(opened) => return Ok(opened),
             Err(e) => failures.push(e),
         }
@@ -1095,15 +1100,25 @@ async fn open_with_retry(
     window: &Arc<Window>,
     offscreen: bool,
     layers: u32,
+    enable_dlss: bool,
 ) -> std::result::Result<Opened, String> {
-    match open_backend(backends, window, offscreen, false, layers).await {
+    let first = open_backend(backends, window, offscreen, false, layers, enable_dlss).await;
+    let first = match first {
+        Err(NoDevice::Failed(e) | NoDevice::NoAdapter(e)) if enable_dlss => {
+            crate::graphics::report_dlss(format!("TAA: {e}"));
+            log::warn!("DLSS startup failed, retrying ordinary Vulkan: {e}");
+            open_backend(backends, window, offscreen, false, layers, false).await
+        }
+        result => result,
+    };
+    match first {
         Err(NoDevice::NoAdapter(hidden)) => {
             log::warn!(
                 "Horizon renderer: {} has no conformant adapter ({hidden}); asking again for the \
                  ones wgpu hides as non-conformant",
                 backends_name(backends)
             );
-            match open_backend(backends, window, offscreen, true, layers).await {
+            match open_backend(backends, window, offscreen, true, layers, false).await {
                 Ok(opened) => {
                     log::warn!(
                         "Horizon renderer: using {} although its driver reports no Vulkan \
@@ -1127,13 +1142,22 @@ async fn open_backend(
     offscreen: bool,
     allow_nonconformant: bool,
     layers: u32,
+    enable_dlss: bool,
 ) -> std::result::Result<Opened, NoDevice> {
     let name = backends_name(backends);
-    let instance = wgpu::Instance::new(instance_descriptor(
-        backends,
-        Some(window),
-        allow_nonconformant,
-    ));
+    let streamline = dlss::load(enable_dlss, backends);
+    let descriptor = instance_descriptor(backends, Some(window), allow_nonconformant);
+    #[cfg(target_os = "windows")]
+    let instance = match &streamline {
+        Some(runtime) => runtime
+            .lock()
+            .map_err(|e| NoDevice::Failed(e.to_string()))?
+            .create_instance(&descriptor)
+            .map_err(NoDevice::Failed)?,
+        None => wgpu::Instance::new(descriptor),
+    };
+    #[cfg(not(target_os = "windows"))]
+    let instance = wgpu::Instance::new(descriptor);
     let surface = if offscreen {
         None
     } else {
@@ -1154,6 +1178,14 @@ async fn open_backend(
         Ok(adapter) => adapter,
         Err(e) => return Err(NoDevice::NoAdapter(format!("{name}: {e}"))),
     };
+    #[cfg(target_os = "windows")]
+    if let Some(runtime) = &streamline {
+        runtime
+            .lock()
+            .map_err(|e| NoDevice::Failed(e.to_string()))?
+            .check_adapter(&adapter)
+            .map_err(NoDevice::Failed)?;
+    }
     describe_adapter(&adapter);
     let info = adapter.get_info();
     let limits = adapter.limits();
@@ -1203,13 +1235,24 @@ async fn open_backend(
         None => adapter.request_device(&desc).await,
     };
     match opened {
-        Ok((device, queue)) => Ok(Opened {
-            instance,
-            surface,
-            adapter,
-            device,
-            queue,
-        }),
+        Ok((device, queue)) => {
+            #[cfg(target_os = "windows")]
+            if let Some(runtime) = &streamline {
+                runtime
+                    .lock()
+                    .map_err(|e| NoDevice::Failed(e.to_string()))?
+                    .attach_device(&device)
+                    .map_err(NoDevice::Failed)?;
+            }
+            Ok(Opened {
+                streamline,
+                instance,
+                surface,
+                adapter,
+                device,
+                queue,
+            })
+        }
         Err(e) => Err(NoDevice::Failed(format!("{name} device: {e}"))),
     }
 }
@@ -1286,6 +1329,7 @@ impl Renderer {
         prepared: Option<PreparedTextures>,
         previous: Option<&Self>,
         api: GraphicsApi,
+        enable_dlss: bool,
     ) -> Result<Self> {
         let split = sprite_split();
         if layers > split * SPRITE_ARRAYS {
@@ -1296,6 +1340,7 @@ impl Renderer {
             .into());
         }
         let Opened {
+            streamline,
             instance,
             surface,
             adapter,
@@ -1309,6 +1354,7 @@ impl Renderer {
                 describe_adapter(&renderer.adapter);
                 check_layers(&renderer.adapter.limits(), layers)?;
                 Opened {
+                    streamline: renderer.streamline.clone(),
                     surface: if offscreen {
                         None
                     } else {
@@ -1328,7 +1374,7 @@ impl Renderer {
                     queue: renderer.queue.clone(),
                 }
             }
-            None => open_device(&window, offscreen, api, layers).await?,
+            None => open_device(&window, offscreen, api, layers, enable_dlss).await?,
         };
         let info = adapter.get_info();
         crate::graphics::suggest_reduced_far_detail(crate::graphics::lod_capped(&info));
@@ -2774,7 +2820,8 @@ impl Renderer {
         let motion = (info.backend == wgpu::Backend::Vulkan
             && info.vendor == 0x10de
             && info.name.to_ascii_uppercase().contains("RTX")
-            && std::env::var("HORIZON_DLSS_MOTION").as_deref() == Ok("1"))
+            && (streamline.is_some()
+                || std::env::var("HORIZON_DLSS_MOTION").as_deref() == Ok("1")))
         .then(|| motion::Motion::new(&device, &atlas_view));
         let uploads = upload::Uploads::new(&device);
         let section_uploads = upload::Uploads::with_chunk(&device, SECTION_UPLOAD_CHUNK);
@@ -2799,6 +2846,8 @@ impl Renderer {
             ));
         }
         Ok(Self {
+            dlss: dlss::State::new(streamline.clone(), enable_dlss),
+            streamline,
             display: DisplayWatch::default(),
             display_fresh: false,
             instance,
@@ -3681,6 +3730,12 @@ impl Renderer {
     /// Experimental data preparation is opt-in and restricted to Vulkan RTX.
     pub fn motion_vectors_enabled(&self) -> bool {
         self.motion.is_some()
+            && (self.dlss.requested != crate::graphics::Dlss::Off
+                || std::env::var("HORIZON_DLSS_MOTION").as_deref() == Ok("1"))
+    }
+
+    pub fn set_dlss(&mut self, mode: crate::graphics::Dlss) {
+        self.dlss.set(mode);
     }
 
     /// `upscale`: output pixels per rendered pixel, for TAA to rebuild (1: native).
@@ -4134,6 +4189,16 @@ impl Renderer {
         let taa = !frame.title
             && self.pack_post.as_ref().is_none_or(|p| p.1.is_none())
             && self.native.as_ref().is_none_or(|n| n.post.is_none());
+        let output = [self.config.width, self.config.height]
+            .map(|v| ((v as f32 * self.world_post.scale).round() as u32).clamp(1, 8192));
+        let dlss_size = self.dlss.prepare(
+            &self.device,
+            &self.queue,
+            output,
+            taa && views.views().len() == 1,
+            self.hdr.is_some(),
+        );
+        self.world_post.set_internal_size(dlss_size);
         if !taa && let Some(motion) = &mut self.motion {
             motion.reset();
         }
@@ -5868,7 +5933,9 @@ impl Renderer {
                 native.timing.as_mut(),
             );
         } else if scaled.is_some() {
-            if let Some(motion) = &mut self.motion {
+            if self.motion_vectors_enabled()
+                && let Some(motion) = &mut self.motion
+            {
                 if let Some(jitter) = self.world_post.temporal_jitter() {
                     motion.render(
                         &self.device,
@@ -5887,8 +5954,52 @@ impl Renderer {
                     motion.reset();
                 }
             }
-            self.world_post
-                .finish(&self.queue, &mut encoder, &view_target);
+            let dlss_result = if dlss_size.is_some() {
+                let motion = self.motion.as_ref().and_then(|m| m.view());
+                if let Some(motion) = motion {
+                    // Submit the world's complete color/depth/motion before native DLSS.
+                    // Its own command buffers run next, then hand/HUD in a fresh encoder.
+                    self.uploads.finish(&encoder);
+                    if has_section_copies { self.section_uploads.finish(&encoder); }
+                    let world_commands = std::mem::replace(
+                        &mut encoder,
+                        self.device.create_command_encoder(&Default::default()),
+                    )
+                    .finish();
+                    self.queue.submit([world_commands]);
+                    self.dlss.resolve(
+                        world_view,
+                        world_depth,
+                        &motion,
+                        views.primary().projection * pose,
+                        self.world_post.reprojection(),
+                        self.world_post.temporal_jitter().unwrap(),
+                        self.world_post.size().unwrap(),
+                        frame.depth_far,
+                        frame.fov_degrees.to_radians(),
+                        views.primary().aspect,
+                        views.primary().view,
+                        frame.camera,
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(output) = dlss_result {
+                let group = self.world_post.bind(&self.device, &output);
+                self.world_post
+                    .finish_with(&mut encoder, &view_target, &group);
+                // This TAA history was not updated. Any later fallback starts afresh.
+                self.world_post.invalidate_history();
+            } else {
+                if dlss_size.is_some() {
+                    self.world_post.invalidate_history();
+                }
+                self.world_post
+                    .finish(&self.queue, &mut encoder, &view_target);
+            }
         }
         if let Some(hdr) = &self.hdr {
             hdr.keep_world(&mut encoder);

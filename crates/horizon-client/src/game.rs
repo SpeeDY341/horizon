@@ -12371,6 +12371,7 @@ impl Game<'_> {
             self.renderer.as_ref(),
             None,
             self.settings.horizon.api,
+            self.settings.horizon.dlss != horizon_client::graphics::Dlss::Off,
         )
     }
     fn apply_settings(&mut self) {
@@ -16900,6 +16901,7 @@ fn build_renderer(
     previous: Option<&Renderer>,
     prepared: Option<horizon_client::gfx::PreparedTextures>,
     api: horizon_client::graphics::GraphicsApi,
+    enable_dlss: bool,
 ) -> Result<Renderer> {
     let assets = &pack.render;
     let atlas = &gui.atlas;
@@ -16932,6 +16934,7 @@ fn build_renderer(
         prepared,
         previous,
         api,
+        enable_dlss,
     ))?;
     renderer.hud.sprite_animations = atlas
         .sprite_animations
@@ -16950,6 +16953,7 @@ fn loading_renderer(
     gui: Option<&UiResources>,
     previous: Option<&Renderer>,
     api: horizon_client::graphics::GraphicsApi,
+    enable_dlss: bool,
 ) -> Result<Renderer> {
     static FORCEFIELD: [u8; 4] = [0; 4];
     static EMPTY_HUD: [u8; 4] = [0, 0, 0, 255];
@@ -16991,6 +16995,7 @@ fn loading_renderer(
         None,
         previous,
         api,
+        enable_dlss,
     ))?;
     if let Some(atlas) = atlas {
         renderer.hud.sprite_animations = atlas
@@ -17327,6 +17332,7 @@ impl Loading {
             self.gui.as_ref(),
             None,
             self.settings.horizon.api,
+            self.settings.horizon.dlss != horizon_client::graphics::Dlss::Off,
         ) {
             Ok(r) => self.renderer = Some(r),
             Err(e) => {
@@ -17372,6 +17378,7 @@ impl Loading {
             self.gui.as_ref(),
             self.renderer.as_ref(),
             self.settings.horizon.api,
+            self.settings.horizon.dlss != horizon_client::graphics::Dlss::Off,
         ) {
             Ok(r) => {
                 horizon_client::hud::GUI_SCALE.store(self.settings.gui_scale, Ordering::Relaxed);
@@ -17460,6 +17467,7 @@ impl Loading {
             self.renderer.as_ref(),
             loaded.renderer_cpu,
             self.settings.horizon.api,
+            self.settings.horizon.dlss != horizon_client::graphics::Dlss::Off,
         )?;
         log::info!(
             "Horizon: world renderer ready after {} ms",

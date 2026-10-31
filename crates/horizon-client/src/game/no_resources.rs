@@ -105,8 +105,14 @@ impl ApplicationHandler for Missing {
             .map_err(Into::into)
             .and_then(|window| {
                 let window = Arc::new(window);
-                let renderer =
-                    loading_renderer(window.clone(), false, Some(&self.gui), None, self.api)?;
+                let renderer = loading_renderer(
+                    window.clone(),
+                    false,
+                    Some(&self.gui),
+                    None,
+                    self.api,
+                    false,
+                )?;
                 Ok((window, renderer))
             });
         match made {

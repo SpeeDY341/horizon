@@ -129,6 +129,11 @@ impl Motion {
         }
     }
 
+    pub fn view(&self) -> Option<wgpu::TextureView> {
+        self.target
+            .as_ref()
+            .map(|t| t.create_view(&Default::default()))
+    }
     pub fn reset(&mut self) {
         self.history.clear();
         self.previous = None;
@@ -166,7 +171,8 @@ impl Motion {
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rg16Float,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             }));
         }
