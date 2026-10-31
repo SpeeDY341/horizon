@@ -668,6 +668,105 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires Vulkan and DirectX 12 devices"]
+    fn blocked_fg_preserves_post_and_motion_history_then_resets_once_on_recovery() {
+        for backend in [wgpu::Backends::VULKAN, wgpu::Backends::DX12] {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: backend,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let adapter =
+                pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+            let (device, queue) =
+                pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+            let texture = |size, usage| {
+                device
+                    .create_texture(&wgpu::TextureDescriptor {
+                        label: None,
+                        size: wgpu::Extent3d {
+                            width: size,
+                            height: size,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        usage,
+                        view_formats: &[],
+                    })
+                    .create_view(&Default::default())
+            };
+            let atlas = texture(1, wgpu::TextureUsages::TEXTURE_BINDING);
+            let screen = texture(32, wgpu::TextureUsages::RENDER_ATTACHMENT);
+            let indices = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 24,
+                usage: wgpu::BufferUsages::INDEX,
+                mapped_at_creation: false,
+            });
+            for reason in ["latched SDK fault", "unconfirmed cap", "unavailable Reflex"] {
+                for sr_active in [false, true] {
+                    let mut post = Post::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+                    post.taa = true;
+                    post.track_camera = true;
+                    let mut motion = super::super::motion::Motion::new(&device, &atlas);
+                    // Runtime's reset_ready boundary is tested with each actual
+                    // Session blocker. All retain pending but return false until
+                    // recovery, so the renderer must preserve fallback history.
+                    for (frame, expected) in [1., 0., 0., 0., 1., 0.].into_iter().enumerate() {
+                        super::super::frame_gen::prepare_frame_history(
+                            true,
+                            frame == 4,
+                            true,
+                            &mut post,
+                            Some(&mut motion),
+                        );
+                        let camera = DVec3::new(frame as f64 * 0.1, 0., 0.);
+                        post.jitter([32; 2], true, Mat4::IDENTITY, camera);
+                        let (_, depth) = post.prepare(&device, [32; 2], true).unwrap();
+                        let constants = post.temporal_jitter().unwrap();
+                        assert_eq!(
+                            constants[2], expected,
+                            "{backend:?}: {reason}, SR={sr_active}"
+                        );
+                        if !sr_active {
+                            assert_eq!(post.taa_uniform().jitter[2], expected);
+                        }
+                        let mut encoder = device.create_command_encoder(&Default::default());
+                        assert!(motion.render(
+                            &device,
+                            &queue,
+                            &mut encoder,
+                            camera,
+                            &[],
+                            &[],
+                            Mat4::IDENTITY,
+                            constants,
+                            &depth,
+                            [32; 2],
+                            &indices
+                        ));
+                        assert_eq!(motion.frame_reset(), expected != 0.);
+                        if sr_active {
+                            post.invalidate_history();
+                        } else {
+                            post.finish(&queue, &mut encoder, &screen);
+                        }
+                        assert_eq!(
+                            post.temporal_jitter().unwrap(),
+                            constants,
+                            "fallback/SR must not mutate the cached common constants"
+                        );
+                        queue.submit([encoder.finish()]);
+                    }
+                }
+            }
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        }
+    }
+
+    #[test]
     fn sr_skips_taa_history_without_resetting_common_constants_and_fallback_resets_once() {
         let (device, queue) = test_device().expect("GPU regression needs a device");
         let mut post = Post::new(&device, wgpu::TextureFormat::Rgba8Unorm);

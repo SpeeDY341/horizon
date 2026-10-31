@@ -182,6 +182,18 @@ impl Session {
         self.needs_reset
     }
 
+    /// Keep the lifecycle request pending while generation is blocked. Only
+    /// an attempt that can reach native On may reset shared SR/TAA history.
+    pub(crate) fn reset_ready(&self, reflex_active: bool, presentation_ready: bool) -> bool {
+        self.loaded
+            && self.wanted > 0
+            && self.max_generated > 0
+            && self.fault.is_none()
+            && reflex_active
+            && presentation_ready
+            && self.reset_pending()
+    }
+
     pub(crate) fn invalidate_history(&mut self) {
         self.needs_reset = true;
     }
@@ -1045,6 +1057,33 @@ mod tests {
         assert!(session.frame_ready(true, true, false));
         session.apply(false, true, 1, &input).unwrap();
         OPTIONS.with_borrow(|(calls, _)| assert_eq!(calls, &[MODE_OFF, MODE_ON, MODE_ON, MODE_ON]));
+    }
+
+    #[test]
+    fn pending_history_reset_waits_for_a_possible_generation_attempt() {
+        let mut session = Session::new(true, true);
+        session.loaded = true;
+        session.set_wanted(1);
+        session.max_generated = 1;
+        assert!(session.reset_ready(true, true));
+        session.note("mock SDK frame failure".into());
+        for _ in 0..4 {
+            assert!(session.reset_pending());
+            assert!(!session.reset_ready(true, true));
+        }
+        session.set_wanted(0);
+        session.set_wanted(1);
+        session.max_generated = 0;
+        assert!(session.reset_pending());
+        assert!(!session.reset_ready(true, true));
+        session.max_generated = 1;
+        assert!(!session.reset_ready(false, true));
+        assert!(!session.reset_ready(true, false));
+        assert!(session.reset_pending());
+        assert!(session.reset_ready(true, true));
+        // Native On success consumes the pending request, not these queries.
+        session.needs_reset = false;
+        assert!(!session.reset_ready(true, true));
     }
 
     #[test]

@@ -616,6 +616,26 @@ swapchain получает hook; стресс-проверка не зависа
   Обходы ограничений доступа или проверки подписей не применялись.
   Нужен независимый review H.
 
+### Исправление по review H (1 ноября 2026)
+
+- Независимый `review_h` дал **FAIL** коду
+  `dd011cbd9aaa6462e245d329b6ffc5f6070ef53c`: latched SDK fault сохранял
+  `loaded` и pending reset, поэтому каждый eligible fallback-кадр сбрасывал
+  общую Post/Motion историю. То же происходило при cap 0 и недоступном Reflex.
+- Runtime теперь возвращает применимый pending reset только при загруженной,
+  запрошенной FG без fault, подтверждённом ненулевом cap, активном Reflex и
+  готовом presentation hook. Запрос остаётся в Session без изменения до
+  настоящей попытки; recovery сбрасывает историю до построения constants.
+- **21 ordinary Streamline tests passed, 6 ignored**. Новый Session test
+  проверяет каждый blocker, сохранение pending и разрешение первого recovery.
+  Новый ignored real Post/Motion test запущен явно: **1 passed**, Vulkan/DX12,
+  TAA fallback и SR, последовательность reset `1,0,0,0,1,0`, накопление TAA,
+  согласованный Motion reset и неизменные cached common constants. Это две
+  границы проверки: Session readiness и обработка её результата renderer.
+  Clippy Streamline/render/client lib/bins/tests с `-D warnings`, fmt,
+  diff/public-tree прошли. Новые SDK/game запуски не требовались; ограничения
+  H по настоящему FG Present остаются открытыми. Нужен новый review H.
+
 ## 8. Выполнить итоговую проверку качества
 
 ### 8.1. Матрица сценариев
