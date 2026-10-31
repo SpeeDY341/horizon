@@ -4707,6 +4707,7 @@ impl Renderer {
         frame_gen::prepare_frame_history(
             self.framegen_frame_allowed(frame, surface_frame.is_some(), !taa),
             self.framegen_reset_pending(),
+            dlss::presentation_ready(&self.streamline),
             &mut self.world_post,
             self.motion.as_mut(),
         );

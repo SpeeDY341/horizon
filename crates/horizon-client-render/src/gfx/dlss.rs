@@ -6,6 +6,17 @@ pub(super) type Shared = std::sync::Arc<std::sync::Mutex<horizon_streamline::Run
 #[cfg(not(target_os = "windows"))]
 pub(super) type Shared = ();
 
+pub(super) fn presentation_ready(shared: &Option<Shared>) -> bool {
+    #[cfg(target_os = "windows")]
+    if let Some(shared) = shared {
+        return shared
+            .lock()
+            .is_ok_and(|runtime| runtime.presentation_ready().is_ok());
+    }
+    let _ = shared;
+    true
+}
+
 /// Keep the runtime loaded even if a new native chain cannot be proxied: older
 /// surfaces and native feature resources can still own SDK objects.
 pub(super) fn hook_presentation(

@@ -330,6 +330,27 @@ swapchain получает hook; стресс-проверка не зависа
   Linux/macOS и независимый review D **не выполнены**. D не закрывает R2/R4/R5;
   проверка настоящего возобновления FG остаётся зависима от E–G.
 
+### Исправление по review D
+
+- `review_d` дал **FAIL** для `98eb2d9b77cbf4b2225bb25c9641fd27333fcaf8`:
+  при отказе hook Session сохраняла pending reset, а renderer применял его
+  на каждом fallback-кадре мира. Из-за этого запасная TAA постоянно теряла
+  историю, пока FG оставалась недоступна.
+- Production decision `prepare_frame_history` теперь требует готовый
+  presentation path, который renderer читает через Runtime. Отказ hook или
+  poisoned lock не разрешает применять reset к TAA. Pending в Session
+  сохраняется для первого подходящего кадра после успешного hook.
+- Новая регрессия выполняет настоящий Post с TAA On и движущейся камерой:
+  четыре hook-failed fallback-кадра дают reset `1, 0, 0, 0`; первый кадр
+  после восстановления hook даёт `1`, следующий после успешного FG — `0`.
+  Она вызывает тот же production helper, что renderer. Mock SDK/runtime
+  дополнительно проверяет, что pending переживает четыре чтения unavailable
+  и остаётся установленным после успешного upgrade новой цепочки.
+- Windows: lifecycle **6 passed**, Streamline **12 passed, 3 ignored**.
+  Clippy streamline/renderer/client lib/bins/tests с `-D warnings`, fmt,
+  diff check и public-tree проходят. Новый независимый review и аппаратная
+  проверка D остаются открытыми. E–G этим исправлением не изменялись.
+
 ## 6. Объединить состояние кадра и сохранить входные данные — R4, R5
 
 **Файлы:** `gfx.rs`, `gfx/{dlss,motion,world_post}.rs`,

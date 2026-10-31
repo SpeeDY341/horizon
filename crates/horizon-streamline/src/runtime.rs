@@ -737,6 +737,9 @@ mod tests {
     #[test]
     fn hook_failure_blocks_consumers_and_successful_new_chain_recovers() {
         let mut presentation = Presentation::default();
+        let mut framegen = crate::frame_gen::Session::new(true, true);
+        framegen.set_wanted(1);
+        framegen.suspend().unwrap();
         assert!(presentation.ready().is_ok()); // offscreen / no hook attempted
         let error = presentation
             .update(unsafe { upgrade_dx12_interface(2usize as *mut _, mock_upgrade).map(|_| ()) })
@@ -746,6 +749,10 @@ mod tests {
         let result = presentation.ready().map(|()| called = true);
         assert_eq!(result.unwrap_err(), error);
         assert!(!called); // token allocation/evaluation must remain gated
+        for _ in 0..4 {
+            assert!(presentation.ready().is_err());
+            assert!(framegen.reset_pending());
+        }
         presentation
             .update(unsafe {
                 upgrade_dx12_interface(std::ptr::dangling_mut(), mock_upgrade).map(|proxy| {
@@ -754,6 +761,7 @@ mod tests {
             })
             .unwrap();
         assert!(presentation.ready().is_ok());
+        assert!(framegen.reset_pending()); // first recovered FG frame still needs reset
     }
 
     #[test]
