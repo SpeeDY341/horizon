@@ -20,6 +20,10 @@ pub fn eligible(vulkan: bool, vendor: u32, name: &str) -> bool {
 #[allow(dead_code)] // Public ABI is consumed by the following integration changes.
 mod dlss_abi;
 
+#[cfg(target_os = "windows")]
+#[allow(dead_code)] // Native resource boundary, connected by the next change.
+mod evaluate;
+
 #[cfg(test)]
 mod tests {
     #[test]
