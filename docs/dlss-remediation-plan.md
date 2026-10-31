@@ -272,6 +272,21 @@ swapchain получает hook; стресс-проверка не зависа
   затронутых crates lib/bins/tests с `-D warnings`. Повторный независимый
   review и аппаратный FG стресс остаются открытыми; D не менялась.
 
+### Сохранение порядка очереди по review C3
+
+- `review_c3` дал **FAIL** для `c7d2b7a4f`: coalescing перемещал повторный
+  resize за no-op present mode. Успешный no-op сбрасывал failures, позволяя
+  drag-событиям бессрочно обходить предел трёх попыток.
+- Запрос того же вида теперь заменяется на исходной позиции очереди. Ошибка
+  в её голове не пропускает поздние no-op и сохраняет failures/backoff.
+  Регрессия воспроизводит Loading resize → apply_menu_settings с повторными
+  Resize/PresentMode: ровно три Off-отказа, затем terminal Err; no-op не
+  вызывается и не обнуляет счётчик. Missing также выходит через существующий
+  error path после terminal render error, без новой серии redraw.
+- Targeted recovery tests: 4 passed; Clippy renderer/client lib/bins/tests с
+  `-D warnings`, fmt, diff check и public-tree успешно. Повторный независимый
+  review fix и аппаратные проверки остаются открытыми.
+
 ## 6. Объединить состояние кадра и сохранить входные данные — R4, R5
 
 **Файлы:** `gfx.rs`, `gfx/{dlss,motion,world_post}.rs`,

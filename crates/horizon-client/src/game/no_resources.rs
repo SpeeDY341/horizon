@@ -71,7 +71,10 @@ impl Missing {
         match renderer.render(&loading_frame(&batch)) {
             Ok(true) => return,
             Ok(false) => {}
-            Err(e) => self.error = Some(e),
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
         }
         // The frame was not shown (the first one often isn't): the glyphs it
         // rasterized never reached the atlas, so draw them again next frame.
@@ -163,7 +166,7 @@ impl ApplicationHandler for Missing {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if horizon_threads::stop_requests() > 0 {
+        if self.error.is_some() || horizon_threads::stop_requests() > 0 {
             event_loop.exit();
             return;
         }

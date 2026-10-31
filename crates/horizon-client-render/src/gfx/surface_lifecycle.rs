@@ -24,9 +24,16 @@ pub(super) struct Pending {
 impl Pending {
     pub fn push(&mut self, change: Change) {
         // A resize drag or repeated settings application retains only the
-        // latest request of each kind, without resetting failure backoff.
-        self.changes
-            .retain(|old| std::mem::discriminant(old) != std::mem::discriminant(&change));
+        // latest request of each kind, at its original queue position. Moving
+        // a failed request behind a successful no-op would reset its retries.
+        if let Some(old) = self
+            .changes
+            .iter_mut()
+            .find(|old| std::mem::discriminant(*old) == std::mem::discriminant(&change))
+        {
+            *old = change;
+            return;
+        }
         self.changes.push_back(change);
     }
 
@@ -132,6 +139,35 @@ mod tests {
             assert_eq!(attempts, expected);
             assert_eq!(result.is_err(), ms >= 750);
             assert_eq!(pending.changes.len(), 1);
+        }
+    }
+
+    #[test]
+    fn resize_drag_cannot_move_failure_behind_noop_settings() {
+        let now = Instant::now();
+        let mut pending = Pending::default();
+        let mut attempts = 0;
+        let mut noop_calls = 0;
+        // Loading's Resized handler follows resize with apply_menu_settings.
+        // Replacing Resize must leave it ahead of the no-op PresentMode.
+        for (ms, expected) in [(0, 1), (250, 2), (750, 3), (1000, 3)] {
+            pending.push(Change::Resize(1600 + ms as u32, 900));
+            pending.push(Change::PresentMode(wgpu::PresentMode::Fifo));
+            let result = pending.poll(now + Duration::from_millis(ms), |change| match change {
+                Change::Resize(..) => {
+                    attempts += 1;
+                    Err("Off failed".into())
+                }
+                Change::PresentMode(_) => {
+                    noop_calls += 1;
+                    Ok(())
+                }
+                _ => unreachable!(),
+            });
+            assert_eq!(attempts, expected);
+            assert_eq!(noop_calls, 0);
+            assert_eq!(result.is_err(), ms >= 750);
+            assert_eq!(pending.failures, expected);
         }
     }
 
