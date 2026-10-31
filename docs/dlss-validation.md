@@ -50,6 +50,17 @@ after dropping Runtime before the native owners. It runs with FG Off in a
 hidden native window: focused FG 2× and additional displayed frames remain
 unproven. No focus or signature guard was bypassed.
 
+Fresh review rejected `14789df1f`: dropping all external native owners before
+Runtime caused access violation during deferred shutdown, while an independent
+D3D12 DLL pin prevented it. The fix keeps HAL's actual D3D12 library Arc directly
+in SdkLifetime until after shutdown, native/proxy COM Release and SDK DLL unload.
+It does not retain a hook or Runtime. The native regression now runs the full
+two-chain/resize scenario in both teardown orders and reinitializes the SDK
+after each. This fix awaits a new independent review.
+The extended native test passed in 19.42 seconds (12 configurations and three
+SDK sessions); 21 ordinary tests, targeted renderer/Streamline Clippy, workspace
+and explicit HAL formatting and diff checks passed again on the fix.
+
 The same F1 code passed 21 ordinary Streamline tests (7 explicitly ignored),
 4 explicit SDK tests including this creation regression and both APIs'
 support checks, 4 renderer lifecycle tests, targeted Windows check and

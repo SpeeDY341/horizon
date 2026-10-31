@@ -58,6 +58,13 @@ impl CreationHook {
 }
 
 impl Instance {
+    /// Retain D3D12's implementation independently of HAL object ownership.
+    /// Native integrations holding additional COM references must keep this
+    /// guard until their shutdown and final native Release have completed.
+    pub fn native_library_guard(&self) -> Arc<dyn Send + Sync> {
+        self.library.clone()
+    }
+
     /// Initialize before any surfaces/adapters exist, so every queue and chain
     /// is created through the interposer, including recreated surfaces.
     ///

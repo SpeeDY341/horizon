@@ -34,6 +34,27 @@ unsafe fn assert_proxy<T: Interface>(runtime: &Runtime, proxy: &T) -> T {
 #[test]
 #[ignore = "requires the official SDK, Windows desktop and an RTX DX12 FG device"]
 fn official_sdk_dx12_creation_buffers_resize_and_recreate() {
+    // Runtime-last caught a missing D3D12 DLL pin even though Runtime-first
+    // passed. Reinitialize after each order to detect a retained SDK lease.
+    for runtime_first in [false, true] {
+        creation_and_teardown(runtime_first);
+    }
+    let path = std::env::var_os("HORIZON_STREAMLINE_SDK").expect("SDK path");
+    drop(
+        Runtime::load_with(
+            Path::new(&path),
+            "00a6bdb2-6386-4e37-8ff9-dcda4642628a",
+            Api::Dx12,
+            false,
+            true,
+            true,
+        )
+        .unwrap(),
+    );
+    assert!(!SESSION.load(Ordering::Acquire));
+}
+
+fn creation_and_teardown(runtime_first: bool) {
     let path = std::env::var_os("HORIZON_STREAMLINE_SDK").expect("SDK path");
     eprintln!("creation: load SDK");
     let mut runtime = Runtime::load_with(
@@ -160,18 +181,20 @@ fn official_sdk_dx12_creation_buffers_resize_and_recreate() {
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         drop(surface);
     }
-    // Deliberately drop Runtime first: native COM owners retain SDK; native
-    // device remains alive until the deferred shutdown has completed.
-    eprintln!("teardown runtime");
-    drop(runtime);
-    eprintln!("teardown queue");
-    drop(queue);
-    eprintln!("teardown device");
-    drop(device);
-    eprintln!("teardown adapter");
-    drop(adapter);
-    eprintln!("teardown instance");
-    drop(instance);
+    eprintln!("teardown runtime_first={runtime_first}");
+    if runtime_first {
+        drop(runtime);
+        drop(queue);
+        drop(device);
+        drop(adapter);
+        drop(instance);
+    } else {
+        drop(queue);
+        drop(device);
+        drop(adapter);
+        drop(instance);
+        drop(runtime);
+    }
     eprintln!("teardown complete");
     assert!(
         !SESSION.load(Ordering::Acquire),

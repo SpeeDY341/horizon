@@ -22,6 +22,9 @@ struct SdkLifetime {
     // Drop native references before unloading proxy code; release the global
     // lease last so a second SDK session cannot overlap final COM Release.
     _library: std::sync::Arc<libloading::os::windows::Library>,
+    // Runtime's own COM references can outlive every HAL hook. Pin D3D12
+    // independently until after shutdown, both COM owners, and the SDK DLL.
+    native_library: std::sync::Mutex<Option<std::sync::Arc<dyn Send + Sync>>>,
     _lease: Lease,
 }
 impl SdkLifetime {
@@ -322,6 +325,7 @@ impl Runtime {
             _lease: guard,
             native_device: Default::default(),
             proxy_device: Default::default(),
+            native_library: Default::default(),
         });
         Ok(Self {
             api,
@@ -622,6 +626,11 @@ impl Runtime {
             let native =
                 unsafe { wgpu::hal::dx12::Instance::init_with_creation_hook(&descriptor, hook) }
                     .map_err(|error| error.to_string())?;
+            *self
+                ._session
+                .native_library
+                .lock()
+                .map_err(|_| "SDK library lock poisoned")? = Some(native.native_library_guard());
             let instance = unsafe { wgpu::Instance::from_hal::<wgpu::hal::api::Dx12>(native) };
             self.instance = Some(instance.clone());
             return Ok(instance);

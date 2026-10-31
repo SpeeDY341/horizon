@@ -382,6 +382,17 @@ swapchain получает hook; стресс-проверка не зависа
 
 ### Повторное исправление F1 (1 ноября 2026, review pending)
 
+- Независимый review `14789df1f` дал **FAIL**: при внешнем drop queue/device/
+  adapter/instance перед Runtime его собственные COM-ссылки переживали HAL pin
+  D3D12 DLL, что давало access violation при shutdown/Release. Отдельное
+  удержание d3d12.dll в probe устраняло crash и позволяло новый SDK session.
+  Исправление удерживает тот же Arc библиотеки непосредственно в SdkLifetime,
+  независимо от hook: shutdown → native/proxy COM Release → SDK DLL → D3D12 DLL
+  → global lease. Обратного владения SDK через pin нет. Повторный review нужен.
+  На исправлении extended native test прошёл за 19.42 s: 12 конфигураций,
+  оба teardown и три последовательных SDK session. Также заново прошли
+  ordinary 21 / 7 ignored, renderer/Streamline Clippy lib/tests `-D warnings`,
+  workspace fmt, отдельный HAL rustfmt и diff check.
 - Поздний `slUpgradeInterface(swapchain)` заменён instance-scoped HAL
   интеграцией: factory proxy существует до создания surface, выбранный native
   device регистрируется и получает proxy до CreateCommandQueue. Все поддержанные
@@ -399,7 +410,9 @@ swapchain получает hook; стресс-проверка не зависа
   подтверждены через slGetNativeInterface; acquired textures HAL равны
   proxy GetBuffer и отличаются от native GetBuffer. Проверены два новых chain,
   каждый 800→960→800, clear/submit/Present и полное освобождение SDK lease
-  после раннего drop Runtime. Это настоящий creation/Present тест с FG Off,
+  после раннего drop Runtime. Расширенная регрессия повторяет весь сценарий
+  с обоими порядками drop (Runtime последним и первым), проверяет release lease
+  и повторный SDK session после каждого порядка. Это creation/Present тест с FG Off,
   а не проверка focused FG 2× или дополнительного показанного кадра.
 - Windows: Streamline ordinary 21 passed / 7 ignored; explicit official SDK
   4 passed; real SR pixel tests Vulkan/DX12 2 passed;
