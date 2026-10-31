@@ -555,7 +555,27 @@ swapchain получает hook; стресс-проверка не зависа
   UI-ввод остановлен. Известный тестовый PID завершён через control quit.
   **Настоящая FG 2× на Vulkan/DX12, live generation tags, warnings-free
   Present, качество HUD/руки и stress остаются непроверенными.** Headless
-  SDK support/SR tests их не заменяют. Review G ещё не выполнен.
+  SDK support/SR tests их не заменяют.
+
+### Исправление по review G (1 ноября 2026)
+
+- Независимый `review_g` дал **FAIL** для
+  `5c3e9ded2cf72a35d7532f12bb8dc64abaca7e75`: новая общая проверка адаптера
+  ошибочно применяла DLSS RTX-name prefilter к Reflex/PCL. Это отклоняло
+  поддерживаемые SDK устройства GeForce GTX до `slIsFeatureSupported`.
+- Production boundary теперь сохраняет общую проверку API/session identity,
+  а RTX prefilter применяет только к DLSS/FG (0/1000). Reflex/PCL (3/4)
+  получают ответ SDK на фактическом native adapter, независимо от имени GPU.
+  Это следует закреплённому официальному Reflex guide: Reflex Low Latency
+  поддерживает GeForce 900+; PCL работает и на других производителях.
+- Регрессия вызывает тот же production boundary на Vulkan/DX12: GTX 1080
+  достигает mock SDK для Reflex/PCL, успех и отказ SDK сохраняются; DLSS/FG
+  по-прежнему отсеиваются; неверный API не достигает SDK; Radeon PCL достигает.
+  **18 ordinary tests passed, 5 SDK tests ignored** в этом повторном прогоне.
+  Clippy Streamline/render/client lib/bins/tests с `-D warnings`, fmt,
+  diff check и public-tree прошли.
+  Проверка GTX на настоящем оборудовании не выполнялась. Нужен новый review G;
+  прежние ограничения actual FG 2× остаются открытыми.
 
 ## 8. Выполнить итоговую проверку качества
 

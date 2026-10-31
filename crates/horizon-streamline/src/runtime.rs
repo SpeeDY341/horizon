@@ -743,58 +743,50 @@ impl Runtime {
 
     fn check_feature_adapter(&self, adapter: &wgpu::Adapter, feature: u32) -> Result<(), String> {
         let info = adapter.get_info();
-        let supported = matches!(info.backend, wgpu::Backend::Vulkan | wgpu::Backend::Dx12);
-        if !crate::eligible(supported, info.vendor, &info.name) {
-            return Err("DLSS requires Vulkan or DirectX 12 on an NVIDIA RTX adapter".into());
-        }
-        let matches_session = match self.api {
-            Api::Vulkan => info.backend == wgpu::Backend::Vulkan,
-            Api::Dx12 => info.backend == wgpu::Backend::Dx12,
-        };
-        if !matches_session {
-            return Err("DLSS graphics API does not match this adapter".into());
-        }
-        let base = abi::Base::new(
-            0x0677315f,
-            0xa746,
-            0x4492,
-            [0x9f, 0x42, 0xcb, 0x61, 0x42, 0xc9, 0xc3, 0xd4],
-            1,
-        );
-        // Safety: matching SDK ABI. The hal guard and adapter stay alive across
-        // the call. A Vulkan physical device makes Streamline ignore the LUID.
-        let result = if self.api == Api::Dx12 {
-            let native = unsafe { adapter.as_hal::<wgpu::hal::api::Dx12>() }
-                .ok_or("DirectX 12 adapter unavailable")?;
-            let luid = native
-                .adapter_luid()
-                .ok_or("DirectX 12 adapter LUID unavailable")?;
-            let adapter_info = abi::AdapterInfo {
-                base,
-                luid: luid.as_ptr(),
-                luid_size: 8,
-                physical_device: std::ptr::null_mut(),
-            };
-            unsafe { (self.supported)(feature, &adapter_info) }
-        } else {
-            use ash::vk::Handle;
-            let native = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }
-                .ok_or("Vulkan adapter unavailable")?;
-            let adapter_info = abi::AdapterInfo {
-                base,
-                luid: std::ptr::null(),
-                luid_size: 0,
-                physical_device: native.raw_physical_device().as_raw() as *mut std::ffi::c_void,
-            };
-            unsafe { (self.supported)(feature, &adapter_info) }
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(format!(
-                "Streamline feature {feature} unsupported on this adapter ({result})"
-            ))
-        }
+        query_feature_support(
+            self.api,
+            info.backend,
+            info.vendor,
+            &info.name,
+            feature,
+            || {
+                let base = abi::Base::new(
+                    0x0677315f,
+                    0xa746,
+                    0x4492,
+                    [0x9f, 0x42, 0xcb, 0x61, 0x42, 0xc9, 0xc3, 0xd4],
+                    1,
+                );
+                // Safety: matching SDK ABI. The hal guard and adapter stay alive across
+                // the call. A Vulkan physical device makes Streamline ignore the LUID.
+                Ok(if self.api == Api::Dx12 {
+                    let native = unsafe { adapter.as_hal::<wgpu::hal::api::Dx12>() }
+                        .ok_or("DirectX 12 adapter unavailable")?;
+                    let luid = native
+                        .adapter_luid()
+                        .ok_or("DirectX 12 adapter LUID unavailable")?;
+                    let adapter_info = abi::AdapterInfo {
+                        base,
+                        luid: luid.as_ptr(),
+                        luid_size: 8,
+                        physical_device: std::ptr::null_mut(),
+                    };
+                    unsafe { (self.supported)(feature, &adapter_info) }
+                } else {
+                    use ash::vk::Handle;
+                    let native = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }
+                        .ok_or("Vulkan adapter unavailable")?;
+                    let adapter_info = abi::AdapterInfo {
+                        base,
+                        luid: std::ptr::null(),
+                        luid_size: 0,
+                        physical_device: native.raw_physical_device().as_raw()
+                            as *mut std::ffi::c_void,
+                    };
+                    unsafe { (self.supported)(feature, &adapter_info) }
+                })
+            },
+        )
     }
 
     /// Install Streamline's DirectX 12 swapchain proxy so Present retires
@@ -887,6 +879,36 @@ unsafe fn upgrade_dx12_interface(
     }
 }
 
+/// Reflex and PCL support is defined by the SDK, independently of DLSS/RTX.
+/// Keep API/session identity checks common, then query the actual native adapter.
+fn query_feature_support(
+    api: Api,
+    backend: wgpu::Backend,
+    vendor: u32,
+    name: &str,
+    feature: u32,
+    query: impl FnOnce() -> Result<i32, String>,
+) -> Result<(), String> {
+    let matches_session = matches!(
+        (api, backend),
+        (Api::Vulkan, wgpu::Backend::Vulkan) | (Api::Dx12, wgpu::Backend::Dx12)
+    );
+    if !matches_session {
+        return Err("Streamline graphics API does not match this adapter".into());
+    }
+    if matches!(feature, 0 | 1000) && !crate::eligible(true, vendor, name) {
+        return Err("DLSS requires Vulkan or DirectX 12 on an NVIDIA RTX adapter".into());
+    }
+    let result = query()?;
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Streamline feature {feature} unsupported on this adapter ({result})"
+        ))
+    }
+}
+
 fn preference_flags(api: Api) -> u64 {
     abi::DISABLE_CL_STATE_TRACKING
         | abi::USE_FRAME_BASED_RESOURCE_TAGGING
@@ -942,6 +964,59 @@ impl Drop for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gtx_reflex_and_pcl_reach_sdk_while_dlss_retains_its_rtx_gate() {
+        for (api, backend) in [
+            (Api::Vulkan, wgpu::Backend::Vulkan),
+            (Api::Dx12, wgpu::Backend::Dx12),
+        ] {
+            for feature in [3, 4] {
+                let calls = std::cell::Cell::new(0);
+                for code in [0, 42] {
+                    let result = query_feature_support(
+                        api,
+                        backend,
+                        0x10de,
+                        "GeForce GTX 1080",
+                        feature,
+                        || {
+                            calls.set(calls.get() + 1);
+                            Ok(code)
+                        },
+                    );
+                    assert_eq!(result.is_ok(), code == 0);
+                }
+                assert_eq!(calls.get(), 2); // SDK truth, including its rejection
+            }
+            for feature in [0, 1000] {
+                assert!(
+                    query_feature_support(
+                        api,
+                        backend,
+                        0x10de,
+                        "GeForce GTX 1080",
+                        feature,
+                        || panic!("RTX gate bypassed")
+                    )
+                    .is_err()
+                );
+            }
+            let other = if api == Api::Vulkan {
+                wgpu::Backend::Dx12
+            } else {
+                wgpu::Backend::Vulkan
+            };
+            assert!(
+                query_feature_support(api, other, 0x10de, "GeForce GTX 1080", 3, || panic!(
+                    "API identity bypassed"
+                ))
+                .is_err()
+            );
+            // PCL is cross-vendor; it must also defer to the SDK.
+            assert!(query_feature_support(api, backend, 0x1002, "Radeon", 4, || Ok(0)).is_ok());
+        }
+    }
 
     #[test]
     fn preferences_enable_frame_tags_on_both_apis_without_ota_or_bypasses() {
