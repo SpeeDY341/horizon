@@ -1,5 +1,8 @@
 //! Optional DLSS inputs. Never changes the existing TAA resolve.
-use super::{Frame, motion_history::History};
+use super::{
+    Vertex,
+    motion_history::{History, Span},
+};
 use glam::{DMat4, DVec3, Mat4};
 use wgpu::util::DeviceExt;
 
@@ -136,7 +139,9 @@ impl Motion {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        frame: &Frame<'_>,
+        camera_position: DVec3,
+        spans: &[Span],
+        entities: &[Vertex],
         current: Mat4,
         jitter: [f32; 4],
         depth: &wgpu::TextureView,
@@ -168,13 +173,13 @@ impl Motion {
         let reset = jitter[2] != 0.0
             || self
                 .previous
-                .is_none_or(|(_, c)| c.distance_squared(frame.camera) > 1024.0);
+                .is_none_or(|(_, c)| c.distance_squared(camera_position) > 1024.0);
         if reset {
             self.reset();
         }
-        let (previous, camera) = self.previous.unwrap_or((current, frame.camera));
+        let (previous, camera) = self.previous.unwrap_or((current, camera_position));
         let reproject = previous.as_dmat4()
-            * DMat4::from_translation(frame.camera - camera)
+            * DMat4::from_translation(camera_position - camera)
             * current.as_dmat4().inverse();
         let u = Uniform {
             current: current.to_cols_array_2d(),
@@ -183,9 +188,8 @@ impl Motion {
             jitter: [jitter[0], jitter[1], if reset { 1.0 } else { 0.0 }, 0.0],
         };
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&u));
-        self.history
-            .update(frame.motion_spans, frame.entities, frame.camera, reset);
-        self.previous = Some((current, frame.camera));
+        self.history.update(spans, entities, camera_position, reset);
+        self.previous = Some((current, camera_position));
         let target = self
             .target
             .as_ref()
@@ -269,6 +273,96 @@ impl Motion {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn motion_pipelines_compile_on_vulkan() {
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::VULKAN;
+        let instance = wgpu::Instance::new(desc);
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            return;
+        };
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let atlas = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut motion = super::Motion::new(&device, &atlas.create_view(&Default::default()));
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 8,
+                height: 8,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth = depth.create_view(&Default::default());
+        let vertices = [super::Vertex {
+            pos: [0.0, 0.0, 0.5],
+            color: u32::MAX,
+            ..bytemuck::Zeroable::zeroed()
+        }; 4];
+        let indices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 24,
+            usage: wgpu::BufferUsages::INDEX,
+            mapped_at_creation: false,
+        });
+        for i in 0..2 {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.5),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            }));
+            motion.render(
+                &device,
+                &queue,
+                &mut encoder,
+                glam::DVec3::ZERO,
+                &[super::Span {
+                    id: 1,
+                    item: false,
+                    vertices: 0..4,
+                }],
+                &vertices,
+                glam::Mat4::IDENTITY,
+                [0.0, 0.0, if i == 0 { 1.0 } else { 0.0 }, 0.0],
+                &depth,
+                [8, 8],
+                &indices,
+            );
+            queue.submit([encoder.finish()]);
+        }
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        assert!(pollster::block_on(scope.pop()).is_none());
+    }
+
     #[test]
     fn motion_shader_validates() {
         let module = naga::front::wgsl::parse_str(include_str!("motion.wgsl")).unwrap();
