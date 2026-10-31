@@ -6,8 +6,15 @@ pub(super) type Shared = std::sync::Arc<std::sync::Mutex<horizon_streamline::Run
 #[cfg(not(target_os = "windows"))]
 pub(super) type Shared = ();
 
-pub(super) fn load(dlss: bool, reflex: bool, backend: wgpu::Backends) -> Option<Shared> {
-    if (!dlss && !reflex) || !matches!(backend, wgpu::Backends::VULKAN | wgpu::Backends::DX12) {
+pub(super) fn load(
+    dlss: bool,
+    reflex: bool,
+    framegen: bool,
+    backend: wgpu::Backends,
+) -> Option<Shared> {
+    if (!dlss && !reflex && !framegen)
+        || !matches!(backend, wgpu::Backends::VULKAN | wgpu::Backends::DX12)
+    {
         return None;
     }
     #[cfg(target_os = "windows")]
@@ -33,12 +40,19 @@ pub(super) fn load(dlss: bool, reflex: bool, backend: wgpu::Backends) -> Option<
                     api,
                     dlss,
                     reflex,
+                    framegen,
                 )
             });
         match result {
             Ok(runtime) => {
                 if reflex && !runtime.reflex_requested() {
                     log::warn!("Reflex plugins were not found beside the Streamline SDK");
+                }
+                if framegen && !runtime.framegen_requested() {
+                    log::warn!("Frame Generation plugins were not found beside the Streamline SDK");
+                }
+                if framegen && !runtime.reflex_requested() {
+                    log::warn!("Reflex plugins were not found; Frame Generation needs them");
                 }
                 let shared = std::sync::Arc::new(std::sync::Mutex::new(runtime));
                 horizon_streamline::install_reflex(&shared);
@@ -59,6 +73,44 @@ pub(super) fn load(dlss: bool, reflex: bool, backend: wgpu::Backends) -> Option<
             graphics::report_dlss("TAA: Windows");
         }
         None
+    }
+}
+
+/// Matrices without jitter, plus the jitter in pixels. Super Resolution and
+/// Frame Generation share this so the two cannot drift.
+#[cfg(target_os = "windows")]
+pub(super) fn frame_constants(
+    projection: Mat4,
+    reproject: Mat4,
+    jitter: [f32; 4],
+    size: [u32; 2],
+    far: f32,
+    fov: f32,
+    aspect: f32,
+    view: Mat4,
+    camera: glam::DVec3,
+    reset: bool,
+) -> horizon_streamline::FrameConstants {
+    horizon_streamline::FrameConstants {
+        projection: projection.to_cols_array_2d(),
+        inverse_projection: projection.inverse().to_cols_array_2d(),
+        reprojection: reproject.to_cols_array_2d(),
+        inverse_reprojection: reproject.inverse().to_cols_array_2d(),
+        jitter_pixels: [
+            jitter[0] * size[0] as f32 * 0.5,
+            -jitter[1] * size[1] as f32 * 0.5,
+        ],
+        camera: [
+            camera.as_vec3().to_array(),
+            view.inverse().transform_vector3(glam::Vec3::Y).to_array(),
+            view.inverse().transform_vector3(glam::Vec3::X).to_array(),
+            view.inverse().transform_vector3(-glam::Vec3::Z).to_array(),
+        ],
+        near: 0.05,
+        far,
+        fov,
+        aspect,
+        reset,
     }
 }
 
@@ -292,27 +344,18 @@ impl State {
         #[cfg(target_os = "windows")]
         {
             let engine = self.engine.as_mut()?;
-            let frame = horizon_streamline::FrameConstants {
-                projection: projection.to_cols_array_2d(),
-                inverse_projection: projection.inverse().to_cols_array_2d(),
-                reprojection: reproject.to_cols_array_2d(),
-                inverse_reprojection: reproject.inverse().to_cols_array_2d(),
-                jitter_pixels: [
-                    jitter[0] * size[0] as f32 * 0.5,
-                    -jitter[1] * size[1] as f32 * 0.5,
-                ],
-                camera: [
-                    camera.as_vec3().to_array(),
-                    view.inverse().transform_vector3(glam::Vec3::Y).to_array(),
-                    view.inverse().transform_vector3(glam::Vec3::X).to_array(),
-                    view.inverse().transform_vector3(-glam::Vec3::Z).to_array(),
-                ],
-                near: 0.05,
+            let frame = frame_constants(
+                projection,
+                reproject,
+                jitter,
+                size,
                 far,
                 fov,
                 aspect,
-                reset: self.reset || jitter[2] != 0.0,
-            };
+                view,
+                camera,
+                self.reset || jitter[2] != 0.0,
+            );
             let result = if std::env::var_os("HORIZON_DLSS_FORCE_ERROR").is_some() {
                 Err("Forced diagnostic failure".into())
             } else {

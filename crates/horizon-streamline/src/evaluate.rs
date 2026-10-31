@@ -373,7 +373,7 @@ impl Targets {
     }
 }
 
-fn tagged_resource(
+pub(crate) fn tagged_resource(
     native: *mut c_void,
     view: *mut c_void,
     state: u32,

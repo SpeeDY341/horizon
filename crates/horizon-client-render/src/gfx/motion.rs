@@ -136,6 +136,13 @@ impl Motion {
             .as_ref()
             .map(|t| t.create_view(&Default::default()))
     }
+
+    /// The motion image and a full view of it, for a Frame Generation tag.
+    pub fn tagged(&self) -> Option<(wgpu::Texture, wgpu::TextureView)> {
+        self.target
+            .as_ref()
+            .map(|t| (t.clone(), t.create_view(&Default::default())))
+    }
     pub fn frame_reset(&self) -> bool {
         self.frame_reset
     }

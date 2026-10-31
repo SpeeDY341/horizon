@@ -12373,6 +12373,7 @@ impl Game<'_> {
             self.settings.horizon.api,
             self.settings.horizon.dlss_mode() != horizon_client::graphics::Dlss::Off,
             self.settings.horizon.reflex,
+            self.settings.horizon.framegen,
         )
     }
     fn apply_settings(&mut self) {
@@ -16909,6 +16910,7 @@ fn build_renderer(
     api: horizon_client::graphics::GraphicsApi,
     enable_dlss: bool,
     reflex: horizon_client::graphics::Reflex,
+    framegen: horizon_client::graphics::FrameGen,
 ) -> Result<Renderer> {
     let assets = &pack.render;
     let atlas = &gui.atlas;
@@ -16943,6 +16945,7 @@ fn build_renderer(
         api,
         enable_dlss,
         reflex,
+        framegen,
     ))?;
     renderer.hud.sprite_animations = atlas
         .sprite_animations
@@ -16963,6 +16966,7 @@ fn loading_renderer(
     api: horizon_client::graphics::GraphicsApi,
     enable_dlss: bool,
     reflex: horizon_client::graphics::Reflex,
+    framegen: horizon_client::graphics::FrameGen,
 ) -> Result<Renderer> {
     static FORCEFIELD: [u8; 4] = [0; 4];
     static EMPTY_HUD: [u8; 4] = [0, 0, 0, 255];
@@ -17006,6 +17010,7 @@ fn loading_renderer(
         api,
         enable_dlss,
         reflex,
+        framegen,
     ))?;
     if let Some(atlas) = atlas {
         renderer.hud.sprite_animations = atlas
@@ -17344,6 +17349,7 @@ impl Loading {
             self.settings.horizon.api,
             self.settings.horizon.dlss_mode() != horizon_client::graphics::Dlss::Off,
             self.settings.horizon.reflex,
+            self.settings.horizon.framegen,
         ) {
             Ok(r) => self.renderer = Some(r),
             Err(e) => {
@@ -17391,6 +17397,7 @@ impl Loading {
             self.settings.horizon.api,
             self.settings.horizon.dlss_mode() != horizon_client::graphics::Dlss::Off,
             self.settings.horizon.reflex,
+            self.settings.horizon.framegen,
         ) {
             Ok(r) => {
                 horizon_client::hud::GUI_SCALE.store(self.settings.gui_scale, Ordering::Relaxed);
@@ -17481,6 +17488,7 @@ impl Loading {
             self.settings.horizon.api,
             self.settings.horizon.dlss_mode() != horizon_client::graphics::Dlss::Off,
             self.settings.horizon.reflex,
+            self.settings.horizon.framegen,
         )?;
         log::info!(
             "Horizon: world renderer ready after {} ms",

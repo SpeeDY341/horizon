@@ -16,6 +16,8 @@ const HISTORY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 struct WorldTarget {
     size: [u32; 2],
     color: wgpu::TextureView,
+    /// Kept so Frame Generation can tag the image, not only the view.
+    depth_texture: wgpu::Texture,
     depth: wgpu::TextureView,
     group: wgpu::BindGroup,
     taa: Option<History>,
@@ -66,6 +68,9 @@ pub struct Post {
     internal_size: Option<[u32; 2]>,
     /// TAA runs this frame (`jitter`): not on the title screen or under a shader pack.
     taa_on: bool,
+    /// Frame Generation without TAA still needs the previous camera. The picture
+    /// itself stays unjittered.
+    pub track_camera: bool,
     target: Option<WorldTarget>,
     taa_resources: Option<TaaResources>,
     /// Frames jittered so far (the Halton index), and which history the next resolve writes.
@@ -245,6 +250,7 @@ impl Post {
             upscale: 1.0,
             internal_size: None,
             taa_on: false,
+            track_camera: false,
             target: None,
             taa_resources,
             taa_frame: 0,
@@ -288,8 +294,25 @@ impl Post {
     /// projection, relative to `camera`. Call it before `prepare`, once per frame.
     pub fn jitter(&mut self, window: [u32; 2], on: bool, view_proj: Mat4, camera: DVec3) -> Mat4 {
         self.taa_on = on && self.taa && self.taa_resources.is_some();
-        if !self.taa_on {
+        let track = self.track_camera && !self.taa_on;
+        if !self.taa_on && !track {
             self.taa_previous = None;
+            return Mat4::IDENTITY;
+        }
+        if track {
+            let current = view_proj.as_dmat4();
+            let (reproject, reset) = match self.taa_previous {
+                Some((previous, previous_camera)) => (
+                    reprojection(previous, previous_camera, current, camera),
+                    0.0,
+                ),
+                None => (DMat4::IDENTITY, 1.0),
+            };
+            self.taa_previous = Some((current, camera));
+            self.taa_this_frame = TaaUniform {
+                reproject: reproject.as_mat4().to_cols_array_2d(),
+                jitter: [0.0, 0.0, reset, 0.0],
+            };
             return Mat4::IDENTITY;
         }
         self.taa_frame = self.taa_frame.wrapping_add(1);
@@ -359,14 +382,15 @@ impl Post {
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
             let color = make_tex("Scaled world", size, self.format, sampled)
                 .create_view(&Default::default());
-            // TEXTURE_BINDING: occlusion culling and TAA read it.
-            let depth = make_tex(
+            // TEXTURE_BINDING: occlusion culling and TAA read it. COPY_SRC: Frame
+            // Generation copies it before the hand clears the screen depth.
+            let depth_texture = make_tex(
                 "Scaled world depth",
                 size,
                 wgpu::TextureFormat::Depth32Float,
                 sampled | wgpu::TextureUsages::COPY_SRC,
-            )
-            .create_view(&Default::default());
+            );
+            let depth = depth_texture.create_view(&Default::default());
             let group = self.bind(device, &color);
             let taa = history_size.and_then(|output| {
                 let res = self.taa_resources.as_ref()?;
@@ -415,6 +439,7 @@ impl Post {
             self.target = Some(WorldTarget {
                 size,
                 color,
+                depth_texture,
                 depth,
                 group,
                 taa,
@@ -427,12 +452,19 @@ impl Post {
 
     /// Exactly the jitter used for this frame's world, including target rebuild resets.
     pub fn temporal_jitter(&self) -> Option<[f32; 4]> {
-        self.taa_on.then_some(self.taa_this_frame.jitter)
+        (self.taa_on || self.track_camera).then_some(self.taa_this_frame.jitter)
     }
 
     /// The size of the world's own target, when it has one.
     pub fn size(&self) -> Option<[u32; 2]> {
         self.target.as_ref().map(|t| t.size)
+    }
+
+    /// Depth image and view for a Frame Generation tag. The view is the one the world wrote.
+    pub fn depth_inputs(&self) -> Option<(wgpu::Texture, wgpu::TextureView)> {
+        self.target
+            .as_ref()
+            .map(|t| (t.depth_texture.clone(), t.depth.clone()))
     }
 
     /// Bindings that copy (or anti-alias) `view` onto the screen in `finish_with`.
@@ -568,6 +600,25 @@ mod tests {
             [halton(1, 2), halton(2, 2), halton(3, 2)],
             [0.5, 0.25, 0.75]
         );
+    }
+
+    #[test]
+    fn frame_generation_tracks_the_camera_without_jittering_the_picture() {
+        let Some((device, _)) = test_device() else {
+            return;
+        };
+        let mut post = Post::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        post.track_camera = true;
+        let view = Mat4::from_translation(glam::Vec3::new(1.0, 0.0, 0.0));
+        let jittered = post.jitter([100, 100], false, view, DVec3::ZERO);
+        assert_eq!(jittered, Mat4::IDENTITY);
+        let first = post.temporal_jitter().unwrap();
+        assert_eq!(first[0], 0.0);
+        assert_eq!(first[2], 1.0);
+        let jittered = post.jitter([100, 100], false, view, DVec3::new(1.0, 0.0, 0.0));
+        assert_eq!(jittered, Mat4::IDENTITY);
+        assert_eq!(post.temporal_jitter().unwrap()[2], 0.0);
+        assert_ne!(post.reprojection(), Mat4::IDENTITY);
     }
 
     fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {

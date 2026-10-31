@@ -112,6 +112,44 @@ unsafe fn same_device(
     }
     Err("DLSS device is neither Vulkan nor DirectX 12".into())
 }
+/// Common constants for one presented frame. Matrices stay free of jitter.
+/// Depth is reversed and motion already includes the camera, matching DLSS.
+pub(crate) fn native_constants(frame: &FrameConstants) -> sl::Constants {
+    let identity = [
+        [1., 0., 0., 0.],
+        [0., 1., 0., 0.],
+        [0., 0., 1., 0.],
+        [0., 0., 0., 1.],
+    ];
+    sl::Constants {
+        base: Base::new(
+            0xdcd35ad7,
+            0x4e4a,
+            0x4bad,
+            [0xa9, 0x0c, 0xe0, 0xc4, 0x9e, 0xb2, 0x3a, 0xfe],
+            2,
+        ),
+        matrices: [
+            frame.projection,
+            frame.inverse_projection,
+            identity,
+            frame.reprojection,
+            frame.inverse_reprojection,
+        ],
+        jitter: frame.jitter_pixels,
+        motion_scale: [1., 1.],
+        pinhole: [0.; 2],
+        camera: frame.camera,
+        near: frame.near,
+        far: frame.far,
+        fov: frame.fov,
+        aspect: frame.aspect,
+        invalid_motion: f32::MIN,
+        flags: [1, 1, 0, u8::from(frame.reset), 0, 0, 0],
+        separation: 40.,
+    }
+}
+
 fn check(code: i32) -> Result<(), String> {
     if code == 0 {
         Ok(())
@@ -293,39 +331,7 @@ impl SuperResolution {
         }
         self.performance.cpu_copy_ms = started.elapsed().as_secs_f32() * 1000.0;
         let started = std::time::Instant::now();
-        let identity = [
-            [1., 0., 0., 0.],
-            [0., 1., 0., 0.],
-            [0., 0., 1., 0.],
-            [0., 0., 0., 1.],
-        ];
-        let constants = sl::Constants {
-            base: Base::new(
-                0xdcd35ad7,
-                0x4e4a,
-                0x4bad,
-                [0xa9, 0x0c, 0xe0, 0xc4, 0x9e, 0xb2, 0x3a, 0xfe],
-                2,
-            ),
-            matrices: [
-                frame.projection,
-                frame.inverse_projection,
-                identity,
-                frame.reprojection,
-                frame.inverse_reprojection,
-            ],
-            jitter: frame.jitter_pixels,
-            motion_scale: [1., 1.],
-            pinhole: [0.; 2],
-            camera: frame.camera,
-            near: frame.near,
-            far: frame.far,
-            fov: frame.fov,
-            aspect: frame.aspect,
-            invalid_motion: f32::MIN,
-            flags: [1, 1, 0, u8::from(frame.reset), 0, 0, 0],
-            separation: 40.,
-        };
+        let constants = native_constants(&frame);
         // Reflex, when it is marking this presented frame, already owns the
         // token. A second token would make Super Resolution and the present
         // disagree. With Reflex off, this is null and DLSS allocates its own.

@@ -5,7 +5,7 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $game = Join-Path $root 'target/fast/horizon-client.exe'
 $sdk = Join-Path $root '.local/dlss/native'
 if (!(Test-Path $game)) { throw 'The DLSS test build is missing. Ask Codex to build this branch.' }
-foreach ($dll in @('sl.interposer.dll','sl.common.dll','sl.dlss.dll','nvngx_dlss.dll')) {
+foreach ($dll in @('sl.interposer.dll','sl.common.dll','sl.dlss.dll','nvngx_dlss.dll','sl.dlss_g.dll','nvngx_dlssg.dll')) {
     if (!(Test-Path (Join-Path $sdk $dll))) { throw 'The official NVIDIA SDK is missing from .local/dlss/native.' }
 }
 $resources = Join-Path $root '.local/horizon-client/26.3'

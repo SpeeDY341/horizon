@@ -49,6 +49,7 @@ pub struct Runtime {
     dx12_swapchain: usize,
     directory: std::path::PathBuf,
     reflex: crate::reflex::Session,
+    framegen: crate::frame_gen::Session,
     dlss_requested: bool,
     pub(crate) _library: libloading::os::windows::Library,
     _session: Lease,
@@ -66,17 +67,20 @@ impl Runtime {
     /// manual hooking: the host registers the device and the swapchain.
     /// Super Resolution only. Reflex stays unloaded.
     pub fn load_for(directory: &Path, project_id: &str, api: Api) -> Result<Self, String> {
-        Self::load_with(directory, project_id, api, true, false)
+        Self::load_with(directory, project_id, api, true, false, false)
     }
 
-    /// `dlss` and `reflex` choose which plugins this process loads. A plugin
-    /// that is not requested is not loaded. DirectX 12 uses manual hooking.
+    /// `dlss`, `reflex` and `framegen` choose which plugins this process loads.
+    /// A plugin that is not requested is not loaded. Frame generation also
+    /// requests Reflex: the driver rejects it otherwise. DirectX 12 uses
+    /// manual hooking.
     pub fn load_with(
         directory: &Path,
         project_id: &str,
         api: Api,
         dlss: bool,
         reflex: bool,
+        framegen: bool,
     ) -> Result<Self, String> {
         if !directory.is_absolute() {
             return Err("Streamline requires an absolute SDK directory".into());
@@ -142,18 +146,24 @@ impl Runtime {
         };
         let wide: Vec<u16> = directory.as_os_str().encode_wide().chain(Some(0)).collect();
         let paths = [wide.as_ptr()];
-        // Feature ids: DLSS 0, Reflex 3, PCL 4. Reflex's own latency DLL is
-        // unsigned and is never placed beside these plugins.
+        // Feature ids: DLSS 0, Reflex 3, PCL 4, Frame Generation 1000.
+        // Reflex's own latency DLL is unsigned and is never placed beside these.
         let mut features = Vec::new();
         if dlss {
             features.push(0u32);
         }
-        let reflex = reflex
-            && directory.join("sl.reflex.dll").is_file()
-            && directory.join("sl.pcl.dll").is_file();
+        let reflex_files =
+            directory.join("sl.reflex.dll").is_file() && directory.join("sl.pcl.dll").is_file();
+        let reflex = (reflex || framegen) && reflex_files;
         if reflex {
             features.push(3);
             features.push(4);
+        }
+        let framegen_files = directory.join("sl.dlss_g.dll").is_file()
+            && directory.join("nvngx_dlssg.dll").is_file();
+        let framegen_listed = framegen && framegen_files;
+        if framegen_listed {
+            features.push(1000);
         }
         if features.is_empty() {
             return Err("Streamline has no requested plugins".into());
@@ -213,6 +223,13 @@ impl Runtime {
                 ));
             }
         }
+        // A missing frame-generation plugin must not take DLSS or Reflex down.
+        let mut framegen_ready = false;
+        if framegen_listed {
+            let mut loaded_fg = false;
+            let code = unsafe { loaded(1000, &mut loaded_fg) };
+            framegen_ready = code == 0 && loaded_fg;
+        }
         Ok(Self {
             api,
             shutdown,
@@ -225,6 +242,7 @@ impl Runtime {
             dx12_swapchain: 0,
             directory,
             reflex: crate::reflex::Session::new(reflex),
+            framegen: crate::frame_gen::Session::new(framegen_listed, framegen_ready),
             dlss_requested: dlss,
             _library: library,
             _session: guard,
@@ -401,7 +419,7 @@ impl Runtime {
                 return Err(format!("Streamline device registration failed ({result})"));
             }
             self.device = Some(device.clone());
-            self.bind_reflex();
+            self.bind_features();
             return Ok(());
         }
         let instance = self
@@ -424,16 +442,56 @@ impl Runtime {
         // vkCreateDevice came from the interposer: it already registered and
         // initialized the device. slSetVulkanInfo is for manual hooking only.
         self.device = Some(device.clone());
-        self.bind_reflex();
+        self.bind_features();
         Ok(())
     }
 
     /// Feature functions exist only after the device is registered. A Reflex
-    /// failure leaves the device usable and the frame path unchanged.
-    fn bind_reflex(&mut self) {
+    /// or frame-generation failure leaves the device usable.
+    fn bind_features(&mut self) {
         if let Err(error) = self.reflex.bind(&self._library) {
             self.reflex.fail(error);
         }
+        if let Err(error) = self.framegen.bind(&self._library) {
+            self.framegen.fail(error);
+        }
+    }
+
+    pub fn framegen_requested(&self) -> bool {
+        self.framegen.requested()
+    }
+
+    pub fn framegen_loaded(&self) -> bool {
+        self.framegen.loaded()
+    }
+
+    /// `generated` is the number of extra frames. Zero turns generation off.
+    pub fn set_framegen_wanted(&mut self, generated: u32) {
+        self.framegen.set_wanted(generated);
+    }
+
+    /// Tag depth and motion, then set this present's options. The token is the
+    /// Reflex frame already open on this thread.
+    pub fn framegen_record(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        input: crate::frame_gen::Inputs<'_>,
+    ) -> Result<(), String> {
+        let dx12 = self.api == Api::Dx12;
+        let token = self.frame_token();
+        self.framegen.record(dx12, token, encoder, input)
+    }
+
+    pub fn framegen_sample(&mut self) {
+        self.framegen.sample();
+    }
+
+    pub fn framegen_line(&self) -> String {
+        self.framegen.line()
+    }
+
+    pub fn take_framegen_error(&mut self) -> Option<String> {
+        self.framegen.take_error()
     }
 
     pub(crate) fn registered_device(&self) -> Option<&wgpu::Device> {

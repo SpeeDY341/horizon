@@ -43,6 +43,10 @@ mod monitor;
 pub use monitor::Performance;
 
 #[cfg(target_os = "windows")]
+mod frame_gen;
+#[cfg(target_os = "windows")]
+pub use frame_gen::Inputs;
+#[cfg(target_os = "windows")]
 mod reflex;
 #[cfg(target_os = "windows")]
 pub use reflex::{ReflexServerTick, install as install_reflex, reflex_server_tick};

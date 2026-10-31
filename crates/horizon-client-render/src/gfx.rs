@@ -443,6 +443,10 @@ pub struct Renderer {
     /// Reflex as saved. The SDK is loaded only when this was On or Boost at startup.
     reflex_mode: crate::graphics::Reflex,
     reflex_loaded: bool,
+    /// Frame Generation as saved. The plugin loads with the device, and only
+    /// when this was not Off at startup. Off leaves Reflex where it is.
+    framegen_mode: crate::graphics::FrameGen,
+    framegen_loaded: bool,
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     /// The offscreen colour target, sized like `config`.
@@ -1070,6 +1074,7 @@ async fn open_device(
     layers: u32,
     enable_dlss: bool,
     enable_reflex: bool,
+    enable_framegen: bool,
 ) -> Result<Opened> {
     let order = backend_order(
         api.with_env(),
@@ -1089,6 +1094,7 @@ async fn open_device(
             layers,
             enable_dlss,
             enable_reflex,
+            enable_framegen,
         )
         .await
         {
@@ -1117,6 +1123,7 @@ async fn open_with_retry(
     layers: u32,
     enable_dlss: bool,
     enable_reflex: bool,
+    enable_framegen: bool,
 ) -> std::result::Result<Opened, String> {
     let first = open_backend(
         backends,
@@ -1126,14 +1133,18 @@ async fn open_with_retry(
         layers,
         enable_dlss,
         enable_reflex,
+        enable_framegen,
     )
     .await;
-    let streamline = enable_dlss || enable_reflex;
+    let streamline = enable_dlss || enable_reflex || enable_framegen;
     let first = match first {
         Err(NoDevice::Failed(e) | NoDevice::NoAdapter(e)) if streamline => {
             crate::graphics::report_dlss("TAA: startup");
             log::warn!("Streamline startup failed, retrying without it: {e}");
-            open_backend(backends, window, offscreen, false, layers, false, false).await
+            open_backend(
+                backends, window, offscreen, false, layers, false, false, false,
+            )
+            .await
         }
         result => result,
     };
@@ -1144,7 +1155,11 @@ async fn open_with_retry(
                  ones wgpu hides as non-conformant",
                 backends_name(backends)
             );
-            match open_backend(backends, window, offscreen, true, layers, false, false).await {
+            match open_backend(
+                backends, window, offscreen, true, layers, false, false, false,
+            )
+            .await
+            {
                 Ok(opened) => {
                     log::warn!(
                         "Horizon renderer: using {} although its driver reports no Vulkan \
@@ -1170,9 +1185,10 @@ async fn open_backend(
     layers: u32,
     enable_dlss: bool,
     enable_reflex: bool,
+    enable_framegen: bool,
 ) -> std::result::Result<Opened, NoDevice> {
     let name = backends_name(backends);
-    let streamline = dlss::load(enable_dlss, enable_reflex, backends);
+    let streamline = dlss::load(enable_dlss, enable_reflex, enable_framegen, backends);
     let descriptor = instance_descriptor(backends, Some(window), allow_nonconformant);
     #[cfg(target_os = "windows")]
     let instance = match &streamline {
@@ -1381,6 +1397,7 @@ impl Renderer {
         api: GraphicsApi,
         enable_dlss: bool,
         reflex: crate::graphics::Reflex,
+        framegen: crate::graphics::FrameGen,
     ) -> Result<Self> {
         let split = sprite_split();
         if layers > split * SPRITE_ARRAYS {
@@ -1433,6 +1450,7 @@ impl Renderer {
                     layers,
                     enable_dlss,
                     reflex != crate::graphics::Reflex::Off,
+                    framegen != crate::graphics::FrameGen::Off,
                 )
                 .await?
             }
@@ -2917,6 +2935,15 @@ impl Renderer {
         });
         #[cfg(not(target_os = "windows"))]
         let reflex_loaded = false;
+        #[cfg(target_os = "windows")]
+        let framegen_loaded = streamline.as_ref().is_some_and(|runtime| {
+            runtime
+                .lock()
+                .ok()
+                .is_some_and(|runtime| runtime.framegen_loaded())
+        });
+        #[cfg(not(target_os = "windows"))]
+        let framegen_loaded = false;
         let mut renderer = Self {
             dlss: dlss::State::new(streamline.clone(), enable_dlss, &info),
             streamline,
@@ -3091,8 +3118,11 @@ impl Renderer {
             present_modes,
             reflex_mode: reflex,
             reflex_loaded,
+            framegen_mode: framegen,
+            framegen_loaded,
         };
         renderer.set_reflex(reflex);
+        renderer.set_framegen(framegen);
         Ok(renderer)
     }
     /// LevelRenderer.submitBlockOutline: the buffer holds `edges` per stroke, the black
@@ -3809,7 +3839,13 @@ impl Renderer {
     pub fn motion_vectors_enabled(&self) -> bool {
         self.motion.is_some()
             && (self.dlss.requested != crate::graphics::Dlss::Off
+                || self.framegen_rendering()
                 || std::env::var("HORIZON_DLSS_MOTION").as_deref() == Ok("1"))
+    }
+
+    /// The player asked for generated frames and this process loaded the plugin.
+    fn framegen_rendering(&self) -> bool {
+        self.framegen_loaded && self.framegen_mode != crate::graphics::FrameGen::Off
     }
 
     pub fn set_dlss(&mut self, mode: crate::graphics::Dlss) {
@@ -3939,6 +3975,158 @@ impl Renderer {
         #[cfg(target_os = "windows")]
         if self.reflex_loaded {
             self.reflex_with(|runtime| runtime.reflex_abandon_if_open());
+        }
+    }
+
+    /// Apply Frame Generation without recreating the device. The first On still
+    /// needs a restart, because the plugin loads with the device. Off does not
+    /// turn Reflex off.
+    pub fn set_framegen(&mut self, mode: crate::graphics::FrameGen) {
+        self.framegen_mode = mode;
+        #[cfg(target_os = "windows")]
+        if let Some(shared) = &self.streamline
+            && let Ok(mut runtime) = shared.lock()
+        {
+            if let Some(error) = runtime.take_framegen_error() {
+                log::warn!("Frame Generation: {error}");
+            }
+            if self.framegen_loaded {
+                runtime.set_framegen_wanted(mode.generated());
+                let line = runtime.framegen_line();
+                drop(runtime);
+                crate::graphics::report_framegen(line);
+                return;
+            }
+        }
+        self.report_framegen_unloaded();
+    }
+
+    fn report_framegen_unloaded(&self) {
+        let line = if self.framegen_mode == crate::graphics::FrameGen::Off {
+            String::new()
+        } else if self.framegen_failed_to_bind() {
+            "Frame Gen: unavailable".into()
+        } else {
+            "Frame Gen: restart".into()
+        };
+        crate::graphics::report_framegen(line);
+    }
+
+    /// The plugin was in this process's startup list, but it never bound.
+    /// Choosing it while it was off at startup is not this case.
+    fn framegen_failed_to_bind(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            self.streamline.as_ref().is_some_and(|runtime| {
+                runtime.lock().ok().is_some_and(|runtime| {
+                    runtime.framegen_requested() && !runtime.framegen_loaded()
+                })
+            })
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            false
+        }
+    }
+
+    /// Tag depth and motion on the command list that is about to be presented,
+    /// then set this present's options. A menu, HDR, a shader pack, the title
+    /// screen, a lost window or a resize stays a real frame.
+    fn record_framegen(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &Frame<'_>,
+        pack_reads_world: bool,
+        pose: Mat4,
+        views: &ViewSet,
+        presenting: bool,
+    ) {
+        #[cfg(target_os = "windows")]
+        {
+            if !self.framegen_loaded {
+                return;
+            }
+            let depth = self.world_post.depth_inputs();
+            let mut jitter = self
+                .world_post
+                .temporal_jitter()
+                .unwrap_or([0.0, 0.0, 1.0, 0.0]);
+            let motion = self
+                .world_post
+                .temporal_jitter()
+                .and_then(|_| self.motion.as_ref().and_then(motion::Motion::tagged));
+            if self.motion.as_ref().is_some_and(|m| m.frame_reset()) {
+                jitter[2] = 1.0;
+            }
+            let depth_size = self
+                .world_post
+                .size()
+                .unwrap_or([self.config.width, self.config.height]);
+            let primary = views.primary();
+            let constants = dlss::frame_constants(
+                primary.projection * pose,
+                self.world_post.reprojection(),
+                jitter,
+                depth_size,
+                frame.depth_far,
+                frame.fov_degrees.to_radians(),
+                primary.aspect,
+                primary.view,
+                frame.camera,
+                jitter[2] != 0.0,
+            );
+            let allow = self.framegen_rendering()
+                && presenting
+                && !frame.title
+                && frame.menu_blur.is_none()
+                && self.hdr.is_none()
+                && !pack_reads_world
+                && self.window.has_focus()
+                && depth.is_some()
+                && motion.is_some();
+            let color = [self.config.width, self.config.height];
+            let color_format = self.config.format;
+            let Some(shared) = &self.streamline else {
+                return;
+            };
+            let Ok(mut runtime) = shared.lock() else {
+                return;
+            };
+            let input = horizon_streamline::Inputs {
+                depth: depth.as_ref().map(|(texture, view)| (texture, view)),
+                motion: motion.as_ref().map(|(texture, view)| (texture, view)),
+                constants: Some(constants),
+                color,
+                depth_size,
+                color_format,
+                allow,
+            };
+            if let Err(error) = runtime.framegen_record(encoder, input) {
+                log::warn!("Frame Generation: {error}");
+            }
+            if let Some(error) = runtime.take_framegen_error() {
+                log::warn!("Frame Generation: {error}");
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (encoder, frame, pack_reads_world, pose, views, presenting);
+        }
+    }
+
+    fn framegen_after_present(&mut self) {
+        #[cfg(target_os = "windows")]
+        if self.framegen_loaded
+            && let Some(shared) = &self.streamline
+            && let Ok(mut runtime) = shared.lock()
+        {
+            runtime.framegen_sample();
+            if let Some(error) = runtime.take_framegen_error() {
+                log::warn!("Frame Generation: {error}");
+            }
+            let line = runtime.framegen_line();
+            drop(runtime);
+            crate::graphics::report_framegen(line);
         }
     }
 
@@ -4412,7 +4600,11 @@ impl Renderer {
             self.hdr.is_some(),
         );
         self.world_post.set_internal_size(dlss_size);
-        if !taa && let Some(motion) = &mut self.motion {
+        self.world_post.track_camera = self.framegen_rendering();
+        if !taa
+            && !self.framegen_rendering()
+            && let Some(motion) = &mut self.motion
+        {
             motion.reset();
         }
         let jittered = self.world_post.jitter(
@@ -5402,7 +5594,7 @@ impl Renderer {
         let scaled = self.world_post.prepare(
             &self.device,
             [self.config.width, self.config.height],
-            pack_reads_world,
+            pack_reads_world || self.framegen_rendering(),
         );
         let (world_view, world_depth) = match &scaled {
             Some((color, depth)) => (color, depth),
@@ -6429,6 +6621,14 @@ impl Renderer {
                 let size = [self.config.width, self.config.height];
                 Some(copy_frame(&self.device, &mut encoder, &texture, size))
             });
+        self.record_framegen(
+            &mut encoder,
+            frame,
+            pack_reads_world,
+            pose,
+            &views,
+            surface_frame.is_some(),
+        );
         let commands = crate::spans::time("encode", || encoder.finish());
         let first_frame = self.first_frame == FirstFrame::Submit;
         if first_frame {
@@ -6479,6 +6679,7 @@ impl Renderer {
             self.reflex_present(true);
             self.queue.present(surface_frame);
             self.reflex_present(false);
+            self.framegen_after_present();
             if self.hdr.is_some()
                 && let Some(marker) = self.hdr_marker.take()
             {

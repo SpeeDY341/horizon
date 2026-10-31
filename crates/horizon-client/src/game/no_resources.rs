@@ -113,6 +113,7 @@ impl ApplicationHandler for Missing {
                     self.api,
                     false,
                     horizon_client::graphics::Reflex::Off,
+                    horizon_client::graphics::FrameGen::Off,
                 )?;
                 Ok((window, renderer))
             });
