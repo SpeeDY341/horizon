@@ -7,9 +7,10 @@ review после исправлений, включая review_g2 и review_h3 
 Итоговые результаты и команды: [dlss-validation.md](dlss-validation.md).
 
 Повторный полный review `8b33c7954` открыл F1–F5. Исправление F1 принято
-`fix_f1_review2` на `aad4e963f`: **PASS**. Для F2 добавлено семантическое
-разрешение FG по gameplay/screen/loading state, независимо от blur; свежий
-независимый review F2 ещё требуется. F3–F5 и аппаратная приёмка открыты.
+`fix_f1_review2` на `aad4e963f`: **PASS**. F2 с семантическим разрешением FG
+по gameplay/screen/loading state принят `fix_f2_review2` на `534b9ff4a`:
+**PASS**. F3 сохраняет timestamps SDK в микросекундах; свежий независимый
+review F3 ещё требуется. F4–F5 и аппаратная приёмка открыты.
 Прежние PASS не означают полной приёмки интеграции; активная FG 2× остаётся
 недоказанной.
 
@@ -426,7 +427,7 @@ swapchain получает hook; стресс-проверка не зависа
   перечень прочитанного добавлен в THIRD_PARTY_NOTICES.md. SDK, подготовленные
   ресурсы и локальные логи не включаются в commit. F2–F5 этим этапом не закрыты.
 
-### Повторное исправление F2 (1 ноября 2026, fresh review pending)
+### Повторное исправление F2 (1 ноября 2026, fix_f2_review2 PASS)
 
 - Свежий review `4126aeb50` дал **FAIL**: `remote_loading` отвечает за
   panorama/blur и исключает Nether/End loading. После PlayerPosition игрок уже
@@ -457,7 +458,30 @@ swapchain получает hook; стресс-проверка не зависа
   renderer/Streamline/client lib/bins/tests с `-D warnings`, workspace fmt,
   public-tree и diff checks прошли. Игра не запускалась; full pr_ready,
   Linux/macOS и focused FG/визуальная приёмка не выполнялись. Свежий независимый
-  review F2 ещё требуется; F3–F5 не изменены.
+  `fix_f2_review2` принял follow-up `534b9ff4a`: **PASS**; F3–F5 этим не закрыты.
+
+### Повторное исправление F3 (1 ноября 2026, fresh review pending)
+
+- `Session::read_reports` сохраняет `end - start` непосредственно как
+  `latency_us`; QueryPerformanceFrequency и поле qpf удалены. Новейший валидный
+  frame ID, приоритет input→GPU и fallback simulation→present сохранены.
+  Overlay по-прежнему переводит микросекунды в ms только при форматировании.
+- Контракт проверен по закреплённому Streamline commit
+  `625db07d4bca5abc67d781c42af7e7fb0761f1b6`: `reflexEntry.cpp` делегирует
+  getLatencyReport; `generic.cpp`, `nvllvk.cpp` и `vknvll2.cpp` копируют
+  timestamps без преобразования. Последний копирует Vulkan поля `*TimeUs`.
+  MIT license и file headers проверены до чтения; реализация SDK не копировалась.
+  Точные ссылки и контракт Khronos приведены в [validation record](dlss-validation.md).
+- Регрессия на production parser до исправления при явно заданном qpf=10 MHz
+  получила 2,000 вместо 20,000 us. После исправления clock dependency отсутствует:
+  4 новых теста проверяют разницу 20,000 us → `Reflex: 20.0 ms`, большой clock
+  origin, новый валидный frame среди неупорядоченных/неполных/невалидных,
+  fallback, очистку устаревшего значения и отсутствие переполнения разницы.
+- Streamline ordinary: **25 passed / 7 ignored**. Targeted Streamline
+  lib/tests Clippy с `-D warnings`, workspace fmt, public-tree и diff checks
+  прошли. Игра/SDK/GPU для F3 не запускались; full pr_ready, Linux/macOS,
+  физическая latency и активная FG не проверялись. Свежий независимый review
+  F3 ещё требуется; F4/F5 и полная аппаратная приёмка открыты.
 
 ### Результат кода E (31 октября 2026)
 
@@ -627,7 +651,9 @@ swapchain получает hook; стресс-проверка не зависа
   fmt, diff check и public-tree прошли. Полный pr_ready/parity не запускался.
   Локальный SDK test log: `.local/dlss/logs/g-sdk-tests.txt`.
 - Оконный DX12 game smoke с отдельными scratch homes достиг настоящего
-  Present, загрузил FG (SDK max generated 5) и Reflex (измерение 9.4 ms),
+  Present, загрузил FG (SDK max generated 5) и Reflex (исторический overlay
+  показывал 9.4 ms; число до F3 имеет неверные единицы и не является измерением
+  исправленной latency),
   но FG оставалась paused без фокуса. Он выполнялся после исправления flags,
   до последующих G support/rate/Off изменений. SDK сообщил repeated initial
   Off (добавлена регрессия/дедупликация) и advisory о синхронизации GetState;

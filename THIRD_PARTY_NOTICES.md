@@ -83,3 +83,9 @@ The DX12 creation integration also consulted that commit's MIT-licensed
 Their license and file notices were checked before reading; no implementation
 code was copied. Factory/device proxy creation and native lifetime management
 in Horizon are original Rust integration code.
+
+The Reflex timestamp unit correction also consulted that commit's MIT-licensed
+`source/plugins/sl.reflex/reflexEntry.cpp` and
+`source/platforms/sl.chi/{generic.cpp,nvllvk.cpp,vknvll2.cpp}`. Their license and
+file notices were checked before reading; no implementation code was copied.
+The report parser and its regressions are original Rust code.

@@ -7,9 +7,10 @@ acceptance. The complete integration is **not yet accepted for release**.
 
 The repeat full review of `8b33c7954` found F1–F5. F1's DX12 creation and
 lifetime fix passed fresh independent `fix_f1_review2` on `aad4e963f`.
-F2 now uses gameplay/screen/loading state rather than blur to suspend FG;
-its fresh independent review is pending. F3–F5 and hardware acceptance remain
-open. Earlier per-part PASS results do not close the repeat review.
+F2's gameplay/screen/loading gate passed fresh independent `fix_f2_review2` on
+`534b9ff4a`. F3 now preserves SDK report microseconds; fresh independent F3
+review is pending. F4–F5 and hardware acceptance remain open. Earlier per-part
+PASS results do not close the repeat review.
 
 ## Implementation and independent review
 
@@ -66,8 +67,8 @@ send Off once; eligible resume sends live tags/On and consumes reset. Existing
 history tests confirm blocked frames do not repeatedly reset fallback TAA.
 Formatting, public-tree and diff checks also passed. No game was launched;
 focused FG/extra displayed frames, Linux/macOS and full pr_ready were not run.
-Fresh independent F2 review is pending; these tests do not close hardware
-acceptance or F3–F5.
+Fresh independent `fix_f2_review2` accepted the follow-up below; these tests do
+not close hardware acceptance or F3–F5.
 
 Fresh review rejected F2 commit `4126aeb50`: its loading predicate reused the
 visual panorama helper, which excludes Nether/End screens. PlayerPosition can
@@ -80,7 +81,42 @@ Other/NetherPortal/EndPortal, with a restored player still waiting for server,
 player chunk, ready/close delay and screen finish, then gameplay resume. The
 same predicate is used by the production Frame producer. Targeted client/render/
 Streamline lib/bins/tests Clippy, formatting, public-tree and diff checks passed
-again on this follow-up. Fresh independent review of this follow-up is pending.
+again on this follow-up. Fresh independent `fix_f2_review2` accepted
+`534b9ff4a` (PASS).
+
+F3 removes the QPF conversion from `Session::read_reports`: report timestamps
+are already microseconds, so `latency_us` is their difference. The unused
+QueryPerformanceFrequency declaration, constructor call and qpf field are gone.
+Input→GPU priority, simulation→present fallback, newest valid frame selection
+and existing overlay labels are unchanged.
+
+Primary contract evidence, with the root MIT license and each source header
+checked before reading, is the pinned Streamline commit
+`625db07d4bca5abc67d781c42af7e7fb0761f1b6`:
+
+- [`reflexEntry.cpp`](https://github.com/NVIDIA-RTX/Streamline/blob/625db07d4bca5abc67d781c42af7e7fb0761f1b6/source/plugins/sl.reflex/reflexEntry.cpp) delegates to the compute backend's latency report query.
+- [`generic.cpp`](https://github.com/NVIDIA-RTX/Streamline/blob/625db07d4bca5abc67d781c42af7e7fb0761f1b6/source/platforms/sl.chi/generic.cpp) copies NVAPI report timestamps without scaling.
+- [`nvllvk.cpp`](https://github.com/NVIDIA-RTX/Streamline/blob/625db07d4bca5abc67d781c42af7e7fb0761f1b6/source/platforms/sl.chi/nvllvk.cpp) and [`vknvll2.cpp`](https://github.com/NVIDIA-RTX/Streamline/blob/625db07d4bca5abc67d781c42af7e7fb0761f1b6/source/platforms/sl.chi/vknvll2.cpp) copy native timestamps unchanged; the latter copies Vulkan `*TimeUs` fields.
+- [Khronos's VkLatencyTimingsFrameReportNV reference](https://docs.vulkan.org/refpages/latest/refpages/source/VkLatencyTimingsFrameReportNV.html) defines those microsecond timestamp fields.
+
+No SDK implementation code was copied. Four new ordinary tests write SDK-shaped
+reports into the production Session buffer and call `read_reports`. The known
+20,000 us difference failed before the fix (2,000 us with QPF explicitly set to
+10 MHz). It now produces exactly `Reflex: 20.0 ms`, including near u64::MAX.
+Other cases cover input→GPU priority, missing-input/GPU fallback, unordered
+frames with invalid newer entries, clearing stale latency and a maximal valid
+difference without multiplication overflow. The final tests and constructor
+have no QPF or CPU-clock assumption. Existing availability/error tests still
+clear latency when reports or low latency become unavailable.
+
+F3 checks passed: `cargo test --locked -p horizon-streamline --lib --
+--test-threads=1` (**25 passed, 7 ignored**), `cargo clippy --locked -p
+horizon-streamline --lib --tests -- -D warnings`, workspace formatting,
+public-tree and diff checks. Fresh independent F3 review is pending. No game,
+SDK or GPU test was started for this units fix; full pr_ready, Linux/macOS and
+physical latency were not rerun. The historical 9.4 ms overlay in the earlier
+windowed attempt used the incorrect conversion and cannot establish corrected
+latency. It has not been retrospectively rescaled or used as acceptance proof.
 
 F1's explicit regression command is:
 

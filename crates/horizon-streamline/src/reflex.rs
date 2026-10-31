@@ -71,11 +71,6 @@ const SIM_TIME: usize = 48;
 const PRESENT_DONE: usize = 88;
 const GPU_DONE: usize = 136;
 
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn QueryPerformanceFrequency(frequency: *mut i64) -> i32;
-}
-
 type NewToken = unsafe extern "C" fn(*mut *mut c_void, *const u32) -> i32;
 type SetOptions = unsafe extern "C" fn(*const ReflexOptions) -> i32;
 type GetState = unsafe extern "C" fn(*mut c_void) -> i32;
@@ -123,16 +118,11 @@ pub struct Session {
     reported: bool,
     diagnostic: Option<String>,
     latency_us: u64,
-    qpf: u64,
     state: StateBuf,
 }
 
 impl Session {
     pub fn new(requested: bool) -> Self {
-        let mut qpf = 1i64;
-        unsafe {
-            QueryPerformanceFrequency(&mut qpf);
-        }
         Self {
             requested,
             loaded: false,
@@ -150,7 +140,6 @@ impl Session {
             reported: false,
             diagnostic: None,
             latency_us: 0,
-            qpf: qpf.max(1) as u64,
             state: StateBuf([0; 16384]),
         }
     }
@@ -522,7 +511,9 @@ impl Session {
             };
             if end > start && id >= best_id {
                 best_id = id;
-                best = (end - start).saturating_mul(1_000_000) / self.qpf;
+                // Streamline copies microsecond timestamps from its native
+                // latency reports; these are not performance-counter ticks.
+                best = end - start;
             }
         }
         self.latency_us = best;
@@ -622,6 +613,67 @@ mod tests {
     }
     unsafe extern "C" fn mock_marker(_: u32, _: *const c_void) -> i32 {
         0
+    }
+
+    fn report(session: &mut Session, slot: usize, id: u64, times: [u64; 4]) {
+        let at = REPORT_AT + slot * REPORT_STRIDE;
+        for (offset, value) in [FRAME_ID, INPUT_TIME, SIM_TIME, PRESENT_DONE, GPU_DONE]
+            .into_iter()
+            .zip([id, times[0], times[1], times[2], times[3]])
+        {
+            session.state.0[at + offset..at + offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn report_microseconds_are_preserved_in_the_overlay() {
+        let mut session = Session::new(true);
+        session.loaded = true;
+        session.mode = 1;
+        session.state.0[33] = 1;
+        // SDK report timestamps are microseconds, including at large clock origins.
+        for start in [1_000_000, u64::MAX - 20_000] {
+            report(&mut session, 0, 1, [start, 1, 50_001, start + 20_000]);
+            session.read_reports();
+            assert_eq!(session.latency_us, 20_000);
+            assert_eq!(session.line(), "Reflex: 20.0 ms");
+        }
+    }
+
+    #[test]
+    fn reports_select_the_newest_valid_frame_instead_of_the_last_slot() {
+        let mut session = Session::new(true);
+        report(&mut session, 0, 8, [100, 0, 0, 20_100]);
+        report(&mut session, 1, 9, [100, 0, 0, 100]); // Equal timestamps.
+        report(&mut session, 2, 10, [200, 0, 0, 100]); // Reversed timestamps.
+        report(&mut session, 3, 11, [0; 4]); // Incomplete newer frame.
+        report(&mut session, REPORTS - 1, 7, [100, 0, 0, 30_100]);
+        session.read_reports();
+        assert_eq!(session.latency_us, 20_000);
+    }
+
+    #[test]
+    fn reports_fall_back_to_simulation_and_present_in_microseconds() {
+        let mut session = Session::new(true);
+        for (input, gpu) in [(0, 30_000), (1, 0), (0, 0)] {
+            report(&mut session, 0, 1, [input, 100_000, 120_000, gpu]);
+            session.read_reports();
+            assert_eq!(session.latency_us, 20_000);
+        }
+    }
+
+    #[test]
+    fn missing_or_invalid_reports_clear_previous_latency() {
+        let mut session = Session::new(true);
+        for times in [[0; 4], [100, 0, 0, 100], [200, 0, 0, 100]] {
+            session.latency_us = 20_000;
+            report(&mut session, 0, 1, times);
+            session.read_reports();
+            assert_eq!(session.latency_us, 0);
+        }
+        report(&mut session, 0, 1, [1, 0, 0, u64::MAX]);
+        session.read_reports();
+        assert_eq!(session.latency_us, u64::MAX - 1);
     }
 
     #[test]
