@@ -728,19 +728,7 @@ impl Oit {
                 self.execute_water_mask(encoder, t, color, depth, mask);
             }
         }
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("OIT composite"),
-            color_attachments: &[attachment(color, wgpu::LoadOp::Load)],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: depth,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
-            ..Default::default()
-        });
+        let mut pass = composite_pass(encoder, color, depth);
         pass.set_pipeline(&self.composite);
         pass.set_bind_group(GROUP, &t.composite, &[]);
         pass.draw(0..3, 0..1);
@@ -875,6 +863,15 @@ impl Oit {
         pass.set_bind_group(GROUP, &t.cull, &[]);
         pass.draw(0..3, 0..1);
     }
+}
+
+/// The last OIT depth writer must retain the world for temporal consumers.
+pub(super) fn composite_pass<'e>(
+    encoder: &'e mut wgpu::CommandEncoder,
+    color: &wgpu::TextureView,
+    depth: &wgpu::TextureView,
+) -> wgpu::RenderPass<'e> {
+    super::world_pass(encoder, color, depth, None, false, true)
 }
 
 #[cfg(test)]

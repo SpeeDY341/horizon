@@ -26,6 +26,7 @@ pub(super) struct Motion {
     history: History,
     previous: Option<(Mat4, DVec3)>,
     frame_reset: bool,
+    valid: bool,
 }
 
 impl Motion {
@@ -128,12 +129,14 @@ impl Motion {
             history: History::default(),
             previous: None,
             frame_reset: true,
+            valid: false,
         }
     }
 
     pub fn view(&self) -> Option<wgpu::TextureView> {
         self.target
             .as_ref()
+            .filter(|_| self.valid)
             .map(|t| t.create_view(&Default::default()))
     }
 
@@ -141,6 +144,7 @@ impl Motion {
     pub fn tagged(&self) -> Option<(wgpu::Texture, wgpu::TextureView)> {
         self.target
             .as_ref()
+            .filter(|_| self.valid)
             .map(|t| (t.clone(), t.create_view(&Default::default())))
     }
     pub fn frame_reset(&self) -> bool {
@@ -149,6 +153,7 @@ impl Motion {
 
     pub fn reset(&mut self) {
         self.frame_reset = true;
+        self.valid = false;
         self.history.clear();
         self.previous = None;
     }
@@ -166,7 +171,18 @@ impl Motion {
         depth: &wgpu::TextureView,
         size: [u32; 2],
         indices: &wgpu::Buffer,
-    ) {
+    ) -> bool {
+        if size.contains(&0)
+            || [depth.texture().width(), depth.texture().height()] != size
+            || depth.texture().format() != wgpu::TextureFormat::Depth32Float
+            || !current.is_finite()
+            || !current.inverse().is_finite()
+            || !camera_position.is_finite()
+            || !jitter.iter().all(|v| v.is_finite())
+        {
+            self.reset();
+            return false;
+        }
         if self
             .target
             .as_ref()
@@ -257,8 +273,9 @@ impl Motion {
             pass.set_bind_group(0, &group, &[]);
             pass.draw(0..3, 0..1);
         }
+        self.valid = true;
         if self.history.vertices.is_empty() {
-            return;
+            return true;
         }
         let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("DLSS entity motion"),
@@ -289,6 +306,7 @@ impl Motion {
         pass.set_vertex_buffer(0, vertices.slice(..));
         pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..(self.history.vertices.len() / 4 * 6) as u32, 0, 0..1);
+        true
     }
 }
 

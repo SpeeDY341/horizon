@@ -3,8 +3,8 @@
 Дата: 31 октября 2026 года. Статус: **часть A прошла review; код части B реализован
 и проверен на Windows, проверки Linux/macOS открыты; код части C прошёл
 независимый review, аппаратная проверка открыта; код части D прошёл review_d2;
-код E реализован и проверен локально, независимый review E и аппаратные
-проверки D/E открыты; F–I не начаты**.
+код E прошёл review_e PASS; код F и GPU-регрессии реализованы, review F
+ещё требуется; аппаратные проверки D–F и части G–I открыты**.
 
 Основание: review 30 коммитов `763528025..35123b73f` личного форка
 `SpeeDY341/horizon`, ветка `codex/dlss-stages-0-2`.
@@ -420,22 +420,24 @@ swapchain получает hook; стресс-проверка не зависа
   Sandbox SDK requirements завис на CPU; тестовый процесс остановлен, повтор
   вне sandbox успешно завершён. SDK отклонил подпись NvLowLatencyVk.dll,
   поэтому этот прогон не доказывает Vulkan Reflex.
-- **Независимый review E ещё требуется.** Настоящий FG Present, визуальное
+- Независимый `review_e` дал **PASS** для кода E на
+  `f2b07d368d5c9f1d94a01c3c2204ae0315e94785` и повторил 3 SDK SR tests.
+  Настоящий FG Present, визуальное
   качество, latency, stress focus/loss/resize и Linux/macOS не проверялись.
   Флаг frame-based tagging пока не включён; аппаратную готовность FG этот
   результат не заявляет. Полный pr_ready и parity не запускались.
 
 ### 6.2. Depth и motion должны доживать до потребителя
 
-- [ ] Вычислять необходимость сохранения depth по всем активным потребителям:
+- [x] Вычислять необходимость сохранения depth по всем активным потребителям:
   TAA, SR, FG, motion, OIT, shader packs и culling.
-- [ ] Проверить StoreOp в последнем проходе, записывающем depth, включая entity
+- [x] Проверить StoreOp в последнем проходе, записывающем depth, включая entity
   и translucency paths; промежуточного Store недостаточно.
 - [ ] Проверить соответствие color/depth/motion по кадру, размеру, проекции,
   jitter, направлению движения, единицам измерения и reverse depth.
 - [ ] Проверить порядок barriers, копирования, native command lists и Present
   на Vulkan и DX12, а также срок жизни texture/view и raw handles.
-- [ ] При неполных или устаревших входах показывать настоящий кадр без FG.
+- [x] При неполных или устаревших входах запрещать FG текущего кадра.
 - [ ] Добавить GPU-проверку содержимого depth/motion при FG On, AA Off/FXAA,
   OIT Off и culling Off; отдельно проверить включённые TAA/OIT/culling.
 - [ ] Добавить тест SR+FG: constants согласованы, ложного reset на каждом кадре
@@ -443,6 +445,43 @@ swapchain получает hook; стресс-проверка не зависа
 
 **Готово, когда:** у кадра один согласованный набор данных; SDK не видит
 разных constants для одного token, а FG не читает discarded/stale depth.
+
+### Результат кода F и GPU-проверок (31 октября 2026)
+
+- Сохранение depth учитывает TAA, SR/FG, motion diagnostics, packs и OIT.
+  Первый world pass сохраняет его для culling, последний — для последующих
+  потребителей. Flat/indirect culling, entity/translucency и проход после OIT
+  используют общий production world-pass constructor. OIT depth bounds/cull,
+  composite и water-mask сохраняют depth; read-only passes его не отбрасывают.
+- Motion diagnostics без AA тоже получают отдельный world target и историю
+  камеры. Рука, crosshair и HUD используют screen depth, не depth мира.
+  Согласованы Depth32Float/Rg16Float и размер входов; motion отвергает неверный
+  размер, singular/non-finite projection, camera/jitter. Reset скрывает старый
+  motion target. FG допускается только после успешной записи motion именно
+  в этом render; пропущенный pass не переиспользует прошлый motion image.
+- `gfx::temporal_input_tests` — **2 ignored GPU tests passed** на RTX 5090,
+  драйвер 621.01 (DX12 32.0.16.2101), Vulkan и DX12. На каждом API 12 вариантов:
+  AA Off/FXAA/TAA × culling-final-pass Off/On × OIT-final-attachment Off/On,
+  два кадра каждый. Рисуются треугольники с depth 0.25/0.75; GPU readback
+  проверяет обе глубины, reset, ненулевой depth-dependent motion в UV units
+  (previous minus current, Y вниз) и jitter. Проверка идёт после post/hand clear.
+  Используются настоящие Post/Motion, production StoreOp и tagged textures.
+- Negative mutation восстановила прежнее условие без FG/motion: Vulkan test
+  упал на AA Off/culling Off/OIT Off, depth 0.0 вместо 0.25. Исходник точно
+  восстановлен, оба API повторно прошли. Отдельно проверен отказ при неверном
+  размере и singular projection без выдачи старого motion target.
+- Motion **2 passed**, world_post **5 passed**, DLSS **3 passed**; Clippy
+  renderer/client lib/bins/tests с `-D warnings`, fmt, diff/public-tree проходят.
+  GPU tests запускаются явно: `cargo test -p horizon-client-render --lib
+  temporal_input_tests -- --ignored --nocapture --test-threads=1`.
+- Это headless GPU harness, не полный Renderer/game и не native FG Present.
+  Culling проверяет production final attachment, без visibility dispatch;
+  OIT — final attachment, без полного translucent pipeline. Native barriers,
+  queue order и lifetime рассмотрены по коду: world/SR submit → final draws /
+  RESOURCE transitions → отдельный tag list → Present; owned textures остаются
+  у Post/Motion. Настоящий SDK copy/Present, stress, визуальное качество motion,
+  Linux/macOS и независимый review F остаются открытыми. Флаг G не включён;
+  полный pr_ready/parity не запускались. SDK и игровые файлы не добавлялись.
 
 ## 7. Исправить контракт Streamline и доказать работу FG — R2
 
@@ -549,9 +588,9 @@ swapchain получает hook; стресс-проверка не зависа
 - [ ] Часть D: код восстановления DX12 proxy при замене surface реализован;
   targeted tests прошли, review_d2 дал PASS коду; аппаратная проверка открыта.
 - [ ] Часть E: общий frame token/constants и отдельная валидность TAA history
-  реализованы, targeted/SDK SR tests прошли; независимый review и аппаратная
-  проверка открыты.
-- [ ] Часть F: сохранение depth/motion и GPU-регрессии.
+  прошли review_e PASS и targeted/SDK SR tests; аппаратная проверка открыта.
+- [ ] Часть F: сохранение depth/motion и headless GPU readback на Vulkan/DX12
+  реализованы и проверены; review F и native FG/game проверка открыты.
 - [ ] Часть G: frame-based tagging и аппаратная проверка FG 2×.
 - [ ] Часть H: обработка ошибок, подтверждённые множители и диагностические статусы.
 - [ ] Часть I: финальная документация, результаты матрицы и повторный review.

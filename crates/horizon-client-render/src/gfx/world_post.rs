@@ -468,6 +468,12 @@ impl Post {
         (self.taa_on || self.track_camera).then_some(self.taa_this_frame.jitter)
     }
 
+    /// Every reader after the last world pass needs stored depth, including
+    /// FG without AA and the opt-in motion diagnostics path.
+    pub(super) fn keep_depth(&self, pack: bool, oit: bool, motion: bool) -> bool {
+        pack || oit || self.taa_on || self.track_camera || motion
+    }
+
     fn taa_uniform(&self) -> TaaUniform {
         let mut uniform = self.taa_this_frame;
         if !self.taa_history_valid {

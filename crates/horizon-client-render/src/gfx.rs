@@ -39,6 +39,8 @@ mod entity_batch;
 mod entity_outline;
 mod motion;
 pub mod motion_history;
+#[cfg(test)]
+mod temporal_input_tests;
 mod weather;
 use entity_batch::EntityBatch;
 pub use entity_batch::{
@@ -127,28 +129,34 @@ fn sky_visible(frame: &Frame) -> bool {
     !frame.title && frame.skybox && sky_open(frame)
 }
 
-fn world_pass_after_culling<'e>(
+fn world_pass<'e>(
     encoder: &'e mut wgpu::CommandEncoder,
     view: &wgpu::TextureView,
     depth: &wgpu::TextureView,
+    clear: Option<wgpu::Color>,
+    first: bool,
     keep_depth: bool,
 ) -> wgpu::RenderPass<'e> {
     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("Horizon world, after culling"),
+        label: Some("Horizon world"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
             view,
             resolve_target: None,
             depth_slice: None,
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Load,
+                load: clear.map_or(wgpu::LoadOp::Load, wgpu::LoadOp::Clear),
                 store: wgpu::StoreOp::Store,
             },
         })],
         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
             view: depth,
             depth_ops: Some(wgpu::Operations {
-                load: wgpu::LoadOp::Load,
-                // A shader pack reads it as depthtex0.
+                load: if first {
+                    wgpu::LoadOp::Clear(0.0)
+                } else {
+                    wgpu::LoadOp::Load
+                },
+                // Preserve the final pass too: temporal consumers read after culling.
                 store: if keep_depth {
                     wgpu::StoreOp::Store
                 } else {
@@ -4157,6 +4165,7 @@ impl Renderer {
         frame: &Frame<'_>,
         pack_reads_world: bool,
         constants: Option<dlss::Constants>,
+        motion_ready: bool,
         presenting: bool,
     ) -> Result<Option<wgpu::CommandBuffer>> {
         #[cfg(target_os = "windows")]
@@ -4168,6 +4177,7 @@ impl Renderer {
             let motion = self
                 .world_post
                 .temporal_jitter()
+                .filter(|_| motion_ready)
                 .and_then(|_| self.motion.as_ref().and_then(motion::Motion::tagged));
             let depth_size = self
                 .world_post
@@ -4199,7 +4209,14 @@ impl Renderer {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (encoder, frame, pack_reads_world, constants, presenting);
+            let _ = (
+                encoder,
+                frame,
+                pack_reads_world,
+                constants,
+                motion_ready,
+                presenting,
+            );
             Ok(None)
         }
     }
@@ -4744,7 +4761,7 @@ impl Renderer {
             self.hdr.is_some(),
         );
         self.world_post.set_internal_size(dlss_size);
-        self.world_post.track_camera = self.framegen_rendering();
+        self.world_post.track_camera = self.motion_vectors_enabled();
         // Menu/loading frames may advance the temporal camera after a surface
         // reset. Keep the request pending in the SDK session and apply it to
         // the first eligible frame, before jitter and either SR/FG constants.
@@ -4756,7 +4773,7 @@ impl Renderer {
             self.motion.as_mut(),
         );
         if !taa
-            && !self.framegen_rendering()
+            && !self.motion_vectors_enabled()
             && let Some(motion) = &mut self.motion
         {
             motion.reset();
@@ -5703,8 +5720,9 @@ impl Renderer {
                 .flatten();
         }
         let pack_reads_world = pack_post || native_post;
-        // Phase 2 of occlusion culling draws over the depth, and a shader pack or TAA reads it.
-        let keep_depth = pack_reads_world || (taa && self.world_post.taa) || oit_on;
+        let keep_depth =
+            self.world_post
+                .keep_depth(pack_reads_world, oit_on, self.motion_vectors_enabled());
         // The pack's program reads the vertices this frame's draws bind.
         let pack_draws_terrain = pack_terrain && flat_frame == self.pack_terrain_flat;
         // The shadow camera's lists, drawn by the pack's shadow programs.
@@ -5748,7 +5766,7 @@ impl Renderer {
         let scaled = self.world_post.prepare(
             &self.device,
             [self.config.width, self.config.height],
-            pack_reads_world || self.framegen_rendering(),
+            pack_reads_world || self.motion_vectors_enabled(),
         );
         let (world_view, world_depth) = match &scaled {
             Some((color, depth)) => (color, depth),
@@ -5876,36 +5894,14 @@ impl Renderer {
             }
         };
         {
-            let attachments = [Some(wgpu::RenderPassColorAttachment {
-                view: world_view,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: if native_sky_pass {
-                        wgpu::LoadOp::Load
-                    } else {
-                        wgpu::LoadOp::Clear(clear)
-                    },
-                    store: wgpu::StoreOp::Store,
-                },
-            })];
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Horizon world"),
-                color_attachments: &attachments,
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: world_depth,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(0.0),
-                        store: if cull.is_some() || keep_depth {
-                            wgpu::StoreOp::Store
-                        } else {
-                            wgpu::StoreOp::Discard
-                        },
-                    }),
-                    stencil_ops: None,
-                }),
-                ..Default::default()
-            });
+            let mut pass = world_pass(
+                &mut encoder,
+                world_view,
+                world_depth,
+                (!native_sky_pass).then_some(clear),
+                true,
+                cull.is_some() || keep_depth,
+            );
             pass.set_bind_group(0, &self.group, &[]);
             pack_frame(&mut pass);
             if frame.title || (sky_visible && (frame.skybox || frame.end_sky)) {
@@ -5967,10 +5963,12 @@ impl Renderer {
                             drop(pass);
                             cull.test_pass(&mut encoder);
                             flat.flatten_phase2(&mut encoder);
-                            pass = world_pass_after_culling(
+                            pass = world_pass(
                                 &mut encoder,
                                 world_view,
                                 world_depth,
+                                None,
+                                false,
                                 keep_depth,
                             );
                             pass.set_bind_group(0, &self.group, &[]);
@@ -5997,10 +5995,12 @@ impl Renderer {
                             cull.test(&mut pass);
                             drop(pass);
                             cull.test_pass(&mut encoder);
-                            pass = world_pass_after_culling(
+                            pass = world_pass(
                                 &mut encoder,
                                 world_view,
                                 world_depth,
+                                None,
+                                false,
                                 keep_depth,
                             );
                             pass.set_bind_group(0, &self.group, &[]);
@@ -6290,7 +6290,14 @@ impl Renderer {
                         },
                         &extras,
                     );
-                    pass = world_pass_after_culling(&mut encoder, world_view, world_depth, true);
+                    pass = world_pass(
+                        &mut encoder,
+                        world_view,
+                        world_depth,
+                        None,
+                        false,
+                        keep_depth,
+                    );
                     pass.set_bind_group(0, &self.group, &[]);
                     pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
                     // HDR output's mark on the eyes drawn in the stages, as the
@@ -6388,6 +6395,7 @@ impl Renderer {
             }
         }
         let mut temporal_constants = None;
+        let mut motion_ready = false;
         let mut submit_started = false;
         if let Some((color, depth)) = &scaled
             && pack_post
@@ -6499,7 +6507,7 @@ impl Renderer {
                 && let Some(motion) = &mut self.motion
             {
                 if let Some(jitter) = self.world_post.temporal_jitter() {
-                    motion.render(
+                    motion_ready = motion.render(
                         &self.device,
                         &self.queue,
                         &mut encoder,
@@ -6518,7 +6526,7 @@ impl Renderer {
             }
             self.dlss.motion_cpu_ms =
                 motion_started.map_or(0.0, |t| t.elapsed().as_secs_f32() * 1000.0);
-            if dlss_size.is_some() || self.framegen_rendering() {
+            if motion_ready && (dlss_size.is_some() || self.framegen_rendering()) {
                 temporal_constants = self.temporal_constants(frame, pose, &views);
             }
             let dlss_result = if dlss_size.is_some() {
@@ -6781,6 +6789,7 @@ impl Renderer {
             frame,
             pack_reads_world,
             temporal_constants,
+            motion_ready,
             surface_frame.is_some(),
         )?;
         let commands = crate::spans::time("encode", || encoder.finish());
