@@ -3877,7 +3877,7 @@ impl Renderer {
     fn report_reflex_unloaded(&self) {
         let line = if self.reflex_mode == crate::graphics::Reflex::Off {
             String::new()
-        } else if self.reflex_failed_to_bind() {
+        } else if cfg!(not(target_os = "windows")) || self.reflex_failed_to_bind() {
             "Reflex: unavailable".into()
         } else {
             "Reflex: restart".into()
@@ -4004,7 +4004,7 @@ impl Renderer {
     fn report_framegen_unloaded(&self) {
         let line = if self.framegen_mode == crate::graphics::FrameGen::Off {
             String::new()
-        } else if self.framegen_failed_to_bind() {
+        } else if cfg!(not(target_os = "windows")) || self.framegen_failed_to_bind() {
             "Frame Gen: unavailable".into()
         } else {
             "Frame Gen: restart".into()

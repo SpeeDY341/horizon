@@ -18,6 +18,8 @@ horizon-items = { path = "../horizon-items" }
 horizon-protocol = { path = "../horizon-protocol" }
 horizon-shader-api = { path = "../horizon-shader-api" }
 horizon-shaders = { path = "../horizon-shaders" }
+# The server-tick guard has a no-op implementation outside Windows.
+horizon-streamline = { path = "../horizon-streamline" }
 horizon-telemetry = { path = "../horizon-telemetry", default-features = false, features = ["live"] }
 horizon-theme = { path = "../horizon-theme" }
 horizon-threads = { path = "../horizon-threads" }
@@ -50,7 +52,6 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 rustix = { version = "1", default-features = false, features = ["std", "time"] }
 
 [target.'cfg(windows)'.dependencies]
-horizon-streamline = { path = "../horizon-streamline" }
 wgpu = { version = "30.0.1", default-features = false, features = ["dx12"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]

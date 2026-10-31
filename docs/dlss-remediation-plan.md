@@ -1,6 +1,7 @@
 # План переделки DLSS, Reflex и Frame Generation
 
-Дата: 31 октября 2026 года. Статус: **часть A реализована; части B–I ещё не начаты**.
+Дата: 31 октября 2026 года. Статус: **часть A прошла review; код части B реализован
+и проверен на Windows, проверки Linux/macOS открыты; части C–I ещё не начаты**.
 
 Основание: review 30 коммитов `763528025..35123b73f` личного форка
 `SpeeDY341/horizon`, ветка `codex/dlss-stages-0-2`.
@@ -92,26 +93,62 @@
 - Настоящие title/Smoke-запуски, GPU/драйвер и API аппаратного прогона здесь
   не проверялись. Изоляция доказана тестом запуска, работоспособность FG/Reflex
   из него не следует. Полный pr_ready и аппаратные SDK-тесты не запускались.
-  Независимый review части A предстоит; остальные замечания остаются открытыми.
+  Независимый агент `review_a` проверил commit
+  `1f375ead463d6e72818a6b5e8164c3d62fb3cc66` и дал **PASS** в этом чате.
+  Review дополнительно подтвердил передачу реальных аргументов Start-Process
+  через helper exe в PowerShell 5.1. Остальные замечания остаются открытыми.
 
 ## 4. Восстановить платформенные границы — R1
 
 **Файлы:** `crates/horizon-client-render/Cargo.toml`,
 `crates/horizon-client-render/src/gfx.rs`, `crates/horizon-streamline/src/lib.rs`.
 
-- [ ] Сделать зависимость `horizon-streamline` общей, используя существующие
+- [x] Сделать зависимость `horizon-streamline` общей, используя существующие
   заглушки вне Windows; нативные зависимости и реализации оставить под cfg.
-- [ ] Проверить все публичные функции, типы и re-export на наличие Windows-only
+- [x] Проверить все публичные функции, типы и re-export на наличие Windows-only
   ссылок в общем коде, включая `reflex_server_tick`.
-- [ ] Убедиться, что Linux/macOS не пытаются загружать NVIDIA DLL и получают
-  корректный статус недоступной функции.
+- [x] Проверить статически, что Linux/macOS не пытаются загружать NVIDIA DLL
+  и получают корректный статус недоступной функции.
 - [ ] Выполнить проверки рендерера и клиента на Windows, Linux и macOS.
-- [ ] Проверить dedicated/server-конфигурацию с `--no-default-features`.
-- [ ] Закрепить нужные проверки в существующей CI-матрице, если они отсутствуют.
+- [x] Проверить dedicated/server-конфигурацию с `--no-default-features` на Windows.
+- [x] Закрепить нужные проверки в существующей CI-матрице, если они отсутствуют.
 
 **Готово, когда:** общий код собирается на всех трёх ОС. Отсутствие локального
 target или доступа к нужной ОС фиксируется как непроведённая проверка,
 а не успешный результат.
+
+### Результат реализации части B (31 октября 2026)
+
+- `horizon-streamline` — общая обязательная зависимость рендерера, поэтому
+  `gfx::reflex_server_tick` разрешает тип и функцию на любой платформе.
+  Runtime, ABI, SR/FG/Reflex native API и их re-export остаются под Windows cfg;
+  `libloading`, `ash`, `wgpu` и `pollster` также подключаются только на Windows.
+  На других ОС доступны только `eligible` (false) и no-op guard server tick.
+- Проверены все ссылки `horizon_streamline` в renderer/client: вне cfg остался
+  только общий guard. `dlss::load` вне Windows возвращает None до загрузки DLL;
+  fallback SR — `TAA: Windows`, Reflex/FG — `unavailable` вместо `restart`.
+  Для non-Windows добавлены Rust-тесты отсутствия сессии, fallback и guard.
+- На Windows успешно: `cargo check --locked -p horizon-client-render -p
+  horizon-client --lib --bins`; `cargo check --locked -p horizon-client -p
+  horizon-server --no-default-features --lib --bins`; `cargo clippy --locked -p
+  horizon-client-render -p horizon-streamline --lib -- -D warnings`;
+  `cargo fmt --all -- --check`.
+- `cargo test --locked -p horizon-streamline --lib`: 7 passed, 3 SDK-теста ignored.
+  `cargo test --locked -p horizon-client-render --lib gfx::dlss::tests::`: 3 passed.
+  `python -m unittest discover -s tests -p test_streamline_platform.py -v`:
+  2 passed; тесты фиксируют общую зависимость и Windows-only native dependencies.
+  `git diff --check` и `python tools/check_public_tree.py`: успешно.
+  Cargo предупреждает о копировании incremental cache вместо hard links.
+- `.github/workflows/ci.yml` уже запускает Linux workspace Clippy/tests и
+  `horizon-client --no-default-features`. `game-build.yml` уже содержит сборки
+  клиента/server на Linux, Windows и macOS, плюс отдельный Linux server build
+  без default features. Расширять матрицу не потребовалось; её выполнение
+  для этого коммита здесь не запускалось.
+- Установлен только `x86_64-pc-windows-msvc`. Linux/macOS builds и новые
+  non-Windows Rust-тесты локально **не выполнялись**. Manifest-тесты и cfg-аудит
+  не заменяют эти сборки, поэтому общий критерий готовности части B и пункт
+  проверки всех трёх ОС остаются открытыми. Игра, launcher и SDK GPU-тесты
+  не запускались; полный pr_ready не запускался. `Cargo.lock` не изменился.
 
 ## 5. Переделать жизненный цикл swapchain — R3, R6
 
@@ -280,7 +317,8 @@ swapchain получает hook; стресс-проверка не зависа
 а тесты включать вместе с исправлением соответствующего поведения.
 
 - [x] Часть A: изолированный запуск и атрибуция ABI.
-- [ ] Часть B: платформенная зависимость, заглушки и проверки сборки.
+- [ ] Часть B: код платформенной зависимости и заглушек реализован; Windows
+  проверен, подтверждение Linux/macOS-сборок ещё требуется.
 - [ ] Часть C: отключение FG до изменения swapchain и тест порядка вызовов.
 - [ ] Часть D: восстановление DX12 proxy при замене surface.
 - [ ] Часть E: общий frame token/constants и отдельная валидность TAA history.

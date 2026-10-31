@@ -395,6 +395,21 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unsupported_platform_never_loads_a_streamline_session() {
+        for backend in [wgpu::Backends::VULKAN, wgpu::Backends::METAL] {
+            assert!(load(true, true, true, backend).is_none());
+        }
+        let state = State::new(
+            None,
+            true,
+            &adapter(wgpu::Backend::Vulkan, 0x10de, "RTX 5090"),
+        );
+        assert_eq!(state.startup_failure.as_deref(), Some("TAA: Windows"));
+    }
+
     fn adapter(backend: wgpu::Backend, vendor: u32, name: &str) -> wgpu::AdapterInfo {
         let mut info = wgpu::AdapterInfo::new(wgpu::DeviceType::DiscreteGpu, backend);
         info.name = name.into();

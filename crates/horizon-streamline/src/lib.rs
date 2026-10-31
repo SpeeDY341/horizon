@@ -35,6 +35,14 @@ mod tests {
         assert!(!super::eligible(true, 0x1002, "Radeon"));
         assert!(!super::eligible(true, 0x10de, "GeForce GTX 1080"));
     }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unsupported_platform_has_no_session_even_for_rtx() {
+        assert!(!super::eligible(true, 0x10de, "NVIDIA GeForce RTX 5090"));
+        let tick: super::ReflexServerTick = super::reflex_server_tick();
+        drop(tick);
+    }
 }
 
 #[cfg(target_os = "windows")]
