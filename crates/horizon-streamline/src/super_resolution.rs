@@ -244,6 +244,7 @@ impl SuperResolution {
         preset: u32,
     ) -> Result<[u32; 2], String> {
         let _session = self._runtime.lock().map_err(|e| e.to_string())?;
+        _session.presentation_ready()?;
         if ![0, 5, 6, 10, 11, 12, 13].contains(&preset)
             || ![1, 2, 3, 4, 6].contains(&mode)
             || output.contains(&0)
@@ -317,6 +318,7 @@ impl SuperResolution {
         frame: FrameConstants,
     ) -> Result<wgpu::TextureView, String> {
         let _session = self._runtime.lock().map_err(|e| e.to_string())?;
+        _session.presentation_ready()?;
         let viewport = sl::Viewport::new();
         let targets = self.targets.as_ref().ok_or("DLSS is not configured")?;
         let slot = self.monitor.as_mut().and_then(|m| m.begin(&self.device));

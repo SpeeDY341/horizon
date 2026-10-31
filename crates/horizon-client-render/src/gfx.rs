@@ -1329,21 +1329,6 @@ fn startup_step(step: std::fmt::Arguments) {
 pub fn reflex_server_tick() -> horizon_streamline::ReflexServerTick {
     horizon_streamline::reflex_server_tick()
 }
-/// Point the DirectX 12 swapchain at Streamline's proxy. Vulkan's interposer
-/// already owns presentation, and a failure here keeps the native swapchain.
-#[cfg(target_os = "windows")]
-fn note_dx12_swapchain(runtime: &Option<dlss::Shared>, surface: &wgpu::Surface<'_>) {
-    let Some(runtime) = runtime else {
-        return;
-    };
-    let hooked = match runtime.lock() {
-        Ok(mut runtime) => runtime.note_dx12_swapchain(surface),
-        Err(e) => Err(e.to_string()),
-    };
-    if let Err(e) = hooked {
-        log::warn!("DLSS DirectX 12 presentation hook failed: {e}");
-    }
-}
 /// How far the first frame on a new device got, for `startup_step`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FirstFrame {
@@ -1495,9 +1480,7 @@ impl Renderer {
             }
             // A fresh runtime has not bound FG yet. Reused runtimes were
             // checked Off above, before taking or creating their surface.
-            surface.configure(&device, &config);
-            #[cfg(target_os = "windows")]
-            note_dx12_swapchain(&streamline, surface);
+            Self::configure(&device, surface, &config, None, &streamline);
             let hdr_output = hdr::output(&caps);
             crate::graphics::offer_hdr(hdr_output.is_some());
             if previous.is_none() {
@@ -3220,6 +3203,7 @@ impl Renderer {
                             surface,
                             &self.surface_config(),
                             self.hdr.as_ref(),
+                            &self.streamline,
                         );
                     }
                 }
@@ -3279,6 +3263,7 @@ impl Renderer {
             &surface,
             &self.surface_config(),
             self.hdr.as_ref(),
+            &self.streamline,
         );
         self.surface = Some(surface);
         Ok(())
@@ -3357,6 +3342,7 @@ impl Renderer {
                 surface,
                 &self.surface_config(),
                 self.hdr.as_ref(),
+                &self.streamline,
             );
         } else {
             self.offscreen = Some(Self::offscreen_target(&self.device, &self.config));
@@ -3792,8 +3778,12 @@ impl Renderer {
         surface: &wgpu::Surface<'_>,
         config: &wgpu::SurfaceConfiguration,
         hdr: Option<&hdr::Hdr>,
+        streamline: &Option<dlss::Shared>,
     ) {
-        surface.configure(device, config);
+        frame_gen::configure_presentation(
+            || surface.configure(device, config),
+            || dlss::hook_presentation(streamline, surface),
+        );
         if let Some(hdr) = hdr {
             horizon_hdr::set_metadata(device, surface, hdr.paper_white, hdr.peak, hdr.black);
         }
@@ -3806,9 +3796,8 @@ impl Renderer {
                 surface,
                 &self.surface_config(),
                 self.hdr.as_ref(),
+                &self.streamline,
             );
-            #[cfg(target_os = "windows")]
-            note_dx12_swapchain(&self.streamline, surface);
         }
         Ok(())
     }
@@ -3899,9 +3888,8 @@ impl Renderer {
                     surface,
                     &self.surface_config(),
                     self.hdr.as_ref(),
+                    &self.streamline,
                 );
-                #[cfg(target_os = "windows")]
-                note_dx12_swapchain(&self.streamline, surface);
             }
             match output {
                 Some(output) => log::info!(

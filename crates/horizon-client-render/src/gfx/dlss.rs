@@ -6,6 +6,23 @@ pub(super) type Shared = std::sync::Arc<std::sync::Mutex<horizon_streamline::Run
 #[cfg(not(target_os = "windows"))]
 pub(super) type Shared = ();
 
+/// Keep the runtime loaded even if a new native chain cannot be proxied: older
+/// surfaces and native feature resources can still own SDK objects.
+pub(super) fn hook_presentation(
+    shared: &Option<Shared>,
+    surface: &wgpu::Surface<'_>,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    if let Some(shared) = shared {
+        return shared
+            .lock()
+            .map_err(|_| "Streamline lock poisoned".to_owned())?
+            .note_dx12_swapchain(surface);
+    }
+    let _ = (shared, surface);
+    Ok(())
+}
+
 pub(super) fn load(
     dlss: bool,
     reflex: bool,
@@ -262,6 +279,17 @@ impl State {
                 );
                 return None;
             };
+            // A hook failure is recoverable on the next configure. Do not make
+            // it a sticky engine failure, or keep allocating unretired tokens.
+            if let Err(error) = shared
+                .lock()
+                .map_err(|_| "Streamline lock poisoned".to_owned())
+                .and_then(|runtime| runtime.presentation_ready())
+            {
+                graphics::report_dlss(format!("TAA: {error}"));
+                self.reset = true;
+                return None;
+            }
             if self.report.versions.is_empty() {
                 self.report.versions = shared
                     .lock()

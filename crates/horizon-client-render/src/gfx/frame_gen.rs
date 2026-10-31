@@ -63,10 +63,79 @@ pub(super) fn prepare_change(
     synchronize()
 }
 
+/// All surface creation and reconfiguration paths finish here before callers
+/// can acquire/present. Hook failure permits ordinary rendering; the runtime
+/// records why presentation-dependent features are unavailable.
+pub(super) fn configure_presentation(
+    configure: impl FnOnce(),
+    hook: impl FnOnce() -> Result<(), String>,
+) {
+    configure();
+    if let Err(error) = hook() {
+        log::warn!("Streamline presentation unavailable: {error}");
+    }
+}
+
 #[cfg(test)]
 mod lifecycle_tests {
     use super::prepare_change;
     use std::cell::RefCell;
+
+    #[test]
+    fn new_surface_is_configured_and_hooked_before_first_present() {
+        let calls = RefCell::new(Vec::new());
+        prepare_change(
+            || {
+                calls.borrow_mut().push("Off");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("wait");
+                Ok(())
+            },
+        )
+        .unwrap();
+        calls.borrow_mut().push("create new surface");
+        super::configure_presentation(
+            || calls.borrow_mut().push("configure new chain"),
+            || {
+                calls.borrow_mut().push("hook new chain");
+                Ok(())
+            },
+        );
+        calls.borrow_mut().push("Present");
+        assert_eq!(
+            *calls.borrow(),
+            [
+                "Off",
+                "wait",
+                "create new surface",
+                "configure new chain",
+                "hook new chain",
+                "Present"
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_hook_keeps_native_render_and_reports_before_present() {
+        let calls = RefCell::new(Vec::new());
+        let available = std::cell::Cell::new(true);
+        super::configure_presentation(
+            || calls.borrow_mut().push("configure"),
+            || {
+                calls.borrow_mut().push("hook failed");
+                available.set(false);
+                Err("slUpgradeInterface failed (42)".into())
+            },
+        );
+        assert!(!available.get());
+        calls.borrow_mut().push("native Present");
+        assert_eq!(
+            *calls.borrow(),
+            ["configure", "hook failed", "native Present"]
+        );
+    }
 
     #[test]
     fn first_eligible_frame_resets_history_after_multiple_menu_frames() {

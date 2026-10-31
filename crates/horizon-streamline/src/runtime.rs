@@ -44,9 +44,8 @@ pub struct Runtime {
     upgrade_interface: abi::UpgradeInterface,
     device: Option<wgpu::Device>,
     instance: Option<wgpu::Instance>,
-    /// Proxy swapchain last installed. A second upgrade of the same pointer is
-    /// rejected when manual hooking is on, and means the proxy is still in place.
-    dx12_swapchain: usize,
+    /// A failed presentation hook disables consumers without unloading SDK objects.
+    presentation: Presentation,
     directory: std::path::PathBuf,
     reflex: crate::reflex::Session,
     framegen: crate::frame_gen::Session,
@@ -239,7 +238,7 @@ impl Runtime {
             upgrade_interface,
             device: None,
             instance: None,
-            dx12_swapchain: 0,
+            presentation: Presentation::default(),
             directory,
             reflex: crate::reflex::Session::new(reflex),
             framegen: crate::frame_gen::Session::new(framegen_listed, framegen_ready),
@@ -273,7 +272,9 @@ impl Runtime {
     /// Start the presented frame. Sleeps only when this token was not already
     /// slept at the previous present. `allow_sleep` is false offscreen.
     pub fn reflex_begin(&mut self, allow_sleep: bool) {
-        self.reflex.begin(allow_sleep);
+        if self.presentation_ready().is_ok() {
+            self.reflex.begin(allow_sleep);
+        }
     }
 
     pub fn reflex_end_simulation(&mut self) {
@@ -299,7 +300,10 @@ impl Runtime {
     }
 
     pub fn reflex_line(&self) -> String {
-        self.reflex.line()
+        self.presentation.error.as_ref().map_or_else(
+            || self.reflex.line(),
+            |error| format!("Reflex: unavailable ({error})"),
+        )
     }
 
     pub fn take_reflex_error(&mut self) -> Option<String> {
@@ -309,6 +313,7 @@ impl Runtime {
     /// Mark simulation on the server thread only when the window has not
     /// already done it for this presented frame. Returns the token address.
     pub(crate) fn reflex_claim_server(&mut self) -> Option<usize> {
+        self.presentation_ready().ok()?;
         self.reflex.claim_server()
     }
 
@@ -491,6 +496,9 @@ impl Runtime {
         encoder: &mut wgpu::CommandEncoder,
         input: crate::frame_gen::Inputs<'_>,
     ) -> Result<Option<wgpu::CommandBuffer>, String> {
+        if self.presentation_ready().is_err() {
+            return Ok(None);
+        }
         let Some(device) = self.device.clone() else {
             return Err("Frame Generation has no graphics device".into());
         };
@@ -500,11 +508,16 @@ impl Runtime {
     }
 
     pub fn framegen_sample(&mut self) {
-        self.framegen.sample();
+        if self.presentation_ready().is_ok() {
+            self.framegen.sample();
+        }
     }
 
     pub fn framegen_line(&self) -> String {
-        self.framegen.line()
+        self.presentation.error.as_ref().map_or_else(
+            || self.framegen.line(),
+            |error| format!("Frame Gen: unavailable ({error})"),
+        )
     }
 
     pub fn take_framegen_error(&mut self) -> Option<String> {
@@ -579,35 +592,35 @@ impl Runtime {
             return Ok(());
         }
         let upgrade = self.upgrade_interface;
-        let known = self.dx12_swapchain;
-        // Safety: the surface guard keeps the hal surface alive. The callback
-        // only calls slUpgradeInterface and does not record commands.
-        let hal = unsafe { surface.as_hal::<wgpu::hal::api::Dx12>() }
-            .ok_or("DirectX 12 surface missing")?;
-        let mut installed = 0usize;
-        let ok = unsafe {
-            hal.upgrade_swap_chain(|native| {
-                let mut ptr = native;
-                let code = upgrade(&mut ptr);
-                if code == 0 && !ptr.is_null() {
-                    installed = ptr as usize;
-                    return ptr;
-                }
-                // Manual hooking rejects a second upgrade of a live proxy and
-                // leaves the pointer unchanged.
-                if !native.is_null() && native as usize == known {
-                    installed = known;
-                    return native;
-                }
-                std::ptr::null_mut()
-            })
-        };
-        if ok {
-            self.dx12_swapchain = installed;
-            Ok(())
-        } else {
-            Err("Streamline did not hook the DirectX 12 swapchain".into())
+        let result = (|| {
+            // Safety: the guard and HAL's exclusive swapchain lock keep the
+            // native interface alive. HAL remembers successful upgrades on the
+            // owned chain itself, preserving that state across ResizeBuffers.
+            let hal = unsafe { surface.as_hal::<wgpu::hal::api::Dx12>() }
+                .ok_or("DirectX 12 surface missing")?;
+            let mut error = "DX12 swapchain missing".to_owned();
+            let ok = unsafe {
+                hal.upgrade_swap_chain(|native| match upgrade_dx12_interface(native, upgrade) {
+                    Ok(proxy) => proxy,
+                    Err(reason) => {
+                        error = reason;
+                        std::ptr::null_mut()
+                    }
+                })
+            };
+            if ok { Ok(()) } else { Err(error) }
+        })();
+        let result = self.presentation.update(result);
+        if result.is_err() {
+            self.reflex.abandon_presentation();
         }
+        result
+    }
+
+    /// Offscreen SR never requires a hook. Only an attempted, failed DX12
+    /// presentation setup makes the token/Present contract unavailable.
+    pub fn presentation_ready(&self) -> Result<(), String> {
+        self.presentation.ready()
     }
 
     pub fn requirements(&self) -> Result<Requirements, String> {
@@ -625,6 +638,39 @@ impl Runtime {
             compute_queues: req.compute_queues,
             graphics_queues: req.graphics_queues,
         })
+    }
+}
+
+/// Failed hooks are recoverable without discarding any native SDK owners.
+#[derive(Default)]
+struct Presentation {
+    error: Option<String>,
+}
+impl Presentation {
+    fn update(&mut self, result: Result<(), String>) -> Result<(), String> {
+        self.error = result.as_ref().err().cloned();
+        result
+    }
+    fn ready(&self) -> Result<(), String> {
+        self.error.clone().map_or(Ok(()), Err)
+    }
+}
+
+// Safety: called only under the HAL chain's exclusive lock. Success transfers
+// the SDK's owned proxy reference to HAL; failure transfers no ownership.
+unsafe fn upgrade_dx12_interface(
+    native: *mut std::ffi::c_void,
+    upgrade: abi::UpgradeInterface,
+) -> Result<*mut std::ffi::c_void, String> {
+    let mut proxy = native;
+    let code = unsafe { upgrade(&mut proxy) };
+    if code == 0 && !proxy.is_null() {
+        Ok(proxy)
+    } else {
+        Err(format!(
+            "DX12 presentation hook failed (slUpgradeInterface: {code}, null proxy: {})",
+            proxy.is_null()
+        ))
     }
 }
 
@@ -673,6 +719,48 @@ impl Drop for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    unsafe extern "C" fn mock_upgrade(ptr: *mut *mut std::ffi::c_void) -> i32 {
+        match unsafe { *ptr } as usize {
+            1 => {
+                unsafe { *ptr = 2usize as *mut _ };
+                0
+            }
+            3 => {
+                unsafe { *ptr = std::ptr::null_mut() };
+                0
+            }
+            _ => 42,
+        }
+    }
+
+    #[test]
+    fn hook_failure_blocks_consumers_and_successful_new_chain_recovers() {
+        let mut presentation = Presentation::default();
+        assert!(presentation.ready().is_ok()); // offscreen / no hook attempted
+        let error = presentation
+            .update(unsafe { upgrade_dx12_interface(2usize as *mut _, mock_upgrade).map(|_| ()) })
+            .unwrap_err();
+        assert!(error.contains("42"));
+        let mut called = false;
+        let result = presentation.ready().map(|()| called = true);
+        assert_eq!(result.unwrap_err(), error);
+        assert!(!called); // token allocation/evaluation must remain gated
+        presentation
+            .update(unsafe {
+                upgrade_dx12_interface(std::ptr::dangling_mut(), mock_upgrade).map(|proxy| {
+                    assert_eq!(proxy as usize, 2);
+                })
+            })
+            .unwrap();
+        assert!(presentation.ready().is_ok());
+    }
+
+    #[test]
+    fn successful_sdk_result_with_null_proxy_is_unavailable() {
+        let result = unsafe { upgrade_dx12_interface(3usize as *mut _, mock_upgrade) };
+        assert!(result.unwrap_err().contains("null proxy: true"));
+    }
     #[test]
     fn absent_sdk_and_invalid_configuration_return_errors() {
         assert!(Runtime::load(Path::new("relative"), "invalid").is_err());

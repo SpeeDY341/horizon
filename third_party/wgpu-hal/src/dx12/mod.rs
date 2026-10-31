@@ -606,6 +606,8 @@ unsafe impl Sync for Instance {}
 struct SwapChain {
     // TODO: Drop order frees the SWC before the raw image pointers...?
     raw: Dxgi::IDXGISwapChain3,
+    // Belongs to this owned COM chain, never to a cached numeric address.
+    proxy_installed: bool,
     // need to associate raw image pointers with the swapchain so they can be properly released
     // when the swapchain is destroyed
     resources: Vec<Direct3D12::ID3D12Resource>,
@@ -670,7 +672,7 @@ impl Surface {
             return false;
         };
         let native = chain.raw.as_raw();
-        let proxy = upgrade(native);
+        let proxy = upgrade_swap_chain_pointer(&mut chain.proxy_installed, native, upgrade);
         if proxy.is_null() {
             return false;
         }
@@ -684,6 +686,67 @@ impl Surface {
     /// Handle is only valid while the swap chain is alive.
     pub unsafe fn waitable_handle(&self) -> Option<Foundation::HANDLE> {
         self.swap_chain.read().as_ref()?.waitable
+    }
+}
+
+// No pointer cache: a freshly created chain starts false even if COM reuses a
+// destroyed proxy's address. A ResizeBuffers keeps this same owned chain true.
+fn upgrade_swap_chain_pointer(
+    installed: &mut bool,
+    native: *mut ffi::c_void,
+    upgrade: impl FnOnce(*mut ffi::c_void) -> *mut ffi::c_void,
+) -> *mut ffi::c_void {
+    if *installed {
+        return native;
+    }
+    let proxy = upgrade(native);
+    *installed = !proxy.is_null();
+    proxy
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::upgrade_swap_chain_pointer;
+    use core::ffi::c_void;
+
+    #[test]
+    fn failure_preserves_native_and_retry_then_resize_is_idempotent() {
+        let native = core::ptr::dangling_mut::<c_void>();
+        let proxy = 2usize as *mut c_void;
+        let mut installed = false;
+        assert!(
+            upgrade_swap_chain_pointer(&mut installed, native, |_| core::ptr::null_mut()).is_null()
+        );
+        assert!(!installed);
+        assert_eq!(
+            upgrade_swap_chain_pointer(&mut installed, native, |p| {
+                assert_eq!(p, native);
+                proxy
+            }),
+            proxy
+        );
+        assert!(installed);
+        assert_eq!(
+            upgrade_swap_chain_pointer(&mut installed, proxy, |_| panic!(
+                "live proxy upgraded twice"
+            )),
+            proxy
+        );
+    }
+
+    #[test]
+    fn new_chain_at_recycled_address_must_still_be_upgraded() {
+        let recycled = 2usize as *mut c_void;
+        let new_proxy = 3usize as *mut c_void;
+        let mut installed = false; // newly constructed SwapChain
+        assert_eq!(
+            upgrade_swap_chain_pointer(&mut installed, recycled, |p| {
+                assert_eq!(p, recycled);
+                new_proxy
+            }),
+            new_proxy
+        );
+        assert!(installed);
     }
 }
 
@@ -1562,9 +1625,11 @@ impl crate::Surface for Surface {
         // For high latency extra buffers seems excessive, so go with a minimum of 3 and beyond that add 1.
         let swap_chain_buffer = (config.maximum_frame_latency + 1).min(16);
 
+        let mut proxy_installed = false;
         let swap_chain = match self.swap_chain.write().take() {
             //Note: this path doesn't properly re-initialize all of the things
             Some(sc) => {
+                proxy_installed = sc.proxy_installed;
                 let raw = unsafe { sc.release_resources() };
                 let result = unsafe {
                     raw.ResizeBuffers(
@@ -1758,6 +1823,7 @@ impl crate::Surface for Surface {
         let mut swapchain = self.swap_chain.write();
         *swapchain = Some(SwapChain {
             raw: swap_chain,
+            proxy_installed,
             resources,
             waitable,
             acquired_count: 0,

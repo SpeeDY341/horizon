@@ -1,8 +1,9 @@
 # План переделки DLSS, Reflex и Frame Generation
 
 Дата: 31 октября 2026 года. Статус: **часть A прошла review; код части B реализован
-и проверен на Windows, проверки Linux/macOS открыты; код части C реализован,
-независимый review и аппаратная проверка открыты; части D–I ещё не начаты**.
+и проверен на Windows, проверки Linux/macOS открыты; код части C прошёл
+независимый review, аппаратная проверка открыта; код части D реализован и
+проверен локально, новый review и аппаратная проверка открыты; E–I не начаты**.
 
 Основание: review 30 коммитов `763528025..35123b73f` личного форка
 `SpeeDY341/horizon`, ветка `codex/dlss-stages-0-2`.
@@ -164,9 +165,9 @@ target или доступа к нужной ОС фиксируется как 
   **до** операции, проверить результат и выполнить требуемую синхронизацию.
 - [x] Не продолжать потенциально опасную реконфигурацию после ошибки отключения
   FG без определённого безопасного пути восстановления.
-- [ ] После создания нового DX12 swapchain устанавливать Streamline proxy до
+- [x] После создания нового DX12 swapchain устанавливать Streamline proxy до
   первого Present; учитывать замену native pointer и владение COM-ссылками.
-- [ ] При ошибке установки hook переводить presentation-зависимые функции
+- [x] При ошибке установки hook переводить presentation-зависимые функции
   в недоступное состояние с понятной причиной.
 - [ ] После восстановления сбрасывать историю и возобновлять FG только на кадре
   с актуальными ресурсами, размерами, token и константами.
@@ -286,6 +287,48 @@ swapchain получает hook; стресс-проверка не зависа
 - Targeted recovery tests: 4 passed; Clippy renderer/client lib/bins/tests с
   `-D warnings`, fmt, diff check и public-tree успешно. Повторный независимый
   review fix и аппаратные проверки остаются открытыми.
+
+### Принятие кода C и результат кода D (31 октября 2026)
+
+- Независимый `review_c4` дал **PASS** для исправлений C на
+  `5b967731778976a71e2e43675f26d212b5af0978`. Аппаратная проверка C
+  остаётся открытой; этот PASS не подтверждает настоящий FG Present.
+- D основана на этом SHA. Все surface configure проходят общий
+  `Renderer::configure`: первый new, new(previous), resize, present mode,
+  HDR, acquire/reconfigure recovery и recreate_surface с новой или spare
+  surface. После configure hook вызывается синхронно до первого acquire/Present;
+  существующие C Off/wait guards перед mutation сохранены.
+- HAL хранит факт установки proxy на самом owned SwapChain и переносит его
+  через ResizeBuffers. Новая цепочка начинает без proxy даже при повторном
+  использовании адреса старой. Runtime больше не распознаёт proxy по голому
+  адресу. Переход на новый proxy передаёт HAL одну owned COM-ссылку; старый
+  интерфейс освобождается прежним HAL-путём, дополнительных удержаний нет.
+- Ошибка `slUpgradeInterface` (код/нулевой результат либо отсутствующий chain)
+  сохраняется как presentation unavailable. SR использует TAA, FG не пишет
+  tags/options для кадра, Reflex не выделяет/sleep новый token; открытый и
+  pending tokens сбрасываются. Статусы содержат причину. Обычный native Present
+  разрешён после успешных C Off/wait. Следующий успешный configure снимает
+  presentation error; SDK не выгружается, пока его объекты ещё могут жить.
+  Vulkan, no-SDK и offscreen без попытки hook не требуют DX12 proxy.
+- Проверены закреплённые MIT license и `include/sl_core_api.h` Streamline
+  2.14.16, commit `625db07d4bca5abc67d781c42af7e7fb0761f1b6`:
+  manual upgrade выполняется после создания интерфейса и до presentation.
+  Новых переводов ABI/чужого исходного кода не добавлено.
+- Windows: Streamline lib **12 passed, 3 SDK ignored**; renderer lifecycle
+  **5 passed** (включая injected new surface → configure → hook → Present
+  и hook failure → native Present). Mock SDK проверяет код ошибки, null-success,
+  восстановление доступности; Reflex проверяет сброс обоих видов tokens.
+  HAL отдельно: `cargo test --manifest-path third_party/wgpu-hal/Cargo.toml
+  --no-default-features --features dx12 --lib proxy_tests --target-dir target`
+  — **2 passed**, idempotent proxy/ошибка/повтор и новый chain по старому адресу.
+  Для standalone dev dependencies потребовалась загрузка crates.io;
+  сгенерированный отдельный Cargo.lock не включён в изменение.
+- Clippy streamline/renderer/client lib/bins/tests с `-D warnings`, fmt
+  (workspace и отдельный HAL), diff check и public-tree проходят. Cargo
+  предупреждает о fallback incremental hard links на копирование.
+  Полный pr_ready, аппаратные loss/recreate/FG Present, визуальная проверка,
+  Linux/macOS и независимый review D **не выполнены**. D не закрывает R2/R4/R5;
+  проверка настоящего возобновления FG остаётся зависима от E–G.
 
 ## 6. Объединить состояние кадра и сохранить входные данные — R4, R5
 
@@ -430,8 +473,9 @@ swapchain получает hook; стресс-проверка не зависа
 - [ ] Часть B: код платформенной зависимости и заглушек реализован; Windows
   проверен, подтверждение Linux/macOS-сборок ещё требуется.
 - [ ] Часть C: код отключения FG до изменения swapchain и regression tests
-  реализованы; независимый review и аппаратная проверка ещё открыты.
-- [ ] Часть D: восстановление DX12 proxy при замене surface.
+  прошёл review_c4 PASS; аппаратная проверка открыта.
+- [ ] Часть D: код восстановления DX12 proxy при замене surface реализован;
+  targeted tests прошли, независимый review и аппаратная проверка открыты.
 - [ ] Часть E: общий frame token/constants и отдельная валидность TAA history.
 - [ ] Часть F: сохранение depth/motion и GPU-регрессии.
 - [ ] Часть G: frame-based tagging и аппаратная проверка FG 2×.

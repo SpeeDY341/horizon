@@ -303,6 +303,16 @@ impl Session {
         }
     }
 
+    /// A failed presentation hook cannot retire pending tokens. Do not reuse
+    /// one after a later surface recovers.
+    pub fn abandon_presentation(&mut self) {
+        self.abandon();
+        if self.pending != 0 {
+            self.index = self.index.wrapping_add(1);
+        }
+        self.pending = 0;
+    }
+
     /// Claim only a frame the window has opened and not yet given a simulation
     /// marker. The window sets that marker in the same step as the input
     /// marker, so this normally does not run.
@@ -569,5 +579,20 @@ mod tests {
         session.loaded = true;
         assert_eq!(session.claim_server(), Some(4));
         assert_eq!(session.sim, 2);
+    }
+
+    #[test]
+    fn failed_presentation_discards_open_and_pending_tokens() {
+        let mut session = Session::new(true);
+        session.current = 4;
+        session.open = true;
+        session.abandon_presentation();
+        assert_eq!(session.token(), std::ptr::null_mut());
+        assert!(!session.is_open());
+        assert_eq!(session.index, 1);
+        session.pending = 5;
+        session.abandon_presentation();
+        assert_eq!(session.pending, 0);
+        assert_eq!(session.index, 2);
     }
 }
