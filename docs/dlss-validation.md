@@ -8,8 +8,10 @@ acceptance. The complete integration is **not yet accepted for release**.
 The repeat full review of `8b33c7954` found F1–F5. F1's DX12 creation and
 lifetime fix passed fresh independent `fix_f1_review2` on `aad4e963f`.
 F2's gameplay/screen/loading gate passed fresh independent `fix_f2_review2` on
-`534b9ff4a`. F3 now preserves SDK report microseconds; fresh independent F3
-review is pending. F4–F5 and hardware acceptance remain open. Earlier per-part
+`534b9ff4a`. F3's report microseconds fix passed fresh independent
+`fix_f3_review` on `b15183c53`. F4's entity motion registration and GPU
+regressions are implemented; fresh independent F4 review is pending. F5 and
+hardware acceptance remain open. Earlier per-part
 PASS results do not close the repeat review.
 
 ## Implementation and independent review
@@ -112,11 +114,59 @@ clear latency when reports or low latency become unavailable.
 F3 checks passed: `cargo test --locked -p horizon-streamline --lib --
 --test-threads=1` (**25 passed, 7 ignored**), `cargo clippy --locked -p
 horizon-streamline --lib --tests -- -D warnings`, workspace formatting,
-public-tree and diff checks. Fresh independent F3 review is pending. No game,
+public-tree and diff checks. Fresh independent `fix_f3_review` accepted
+`b15183c53` (PASS). No game,
 SDK or GPU test was started for this units fix; full pr_ready, Linux/macOS and
 physical latency were not rerun. The historical 9.4 ms overlay in the earlier
 windowed attempt used the incorrect conversion and cannot establish corrected
 latency. It has not been retrospectively rescaled or used as acceptance proof.
+
+F4's production change `934ebb35b` replaces the item/mob boolean namespace
+with typed renderer/entity/block keys. Known entity UUIDs distinguish reused
+network IDs; locally allocated IDs are monotonic within a level. Per-object
+ranges are registered after existing culling and before material sorting.
+The renderer still reads the original `Frame.entities` offsets. Dragon geometry
+now appends directly to that buffer, so its spans use final offsets too.
+
+Registration covers boats/carts, local third-person and LAN guest players
+(remote players already use the mob path), falling blocks, TNT, armor stands,
+projectiles/tridents/rockets/potions/fangs, block/item displays, crystals/eyes,
+dragons/fireballs, leashes/hooks, frame bodies/items/maps, paintings/cushions
+and the elder apparition. Animated block entity meshes (including chest lids,
+shulkers and banners), moving pistons, spawner previews, vault displays,
+brushable items and ominous spawners also receive separate stable ranges.
+Static campfire/shelf items, transient block replacements and leash knots do
+not animate their geometry; their existing camera motion remains sufficient.
+
+Two new CPU tests cover renderer namespace isolation, UUID replacement between
+adjacent frames, changed vertex counts and disappearance/reappearance. Existing
+UV/layer compatibility, animated geometry, reordering, reset and distant-camera
+precision checks remain. New/hidden/replaced/incompatible geometry uses camera
+motion until compatible rendered history exists.
+
+```powershell
+cargo test --locked -p horizon-client-render --lib gfx::motion -- --test-threads=1
+cargo test --locked -p horizon-client-render --lib object_motion_ -- --ignored --test-threads=1 --nocapture
+cargo test --locked -p horizon-client-render --lib temporal_inputs_ -- --ignored --test-threads=1 --nocapture
+cargo clippy --locked -p horizon-client-render -p horizon-client --lib --bins --tests -- -D warnings
+```
+
+Results: **7 motion/history tests**, **2 object-motion GPU readbacks** and
+**2 existing temporal-input readbacks** passed. Both GPU regressions ran on the
+RTX 5090, Vulkan 621.01 and DX12 32.0.16.2101. The new readback submits
+representative opaque boat/player panels through the exact `Span::entity`
+registration used by `Game::mark_motion`, then production `Motion::render`.
+With a fixed camera, second-frame object pixels contain the expected normalized
+X motion **−0.0625**; background, depth-occluded cart, vertex/texture alpha
+cutouts and culled backfaces stay zero. The initial reset frame stays zero.
+Targeted client check, Clippy, formatting, public-tree and diff checks passed.
+
+This is entity-renderer coverage, not a claim of complete motion for every
+pixel: particles, name tags/text and transparent effects retain their existing
+behavior. No particle identity/lifecycle system was added. Texture/material or
+topology changes can deliberately select camera fallback. No game, real FG,
+visual-quality, full pr_ready, parity oracle or Linux/macOS run was performed
+for F4. Fresh independent F4 review and hardware acceptance remain open.
 
 F1's explicit regression command is:
 

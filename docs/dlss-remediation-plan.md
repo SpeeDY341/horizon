@@ -9,8 +9,9 @@ review после исправлений, включая review_g2 и review_h3 
 Повторный полный review `8b33c7954` открыл F1–F5. Исправление F1 принято
 `fix_f1_review2` на `aad4e963f`: **PASS**. F2 с семантическим разрешением FG
 по gameplay/screen/loading state принят `fix_f2_review2` на `534b9ff4a`:
-**PASS**. F3 сохраняет timestamps SDK в микросекундах; свежий независимый
-review F3 ещё требуется. F4–F5 и аппаратная приёмка открыты.
+**PASS**. F3 принят `fix_f3_review` на `b15183c53`: **PASS**. Для F4
+реализованы регистрация движущихся сущностей и GPU-регрессии; свежий независимый
+review F4 требуется. F5 и аппаратная приёмка открыты.
 Прежние PASS не означают полной приёмки интеграции; активная FG 2× остаётся
 недоказанной.
 
@@ -460,7 +461,7 @@ swapchain получает hook; стресс-проверка не зависа
   Linux/macOS и focused FG/визуальная приёмка не выполнялись. Свежий независимый
   `fix_f2_review2` принял follow-up `534b9ff4a`: **PASS**; F3–F5 этим не закрыты.
 
-### Повторное исправление F3 (1 ноября 2026, fresh review pending)
+### Повторное исправление F3 (1 ноября 2026, fix_f3_review PASS)
 
 - `Session::read_reports` сохраняет `end - start` непосредственно как
   `latency_us`; QueryPerformanceFrequency и поле qpf удалены. Новейший валидный
@@ -481,7 +482,8 @@ swapchain получает hook; стресс-проверка не зависа
   lib/tests Clippy с `-D warnings`, workspace fmt, public-tree и diff checks
   прошли. Игра/SDK/GPU для F3 не запускались; full pr_ready, Linux/macOS,
   физическая latency и активная FG не проверялись. Свежий независимый review
-  F3 ещё требуется; F4/F5 и полная аппаратная приёмка открыты.
+  `fix_f3_review` принял `b15183c53`: **PASS**. F4/F5 и полная аппаратная
+  приёмка открыты.
 
 ### Результат кода E (31 октября 2026)
 
@@ -591,6 +593,38 @@ swapchain получает hook; стресс-проверка не зависа
   Linux/macOS остаются открытыми. Независимый review_f дал PASS коду F на
   `e5a51229a5ec6c5f7682bdb6da29c968356fe34e`. На этапе F флаг G не включался;
   полный pr_ready/parity не запускались. SDK и игровые файлы не добавлялись.
+
+### Повторное исправление F4 (1 ноября 2026, fresh review pending)
+
+- Production commit `934ebb35b`: отдельные typed keys для каждого renderer,
+  entity ID/UUID и позиции block entity. Известный UUID не даёт новой сетевой
+  сущности заимствовать history прежнего владельца того же ID; локальные ID
+  монотонны в пределах уровня. Ranges остаются в исходном `Frame.entities`,
+  после существующего culling и до material sorting. Геометрия дракона теперь
+  добавляется прямо туда, без временного нулевого offset.
+- Добавлены boat/cart, локальный third-person player и LAN guests; remote
+  players уже идут через mob path. Добавлены falling blocks/TNT/armor stands,
+  projectiles/tridents/rockets/potions/fangs/displays/crystals/eyes/dragon,
+  leashes/hooks, frames/items/maps, paintings/cushions и elder apparition.
+- Анимируемые block entities (включая крышки сундуков, shulker и banners),
+  moving pistons, spawner previews, vault/brushable display и ominous spawner
+  получают отдельные ranges. Campfire/shelf items, transient replacements и
+  knots имеют статичную геометрию; им достаточно camera motion.
+- Существующие правила совместимости topology/UV/layer, reset, culling и
+  material sorting сохранены. Новые, исчезнувшие/вернувшиеся, заменённые UUID
+  и несовместимые meshes используют camera fallback до следующего совместимого
+  кадра. Два новых CPU-теста покрывают namespaces/UUID reuse и topology/vanish.
+- Пройдены 7 motion/history tests, 2 object-motion GPU readbacks и 2 прежних
+  temporal-input readbacks на RTX 5090, Vulkan/DX12. Репрезентативные opaque
+  boat/player panels проходят production `Span::entity` и `Motion::render`:
+  fixed camera, object X = −0.0625, background/depth-hidden/alpha/backface = 0.
+  Первый reset frame = 0. Targeted client check и client/render lib/bins/tests
+  Clippy с `-D warnings`, fmt/public-tree/diff checks прошли.
+- Это scope сущностей, а не полное движение каждого pixel: particles,
+  nametags/text и transparent effects сохраняют прежние ограничения; новая
+  particle lifecycle-система не добавлялась. Игра/настоящая FG, визуальная
+  приёмка, full pr_ready, parity oracle и Linux/macOS не запускались. Свежий
+  независимый review F4 требуется; F5 и аппаратная приёмка остаются открыты.
 
 ## 7. Исправить контракт Streamline и доказать работу FG — R2
 

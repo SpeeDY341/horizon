@@ -40,6 +40,8 @@ mod entity_outline;
 mod motion;
 pub mod motion_history;
 #[cfg(test)]
+mod object_motion_tests;
+#[cfg(test)]
 mod temporal_input_tests;
 mod weather;
 use entity_batch::EntityBatch;
