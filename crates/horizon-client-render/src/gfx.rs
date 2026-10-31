@@ -678,6 +678,7 @@ pub struct Renderer {
     readback: readback::Readback,
     pub info: wgpu::AdapterInfo,
     pub suspended: bool,
+    surface_change_failed: bool,
     /// Consecutive frames whose surface acquisition failed validation. The
     /// first gets the swapchain a fresh configuration; later ones reattach
     /// the window, as a lost surface does.
@@ -1421,6 +1422,7 @@ impl Renderer {
             Some(renderer) => {
                 describe_adapter(&renderer.adapter);
                 check_layers(&renderer.adapter.limits(), layers)?;
+                frame_gen::prepare_presentation(&renderer.streamline, &renderer.device)?;
                 Opened {
                     streamline: renderer.streamline.clone(),
                     surface: if offscreen {
@@ -1490,6 +1492,8 @@ impl Renderer {
                     config.width, config.height, config.format, config.present_mode
                 ));
             }
+            // A fresh runtime has not bound FG yet. Reused runtimes were
+            // checked Off above, before taking or creating their surface.
             surface.configure(&device, &config);
             #[cfg(target_os = "windows")]
             note_dx12_swapchain(&streamline, surface);
@@ -3102,6 +3106,7 @@ impl Renderer {
             readback: readback::Readback::default(),
             info,
             suspended: !drawable_size(size.width, size.height, max_side),
+            surface_change_failed: false,
             acquire_validation_failures: 0,
             drawn_sections: 0,
             section_draws: 0,
@@ -3169,19 +3174,36 @@ impl Renderer {
             view_formats: &config.view_formats,
         })
     }
-    /// Hand the window surface over to the renderer that replaces this one on
-    /// the same device (it takes `spare_surface`).
-    pub fn release_surface(&mut self) {
+    /// Also used before asking the window system to change fullscreen state.
+    /// On failure drawing stops; no surface mutation is safe until a retry
+    /// succeeds. Zero-size resize takes this path too, without another frame.
+    pub fn prepare_surface_change(&mut self) -> Result<()> {
+        self.world_post.reset_history();
+        self.dlss.invalidate_history();
+        if let Some(motion) = &mut self.motion {
+            motion.reset();
+        }
+        let result = frame_gen::prepare_presentation(&self.streamline, &self.device);
+        self.surface_change_failed = result.is_err();
+        result.map_err(Into::into)
+    }
+
+    /// Hand the window surface to the renderer replacing this one on the same
+    /// device. A failed Off leaves ownership and all GPU resources here.
+    pub fn release_surface(&mut self) -> Result<()> {
+        self.prepare_surface_change()?;
         *self
             .spare_surface
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = self.surface.take();
+        Ok(())
     }
     /// Reattach a window after surface loss or a failed renderer replacement.
     pub fn recreate_surface(&mut self) -> Result<()> {
         if self.offscreen.is_some() {
             return Ok(());
         }
+        self.prepare_surface_change()?;
         // The surface set aside for a replacement that failed, else a new one
         // (Wayland allows only one tearing-control object per window surface,
         // so the old one goes first).
@@ -3254,13 +3276,15 @@ impl Renderer {
             Some(PresentMode::Immediate) => wgpu::PresentMode::Immediate,
             _ => wgpu::PresentMode::Fifo,
         };
-        if self.config.present_mode != mode
-            && let Some(surface) = &self.surface
-        {
+        if self.config.present_mode != mode && self.surface.is_some() {
+            if let Err(error) = self.prepare_surface_change() {
+                log::warn!("Present mode unchanged: {error}");
+                return;
+            }
             self.config.present_mode = mode;
             Self::configure(
                 &self.device,
-                surface,
+                self.surface.as_ref().unwrap(),
                 &self.surface_config(),
                 self.hdr.as_ref(),
             );
@@ -3269,6 +3293,10 @@ impl Renderer {
     /// Follows the window to `width` x `height`. A size the swapchain can't take
     /// ([`drawable_size`]) keeps the last one and draws nothing until the next.
     pub fn resize(&mut self, width: u32, height: u32) {
+        if let Err(error) = self.prepare_surface_change() {
+            log::warn!("Resize skipped: {error}");
+            return;
+        }
         let max = self.device.limits().max_texture_dimension_2d;
         self.suspended = !drawable_size(width, height, max);
         if self.suspended {
@@ -3723,7 +3751,8 @@ impl Renderer {
             horizon_hdr::set_metadata(device, surface, hdr.paper_white, hdr.peak, hdr.black);
         }
     }
-    fn configure_surface(&self) {
+    fn configure_surface(&mut self) -> Result<()> {
+        self.prepare_surface_change()?;
         if let Some(surface) = &self.surface {
             Self::configure(
                 &self.device,
@@ -3734,6 +3763,7 @@ impl Renderer {
             #[cfg(target_os = "windows")]
             note_dx12_swapchain(&self.streamline, surface);
         }
+        Ok(())
     }
     fn send_hdr_metadata(&self) {
         if let (Some(surface), Some(hdr)) = (&self.surface, &self.hdr) {
@@ -3778,6 +3808,10 @@ impl Renderer {
     ) {
         let output = self.hdr_output.filter(|_| on && self.surface.is_some());
         if output.is_some() != self.hdr.is_some() {
+            if let Err(error) = self.prepare_surface_change() {
+                log::warn!("HDR unchanged: {error}");
+                return;
+            }
             // If the game dies before HDR output shows a frame, the marker is still there at
             // the next start, which then comes up with HDR off.
             if output.is_some() {
@@ -3799,7 +3833,17 @@ impl Renderer {
             };
             let format = self.config.format.remove_srgb_suffix();
             self.hdr = output.map(|output| hdr::Hdr::new(&self.device, format, output));
-            self.configure_surface();
+            // Preparation above succeeded before changing HDR resources.
+            if let Some(surface) = &self.surface {
+                Self::configure(
+                    &self.device,
+                    surface,
+                    &self.surface_config(),
+                    self.hdr.as_ref(),
+                );
+                #[cfg(target_os = "windows")]
+                note_dx12_swapchain(&self.streamline, surface);
+            }
             match output {
                 Some(output) => log::info!(
                     "Horizon renderer: HDR on: {} ({:?}), {paper_white}/{peak} nits",
@@ -4490,7 +4534,7 @@ impl Renderer {
         if let Some(flat) = &mut self.flat {
             flat.trim(|page| self.arena.has_page(page));
         }
-        if self.suspended {
+        if self.suspended || self.surface_change_failed {
             return Ok(false);
         }
         let started = Instant::now();
@@ -4510,14 +4554,7 @@ impl Renderer {
                 return Ok(false);
             }
             Some(wgpu::CurrentSurfaceTexture::Outdated) => {
-                if let Some(surface) = &self.surface {
-                    Self::configure(
-                        &self.device,
-                        surface,
-                        &self.surface_config(),
-                        self.hdr.as_ref(),
-                    );
-                }
+                self.configure_surface()?;
                 return Ok(false);
             }
             Some(wgpu::CurrentSurfaceTexture::Lost) => {
@@ -4532,14 +4569,7 @@ impl Renderer {
                 // window like a Lost one — a fullscreen loading screen then
                 // skips frames instead of failing every one of them.
                 if self.acquire_validation_failures == 0 {
-                    if let Some(surface) = &self.surface {
-                        Self::configure(
-                            &self.device,
-                            surface,
-                            &self.surface_config(),
-                            self.hdr.as_ref(),
-                        );
-                    }
+                    self.configure_surface()?;
                 } else {
                     self.recreate_surface()?;
                 }
@@ -6698,13 +6728,8 @@ impl Renderer {
                 let _ = std::fs::remove_file(marker);
                 log::info!("Horizon renderer: HDR output presented its first frame");
             }
-            if reconfigure && let Some(surface) = &self.surface {
-                Self::configure(
-                    &self.device,
-                    surface,
-                    &self.surface_config(),
-                    self.hdr.as_ref(),
-                );
+            if reconfigure {
+                self.configure_surface()?;
             }
         } else {
             // No swapchain paces offscreen frames: keep two on the GPU at most.

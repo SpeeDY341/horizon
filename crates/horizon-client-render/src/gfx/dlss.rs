@@ -132,6 +132,10 @@ pub(super) struct State {
     samples: u32,
 }
 impl State {
+    pub(super) fn invalidate_history(&mut self) {
+        self.reset = true;
+    }
+
     pub fn new(shared: Option<Shared>, requested: bool, info: &wgpu::AdapterInfo) -> Self {
         Self {
             requested: Dlss::Off,

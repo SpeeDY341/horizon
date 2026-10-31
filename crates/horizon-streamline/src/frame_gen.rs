@@ -142,6 +142,7 @@ pub(crate) struct Session {
     second_at: Instant,
     last_color: Option<[u32; 2]>,
     error: Option<String>,
+    needs_reset: bool,
 }
 
 impl Session {
@@ -162,6 +163,7 @@ impl Session {
             second_at: Instant::now(),
             last_color: None,
             error: None,
+            needs_reset: true,
         }
     }
 
@@ -188,6 +190,27 @@ impl Session {
     pub(crate) fn fail(&mut self, error: String) {
         self.loaded = false;
         self.error = Some(error);
+    }
+
+    /// Must succeed before touching a swapchain or releasing its inputs. Do
+    /// not use `loaded` here: a failed frame may still have left the SDK On.
+    pub(crate) fn suspend(&mut self) -> Result<(), String> {
+        self.needs_reset = true;
+        self.last_color = None;
+        self.actual = 0;
+        self.paused = self.wanted > 0;
+        if let Some(api) = &self.api {
+            // Sizes/formats are optional in the pinned v5 ABI. No frame token
+            // or live input texture is needed to turn generation off.
+            let options = GOptions::new(MODE_OFF, 1, [0; 2], [0; 2], 0, 0, 0);
+            let viewport = sl::Viewport::new();
+            // Safety: called on the present thread, with live v5 ABI values.
+            let code = unsafe { (api.options)(&viewport, &options) };
+            if code != 0 {
+                return Err(format!("Frame Generation suspend failed ({code})"));
+            }
+        }
+        Ok(())
     }
 
     /// Bind after the device exists. A missing plugin leaves the device usable.
@@ -260,6 +283,7 @@ impl Session {
             && input.depth.is_some()
             && input.motion.is_some()
             && input.constants.is_some()
+            && (!self.needs_reset || input.constants.as_ref().is_some_and(|c| c.reset))
             && !token.is_null();
         self.actual = if interpolate { generate } else { 0 };
         self.paused = self.wanted > 0 && !interpolate;
@@ -295,6 +319,9 @@ impl Session {
             }
         };
         self.apply(dx12, interpolate, generate, &input)?;
+        if interpolate {
+            self.needs_reset = false;
+        }
         Ok(tags)
     }
 
@@ -777,6 +804,66 @@ fn color_format(format: wgpu::TextureFormat, dx12: bool) -> u32 {
 mod tests {
     use super::*;
     use std::mem::{offset_of, size_of};
+
+    thread_local! {
+        static OPTIONS: std::cell::RefCell<(Vec<u32>, i32)> = const { std::cell::RefCell::new((Vec::new(), 0)) };
+    }
+
+    unsafe extern "C" fn options(_: *const sl::Viewport, options: *const GOptions) -> i32 {
+        // Safety: Session passes a live options value during this call.
+        let options = unsafe { &*options };
+        assert_eq!(options.queue_parallelism, 0);
+        OPTIONS.with_borrow_mut(|(calls, result)| {
+            calls.push(options.mode);
+            *result
+        })
+    }
+    unsafe extern "C" fn state(_: *const sl::Viewport, _: *mut GState, _: *const GOptions) -> i32 {
+        0
+    }
+    unsafe extern "C" fn tag(
+        _: *const c_void,
+        _: *const sl::Viewport,
+        _: *const sl::Tag,
+        _: u32,
+        _: *mut c_void,
+    ) -> i32 {
+        0
+    }
+    unsafe extern "C" fn constants(
+        _: *const sl::Constants,
+        _: *const c_void,
+        _: *const sl::Viewport,
+    ) -> i32 {
+        0
+    }
+
+    #[test]
+    fn suspend_calls_sdk_even_after_failure_and_never_clears_the_request() {
+        let mut session = Session::new(true, true);
+        session.api = Some(Api {
+            options,
+            state,
+            tag,
+            constants,
+        });
+        session.wanted = 3;
+        session.actual = 3;
+        session.last_color = Some([1920, 1080]);
+        session.needs_reset = false;
+        // Failure disables recording, but is not proof that the SDK is Off.
+        session.fail("frame failed".into());
+        OPTIONS.with_borrow_mut(|state| *state = (Vec::new(), 7));
+        assert!(session.suspend().is_err());
+        assert!(session.needs_reset);
+        assert_eq!(session.last_color, None);
+        assert_eq!(session.actual, 0);
+        assert_eq!(session.wanted, 3);
+        OPTIONS.with_borrow_mut(|(_, result)| *result = 0);
+        session.suspend().unwrap();
+        OPTIONS.with_borrow(|(calls, _)| assert_eq!(calls, &[MODE_OFF, MODE_OFF]));
+        assert!(session.paused);
+    }
 
     #[test]
     fn options_and_state_match_the_pinned_header() {

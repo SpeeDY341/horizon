@@ -322,24 +322,59 @@ impl FullscreenState {
         preferred: Option<VideoMode>,
         in_video_screen: bool,
     ) {
-        let request = self.request(wanted);
-        let reapply = self.set_exclusive(exclusive);
-        self.set_preferred_mode(preferred);
-        let mode_change = !in_video_screen && self.take_mode_change();
-        match request {
+        self.apply_with(
+            window,
+            wanted,
+            exclusive,
+            preferred,
+            in_video_screen,
+            || true,
+        );
+    }
+
+    /// Prepare the renderer before an actual window mutation. If preparation
+    /// fails, keep the request pending so applying settings can retry safely.
+    pub fn apply_with(
+        &mut self,
+        window: &winit::window::Window,
+        wanted: bool,
+        exclusive: bool,
+        preferred: Option<VideoMode>,
+        in_video_screen: bool,
+        prepare: impl FnOnce() -> bool,
+    ) {
+        match self.prepare_request(wanted, exclusive, preferred, in_video_screen, prepare) {
             Some(false) => window.set_fullscreen(None),
             Some(true) => window.set_fullscreen(Some(fullscreen_request(
                 window,
                 exclusive,
                 preferred.as_ref(),
             ))),
-            None if reapply || mode_change => window.set_fullscreen(Some(fullscreen_request(
-                window,
-                exclusive,
-                preferred.as_ref(),
-            ))),
             None => {}
         }
+    }
+
+    fn prepare_request(
+        &mut self,
+        wanted: bool,
+        exclusive: bool,
+        preferred: Option<VideoMode>,
+        in_video_screen: bool,
+        prepare: impl FnOnce() -> bool,
+    ) -> Option<bool> {
+        let previous = *self;
+        let request = self.request(wanted);
+        let reapply = self.set_exclusive(exclusive);
+        self.set_preferred_mode(preferred);
+        let mode_change = !in_video_screen && self.take_mode_change();
+        if request.is_none() && !reapply && !mode_change {
+            return None;
+        }
+        if !prepare() {
+            *self = previous;
+            return None;
+        }
+        Some(request.unwrap_or(true))
     }
 
     /// `Window.setExclusiveFullscreen`: true when the option changed while fullscreen is
@@ -533,6 +568,32 @@ pub fn icon() -> Option<winit::window::Icon> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn fullscreen_preparation_failure_leaves_the_window_and_request_untouched() {
+        let mut fullscreen = super::FullscreenState::new(false);
+        let previous = fullscreen;
+        let mut calls = Vec::new();
+        let change = fullscreen.prepare_request(true, false, None, false, || {
+            calls.push("Off failed");
+            false
+        });
+        if change.is_some() {
+            calls.push("window mutation");
+        }
+        assert_eq!(fullscreen, previous);
+        assert_eq!(calls, ["Off failed"]);
+        let change = fullscreen.prepare_request(true, false, None, false, || {
+            calls.push("Off succeeded");
+            true
+        });
+        assert_eq!(change, Some(true));
+        calls.push("window mutation");
+        assert_eq!(calls, ["Off failed", "Off succeeded", "window mutation"]);
+        assert_eq!(
+            fullscreen.prepare_request(true, false, None, false, || panic!("no change")),
+            None
+        );
+    }
     #[test]
     fn video_mode_round_trips_the_options_json() {
         let mode = VideoMode {

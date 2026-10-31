@@ -326,12 +326,22 @@ impl Loading {
                 .fullscreen_resolution
                 .as_deref()
                 .and_then(horizon_client::window::VideoMode::read);
-            self.fullscreen.apply(
+            self.fullscreen.apply_with(
                 &window,
                 self.settings.fullscreen,
                 self.settings.file.bool("exclusiveFullscreen"),
                 preferred,
                 false,
+                || {
+                    self.renderer.as_mut().is_none_or(|renderer| {
+                        renderer
+                            .prepare_surface_change()
+                            .inspect_err(|e| {
+                                log::warn!("Fullscreen unchanged: {e}");
+                            })
+                            .is_ok()
+                    })
+                },
             );
             self.settings.video_modes = modes;
         }

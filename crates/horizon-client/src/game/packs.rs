@@ -258,7 +258,7 @@ impl Game<'_> {
         } = staged;
         // Keep the working GPU resources, and hand its window surface over.
         if let Some(renderer) = &mut self.renderer {
-            renderer.release_surface();
+            renderer.release_surface()?;
         }
         let renderer = match self
             .window

@@ -285,6 +285,12 @@ impl Post {
     pub fn invalidate_history(&mut self) {
         self.taa_this_frame.jitter[2] = 1.0;
     }
+    /// A lifecycle reset must survive the next call to jitter, even if the
+    /// surface keeps its dimensions (fullscreen, HDR or present-mode change).
+    pub fn reset_history(&mut self) {
+        self.taa_previous = None;
+        self.invalidate_history();
+    }
     pub fn reprojection(&self) -> Mat4 {
         Mat4::from_cols_array_2d(&self.taa_this_frame.reproject)
     }

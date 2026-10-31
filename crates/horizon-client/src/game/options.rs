@@ -362,7 +362,16 @@ impl Game<'_> {
                 .as_deref()
                 .and_then(horizon_client::window::VideoMode::read);
             self.fullscreen
-                .apply(&w, wanted, exclusive, preferred, in_video_screen);
+                .apply_with(&w, wanted, exclusive, preferred, in_video_screen, || {
+                    self.renderer.as_mut().is_none_or(|renderer| {
+                        renderer
+                            .prepare_surface_change()
+                            .inspect_err(|e| {
+                                log::warn!("Fullscreen unchanged: {e}");
+                            })
+                            .is_ok()
+                    })
+                });
             self.settings.video_modes = modes;
         }
     }

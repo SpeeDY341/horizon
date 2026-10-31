@@ -470,6 +470,12 @@ impl Runtime {
         self.framegen.set_wanted(generated);
     }
 
+    /// Checked Off before a surface/configuration/window mutation. The caller
+    /// must then drain the presenting queue before changing GPU resources.
+    pub fn suspend_framegen(&mut self) -> Result<(), String> {
+        self.framegen.suspend()
+    }
+
     /// Tag depth and motion, then set this present's options. The token is the
     /// Reflex frame already open on this thread. Barriers stay on `encoder`.
     /// The returned buffer, when present, is only the raw tag copy: submit it

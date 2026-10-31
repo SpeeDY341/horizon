@@ -1,7 +1,8 @@
 # План переделки DLSS, Reflex и Frame Generation
 
 Дата: 31 октября 2026 года. Статус: **часть A прошла review; код части B реализован
-и проверен на Windows, проверки Linux/macOS открыты; части C–I ещё не начаты**.
+и проверен на Windows, проверки Linux/macOS открыты; код части C реализован,
+независимый review и аппаратная проверка открыты; части D–I ещё не начаты**.
 
 Основание: review 30 коммитов `763528025..35123b73f` личного форка
 `SpeeDY341/horizon`, ветка `codex/dlss-stages-0-2`.
@@ -149,17 +150,19 @@ target или доступа к нужной ОС фиксируется как 
   не заменяют эти сборки, поэтому общий критерий готовности части B и пункт
   проверки всех трёх ОС остаются открытыми. Игра, launcher и SDK GPU-тесты
   не запускались; полный pr_ready не запускался. `Cargo.lock` не изменился.
+  Независимый агент `review_b` проверил commit
+  `d1b3a048d71edd404fd50eb131b07dcf76b6078d` и дал **PASS** в этом чате.
 
 ## 5. Переделать жизненный цикл swapchain — R3, R6
 
 **Файлы:** `gfx.rs`, `horizon-streamline/src/{runtime,frame_gen}.rs`,
 при необходимости существующие точки расширения `third_party/wgpu-hal`.
 
-- [ ] Найти все пути создания, configure, resize, замены и уничтожения surface,
+- [x] Найти все пути создания, configure, resize, замены и явного release surface,
   включая present mode, HDR, fullscreen, resource reload и surface loss.
-- [ ] Ввести общий путь подготовки к изменению swapchain: отправить FG Off
+- [x] Ввести общий путь подготовки к изменению swapchain: отправить FG Off
   **до** операции, проверить результат и выполнить требуемую синхронизацию.
-- [ ] Не продолжать потенциально опасную реконфигурацию после ошибки отключения
+- [x] Не продолжать потенциально опасную реконфигурацию после ошибки отключения
   FG без определённого безопасного пути восстановления.
 - [ ] После создания нового DX12 swapchain устанавливать Streamline proxy до
   первого Present; учитывать замену native pointer и владение COM-ссылками.
@@ -176,6 +179,43 @@ target или доступа к нужной ОС фиксируется как 
 
 **Готово, когда:** FG Off всегда предшествует реконфигурации; новый DX12
 swapchain получает hook; стресс-проверка не зависает и не требует перезапуска.
+
+### Результат кода части C (31 октября 2026)
+
+- База: `d1b3a048d71edd404fd50eb131b07dcf76b6078d`. Прочитаны MIT license,
+  `sl_dlss_g.h` и ProgrammingGuideDLSS_G, раздел 12.0, SDK 2.14.16 на commit
+  `625db07d4bca5abc67d781c42af7e7fb0761f1b6`. Off не требует frame token;
+  размеры/форматы в options optional. Используется default
+  `eBlockPresentingClientQueue`; после успешного Off ожидается presenting queue
+  через device.poll с таймаутом 5 секунд. Проверки подписей не менялись.
+- Общая подготовка вызывается перед resize (в том числе 0×0), present mode,
+  HDR, recreate, acquire retries, reconfigure после suboptimal Present,
+  fullscreen в игре/title и явной передачей surface при resource reload.
+  Renderer::new с прежним renderer проверяет Off до получения spare surface;
+  у первого нового runtime FG ещё не bound и не мог быть включён.
+- Ошибка Off/queue wait останавливает mutation; текущий renderer прекращает
+  рисование. release_surface возвращает ошибку без передачи владения, reload
+  её распространяет. Fullscreen сохраняет запрос для повторной попытки.
+- Сбрасываются SR/TAA/motion history и состояние FG. Режим пользователя
+  сохраняется; Session не включает FG до кадра с reset и существующими
+  depth/motion/constants/token. Нулевой размер отключает SDK немедленно,
+  не ожидая record следующего кадра. Старый delayed size-check оставлен
+  дополнительной защитой, а не механизмом lifecycle.
+- Регрессии: native mock slDLSSGSetOptions проверяет Off даже после failure
+  session, результат ошибки, повтор и сохранение wanted; injectable SDK/queue
+  boundary проверяет Off → wait → mutation и short circuit обеих ошибок.
+  Fullscreen-тест проверяет отказ без window mutation, успешный повтор и
+  no-op без обращения к SDK. Это unit-проверки, не настоящие Present/resize.
+- На Windows прошли targeted client check, Clippy lib/bins/tests четырёх
+  затронутых crates с `-D warnings`, Streamline unit tests (8 passed,
+  3 SDK ignored), renderer lifecycle (2 passed), renderer DLSS (3 passed),
+  input window tests (12 passed). Cargo предупреждает о fallback incremental
+  hard links на копирование. Полный pr_ready не запускался.
+- Аппаратный прогон игры/launcher, FG stress resize/minimize/fullscreen,
+  Linux/macOS и независимый review C ещё не выполнены. R2/R4–R6 и часть D
+  остаются открытыми; установка proxy для новой surface здесь не добавлялась.
+  Shutdown/destructor не превращён в новый путь восстановления/утечек;
+  покрыты перечисленные явные операции lifecycle. `conversation.md` не тронут.
 
 ## 6. Объединить состояние кадра и сохранить входные данные — R4, R5
 
@@ -319,7 +359,8 @@ swapchain получает hook; стресс-проверка не зависа
 - [x] Часть A: изолированный запуск и атрибуция ABI.
 - [ ] Часть B: код платформенной зависимости и заглушек реализован; Windows
   проверен, подтверждение Linux/macOS-сборок ещё требуется.
-- [ ] Часть C: отключение FG до изменения swapchain и тест порядка вызовов.
+- [ ] Часть C: код отключения FG до изменения swapchain и regression tests
+  реализованы; независимый review и аппаратная проверка ещё открыты.
 - [ ] Часть D: восстановление DX12 proxy при замене surface.
 - [ ] Часть E: общий frame token/constants и отдельная валидность TAA history.
 - [ ] Часть F: сохранение depth/motion и GPU-регрессии.
