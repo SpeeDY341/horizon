@@ -4029,9 +4029,10 @@ impl Renderer {
         }
     }
 
-    /// Tag depth and motion on the command list that is about to be presented,
-    /// then set this present's options. A menu, HDR, a shader pack, the title
-    /// screen, a lost window or a resize stays a real frame.
+    /// Tag depth and motion, then set this present's options. Barriers stay on
+    /// `encoder`. The returned list is the raw tag copy and is submitted after
+    /// this frame. A menu, HDR, a shader pack, the title screen, a lost window
+    /// or a resize stays a real frame.
     fn record_framegen(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -4040,11 +4041,11 @@ impl Renderer {
         pose: Mat4,
         views: &ViewSet,
         presenting: bool,
-    ) {
+    ) -> Option<wgpu::CommandBuffer> {
         #[cfg(target_os = "windows")]
         {
             if !self.framegen_loaded {
-                return;
+                return None;
             }
             let depth = self.world_post.depth_inputs();
             let mut jitter = self
@@ -4087,10 +4088,10 @@ impl Renderer {
             let color = [self.config.width, self.config.height];
             let color_format = self.config.format;
             let Some(shared) = &self.streamline else {
-                return;
+                return None;
             };
             let Ok(mut runtime) = shared.lock() else {
-                return;
+                return None;
             };
             let input = horizon_streamline::Inputs {
                 depth: depth.as_ref().map(|(texture, view)| (texture, view)),
@@ -4101,16 +4102,19 @@ impl Renderer {
                 color_format,
                 allow,
             };
-            if let Err(error) = runtime.framegen_record(encoder, input) {
+            let recorded = runtime.framegen_record(encoder, input);
+            if let Err(error) = &recorded {
                 log::warn!("Frame Generation: {error}");
             }
             if let Some(error) = runtime.take_framegen_error() {
                 log::warn!("Frame Generation: {error}");
             }
+            recorded.ok().flatten()
         }
         #[cfg(not(target_os = "windows"))]
         {
             let _ = (encoder, frame, pack_reads_world, pose, views, presenting);
+            None
         }
     }
 
@@ -6621,7 +6625,7 @@ impl Renderer {
                 let size = [self.config.width, self.config.height];
                 Some(copy_frame(&self.device, &mut encoder, &texture, size))
             });
-        self.record_framegen(
+        let tags = self.record_framegen(
             &mut encoder,
             frame,
             pack_reads_world,
@@ -6637,7 +6641,15 @@ impl Renderer {
         }
         self.reflex_end_simulation();
         self.reflex_submit(true);
-        let submission = crate::spans::time("submit", || self.queue.submit([commands]));
+        // The tag copy is its own list. It runs after this frame's draws and
+        // before Present. wgpu rejects that copy on the list that already drew.
+        let submission = crate::spans::time("submit", || {
+            if let Some(tags) = tags {
+                self.queue.submit([commands, tags])
+            } else {
+                self.queue.submit([commands])
+            }
+        });
         self.reflex_submit(false);
         if let Some(cull) = &mut self.cull {
             cull.submitted();

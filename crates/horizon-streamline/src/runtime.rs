@@ -471,15 +471,20 @@ impl Runtime {
     }
 
     /// Tag depth and motion, then set this present's options. The token is the
-    /// Reflex frame already open on this thread.
+    /// Reflex frame already open on this thread. Barriers stay on `encoder`.
+    /// The returned buffer, when present, is only the raw tag copy: submit it
+    /// after `encoder` and before Present.
     pub fn framegen_record(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         input: crate::frame_gen::Inputs<'_>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<wgpu::CommandBuffer>, String> {
+        let Some(device) = self.device.clone() else {
+            return Err("Frame Generation has no graphics device".into());
+        };
         let dx12 = self.api == Api::Dx12;
         let token = self.frame_token();
-        self.framegen.record(dx12, token, encoder, input)
+        self.framegen.record(dx12, token, &device, encoder, input)
     }
 
     pub fn framegen_sample(&mut self) {

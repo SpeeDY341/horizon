@@ -4,9 +4,11 @@
 //! token is the one Reflex already opened for this present.
 //!
 //! The backbuffer is the one Present already shows. Depth and motion are
-//! copied on the command list that writes that backbuffer (`eOnlyValidNow`),
-//! because the hand pass clears the screen depth before Present. The HUD is
-//! still in that color, so generated frames smear it until a HUD-less tag exists.
+//! copied on a fresh command list submitted immediately after the list that
+//! wrote that backbuffer (`eOnlyValidNow`). wgpu panics if raw tags are
+//! recorded into a list that already drew. The hand pass clears the screen
+//! depth before Present. The HUD is still in that color, so generated frames
+//! smear it until a HUD-less tag exists.
 use crate::{
     abi::Base,
     dlss_abi::{self as sl, GetFunction},
@@ -209,15 +211,18 @@ impl Session {
 
     /// Constants, tags and options for the present that follows this submit.
     /// `token` is Reflex's frame token. A null token cannot mark the frame.
+    /// Barriers stay on `encoder`. The returned list, when present, holds only
+    /// the raw tag copy and must be submitted after `encoder` and before Present.
     pub(crate) fn record(
         &mut self,
         dx12: bool,
         token: *mut c_void,
+        device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         input: Inputs<'_>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<wgpu::CommandBuffer>, String> {
         if !self.loaded {
-            return Ok(());
+            return Ok(None);
         }
         let resized = self.last_color.is_some_and(|prev| prev != input.color);
         self.last_color = Some(input.color);
@@ -247,17 +252,27 @@ impl Session {
                 self.note(format!("Frame Generation constants failed ({code})"));
             }
         }
-        if interpolate {
-            if let Err(error) = self.tag(dx12, token, encoder, &input) {
-                self.actual = 0;
-                self.paused = true;
-                let _ = self.apply(dx12, false, 1, &input);
-                return Err(error);
-            }
-        } else if !token.is_null() {
-            self.tag_cleared(dx12, token, encoder)?;
+        if interpolate && let Err(error) = self.transition(encoder, &input) {
+            self.actual = 0;
+            self.paused = true;
+            let _ = self.apply(dx12, false, 1, &input);
+            return Err(error);
         }
-        self.apply(dx12, interpolate, generate, &input)
+        let tags = if token.is_null() {
+            None
+        } else {
+            match self.record_tags(dx12, token, device, interpolate, &input) {
+                Ok(buffer) => Some(buffer),
+                Err(error) => {
+                    self.actual = 0;
+                    self.paused = true;
+                    let _ = self.apply(dx12, false, 1, &input);
+                    return Err(error);
+                }
+            }
+        };
+        self.apply(dx12, interpolate, generate, &input)?;
+        Ok(tags)
     }
 
     /// `numFramesActuallyPresented` since the previous call, on this thread only.
@@ -358,15 +373,15 @@ impl Session {
         Ok(())
     }
 
-    fn tag(
+    /// Depth and motion must be in the resource state before the tag list runs.
+    /// This barrier stays on the drawn list. The tag list itself cannot take it:
+    /// wgpu rejects a barrier and a raw command on the same encoder.
+    fn transition(
         &mut self,
-        dx12: bool,
-        token: *mut c_void,
         encoder: &mut wgpu::CommandEncoder,
         input: &Inputs<'_>,
     ) -> Result<(), String> {
-        let (Some((depth, depth_view)), Some((motion, motion_view))) = (input.depth, input.motion)
-        else {
+        let (Some((depth, _)), Some((motion, _))) = (input.depth, input.motion) else {
             return Err("Frame Generation is missing depth or motion".into());
         };
         encoder.transition_resources(
@@ -379,6 +394,47 @@ impl Session {
                     state: wgpu::TextureUses::RESOURCE,
                 }),
         );
+        Ok(())
+    }
+
+    /// Tag on an encoder that has no wgpu commands yet. Submit that buffer
+    /// after the drawn frame and before Present.
+    fn record_tags(
+        &mut self,
+        dx12: bool,
+        token: *mut c_void,
+        device: &wgpu::Device,
+        interpolate: bool,
+        input: &Inputs<'_>,
+    ) -> Result<wgpu::CommandBuffer, String> {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Frame Generation"),
+        });
+        let tagged = if interpolate {
+            self.tag(dx12, token, &mut encoder, input)
+        } else {
+            self.tag_cleared(dx12, token, &mut encoder)
+        };
+        match tagged {
+            Ok(()) => Ok(encoder.finish()),
+            Err(error) => {
+                drop(encoder.finish());
+                Err(error)
+            }
+        }
+    }
+
+    fn tag(
+        &mut self,
+        dx12: bool,
+        token: *mut c_void,
+        encoder: &mut wgpu::CommandEncoder,
+        input: &Inputs<'_>,
+    ) -> Result<(), String> {
+        let (Some((depth, depth_view)), Some((motion, motion_view))) = (input.depth, input.motion)
+        else {
+            return Err("Frame Generation is missing depth or motion".into());
+        };
         if dx12 {
             self.tag_dx12(token, encoder, depth, motion, input.depth_size)
         } else {
