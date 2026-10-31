@@ -21,6 +21,9 @@ pub const KEPT: usize = 40;
 /// Server changes kept, the oldest dropped first.
 const CHANGES_KEPT: usize = 64;
 
+/// Block changes near the player kept until the client has seen them.
+const BLOCKS_KEPT: usize = 256;
+
 /// Something the server sent the player that changes how its client moves. The client applies it when
 /// it handles the packet, before its next tick.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -33,6 +36,10 @@ pub enum Change {
     /// ClientboundUpdateAttributesPacket or a mob effect for the player itself: the server's
     /// attributes and effects, as they are when the replay reaches it.
     State,
+    /// ClientboundPlayerAbilitiesPacket (a game mode, flight given or taken): the replay takes the
+    /// abilities from the server's copy every tick, so a tick played before the client had them may
+    /// be off.
+    Abilities,
 }
 
 /// One client tick.
@@ -65,12 +72,18 @@ pub struct Record {
     seen: Option<u64>,
     /// Client ticks ended since the record began.
     ended: u64,
-    /// Where an accepted teleport put the player, until the replay starts again from there.
-    restart: Option<[f64; 3]>,
+    /// Where an accepted teleport put the player, and whether it kept the player's motion, until the
+    /// replay starts again from there.
+    restart: Option<([f64; 3], bool)>,
     /// What the server changed, with the server tick that sent it, oldest first.
     changes: VecDeque<(u64, Change)>,
     /// Changes heard since the record began.
     changed: u64,
+    /// Blocks the server changed near the player, with the server tick that sent them, until a
+    /// client tick has seen them.
+    blocks: VecDeque<(u64, [i32; 3])>,
+    /// The server tick of the last block change dropped unseen ([`BLOCKS_KEPT`] of them came first).
+    blocks_dropped: Option<u64>,
 }
 
 impl Record {
@@ -102,6 +115,12 @@ impl Record {
         self.current.input = input;
         self.current.sprinting = sprinting;
         self.current.seen = self.seen;
+        if let Some(seen) = self.seen {
+            while self.blocks.front().is_some_and(|&(sent, _)| sent <= seen) {
+                self.blocks.pop_front();
+            }
+            self.blocks_dropped = self.blocks_dropped.filter(|&sent| sent > seen);
+        }
         let next = ClientTick {
             yaw: self.current.yaw,
             pitch: self.current.pitch,
@@ -156,7 +175,10 @@ impl Record {
     }
 
     /// The changes after the first `applied`, oldest first; None when some of them are no longer kept.
-    pub fn changes_since(&self, applied: u64) -> Option<impl Iterator<Item = &(u64, Change)>> {
+    pub fn changes_since(
+        &self,
+        applied: u64,
+    ) -> Option<impl Iterator<Item = &(u64, Change)> + Clone> {
         let new = self.changed.checked_sub(applied)?;
         let new = usize::try_from(new)
             .ok()
@@ -164,15 +186,31 @@ impl Record {
         Some(self.changes.iter().skip(self.changes.len() - new))
     }
 
-    /// The client accepted a teleport to `at` (ServerboundAcceptTeleportationPacket): it goes on from
-    /// there, standing still, and the ticks before say nothing about the ones after.
-    pub fn teleported(&mut self, at: [f64; 3]) {
-        self.clear();
-        self.restart = Some(at);
+    /// The server sent the client the block at `pos` during server tick `server_tick` (before that
+    /// tick's ping).
+    pub fn block_changed(&mut self, server_tick: u64, pos: [i32; 3]) {
+        if self.blocks.len() == BLOCKS_KEPT {
+            self.blocks_dropped = self.blocks.pop_front().map(|(sent, _)| sent);
+        }
+        self.blocks.push_back((server_tick, pos));
     }
 
-    /// Where the last accepted teleport put the player, once.
-    pub fn take_restart(&mut self) -> Option<[f64; 3]> {
+    /// Whether the client may not have seen a block change for which `near` holds when its last tick
+    /// ended: the client still had the old block where the server has the new one.
+    pub fn unseen_block(&self, near: impl Fn([i32; 3]) -> bool) -> bool {
+        self.blocks_dropped.is_some() || self.blocks.iter().any(|&(_, pos)| near(pos))
+    }
+
+    /// The client accepted a teleport to `at` (ServerboundAcceptTeleportationPacket): it goes on from
+    /// there, standing still unless the teleport `kept_motion` (an End gateway's), and the ticks before
+    /// say nothing about the ones after.
+    pub fn teleported(&mut self, at: [f64; 3], kept_motion: bool) {
+        self.clear();
+        self.restart = Some((at, kept_motion));
+    }
+
+    /// Where the last accepted teleport put the player, and whether it kept its motion, once.
+    pub fn take_restart(&mut self) -> Option<([f64; 3], bool)> {
         self.restart.take()
     }
 
@@ -190,6 +228,28 @@ impl Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_block_change_is_unseen_until_a_tick_ends_after_its_pong() {
+        let mut r = Record::default();
+        r.block_changed(4, [1, 2, 3]);
+        r.block_changed(5, [7, 2, 3]);
+        let near = |p: [i32; 3]| p[0] < 5;
+        assert!(r.unseen_block(near));
+        // The pong alone: the tick that ended before it hadn't seen the change.
+        assert!(r.pong(4, 5));
+        assert!(r.unseen_block(near));
+        r.tick_end(0, false);
+        assert!(!r.unseen_block(near));
+        assert!(r.unseen_block(|_| true));
+        for i in 0..=BLOCKS_KEPT as u64 {
+            r.block_changed(6 + i, [100, 0, 0]);
+        }
+        assert!(r.unseen_block(near), "a change dropped unseen counts");
+        assert!(r.pong(6 + BLOCKS_KEPT as u64, 6 + BLOCKS_KEPT as u64));
+        r.tick_end(0, false);
+        assert!(!r.unseen_block(|_| true));
+    }
 
     #[test]
     fn a_tick_is_the_packets_between_two_tick_ends() {
@@ -253,8 +313,8 @@ mod tests {
         r.clear();
         assert_eq!(x(&r, 2), None);
         assert_eq!(x(&r, 3), Some(vec![]));
-        r.teleported([5.0, 6.0, 7.0]);
-        assert_eq!(r.take_restart(), Some([5.0, 6.0, 7.0]));
+        r.teleported([5.0, 6.0, 7.0], false);
+        assert_eq!(r.take_restart(), Some(([5.0, 6.0, 7.0], false)));
         assert_eq!(r.take_restart(), None);
     }
 

@@ -1101,6 +1101,8 @@ impl Hub {
         g.teleport_counter = (g.teleport_counter + 1) & 0x7FFF_FFFF;
         let id = g.teleport_counter;
         g.awaiting_teleport = Some((id, g.position));
+        use play::relative::{DELTA_X, DELTA_Y, DELTA_Z};
+        g.awaiting_keeps_motion = relatives & (DELTA_X | DELTA_Y | DELTA_Z) != 0;
         let turn = relatives & (play::relative::Y_ROT | play::relative::X_ROT) != 0;
         g.send(&C::PlayerPosition(play::PlayerPosition {
             teleport: id,
@@ -1731,6 +1733,8 @@ impl Hub {
         let mut changes = std::mem::take(log);
         changes.sort_unstable();
         changes.dedup();
+        // The prediction's replay excuses a client that hadn't seen a change near it.
+        let recording = self.recording();
         // Group by section.
         let mut sections: std::collections::BTreeMap<(i32, i32, i32), Vec<(i32, i32, i32)>> =
             Default::default();
@@ -1773,6 +1777,19 @@ impl Hub {
             let body = packet.encode();
             for &i in &viewers {
                 self.guests[i].sender.send(body.clone());
+            }
+            if recording {
+                for &i in &viewers {
+                    let g = &mut self.guests[i];
+                    let Some(record) = g.anticheat.record.as_deref_mut() else {
+                        continue;
+                    };
+                    for &(x, y, z) in &positions {
+                        if super::prediction::near(g.position, [x, y, z]) {
+                            record.block_changed(self.ticks, [x, y, z]);
+                        }
+                    }
+                }
             }
             // Block entities with data the client shows.
             for &(x, y, z) in &positions {
@@ -2446,7 +2463,11 @@ impl Hub {
                         g.awaiting_teleport = None;
                         // The prediction's replay starts again where the client now is.
                         if recording {
-                            g.anticheat.record.get_or_insert_default().teleported(at);
+                            let kept = g.awaiting_keeps_motion;
+                            g.anticheat
+                                .record
+                                .get_or_insert_default()
+                                .teleported(at, kept);
                         }
                         let rot = (p.yaw, p.pitch);
                         self.position_change(i, [p.x, p.y, p.z], rot, 0, ctx, events);
