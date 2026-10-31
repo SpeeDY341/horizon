@@ -217,6 +217,32 @@ swapchain получает hook; стресс-проверка не зависа
   Shutdown/destructor не превращён в новый путь восстановления/утечек;
   покрыты перечисленные явные операции lifecycle. `conversation.md` не тронут.
 
+### Исправление по review части C
+
+- Независимый `review_c` дал **FAIL** для
+  `9628c314ee9b4e41859f666be21986362e7b016e`: reset первого кадра после
+  suspend мог пройти под меню с FG allow=false. Следующие кадры теряли reset,
+  а gate Session ожидал его бесконечно и не возобновлял FG после закрытия меню.
+- Renderer теперь читает pending reset Session перед jitter и формированием
+  SR/FG constants. На первом подходящем кадре сбрасываются camera/motion
+  history; paused-кадры не потребляют pending и не заставляют TAA постоянно
+  сбрасываться. SR и FG получают reset из раннего состояния кадра; позднее
+  изменение констант только внутри FG не добавлялось. Объединение immutable
+  common constants и существующая проблема R4 остаются задачей E.
+- Pending снимается только после успешного SDK On. Ошибка options сохраняет
+  его для повтора; отключённая после failure session не сбрасывает историю
+  обычного рендера. Условия допустимости кадра вынесены в общий predicate
+  для ранней подготовки и позднего record.
+- Native mock регрессия проверяет suspend → три paused кадра с reset
+  true/false/false → ошибку On → успешный On с reset → обычный кадр без reset.
+  Headless wgpu-тест проверяет ту же последовательность temporal camera при
+  SR Off: первый разрешённый кадр получает новый reset, следующий — уже нет.
+  Это не тест настоящего FG Present: SDK boundary подменён.
+- Targeted проверки Windows: Streamline 9 passed/3 ignored; renderer lifecycle
+  3 passed (включая headless wgpu); Clippy renderer/Streamline/client
+  lib/bins/tests с `-D warnings` успешно. Повторный независимый review fix
+  ещё требуется; аппаратный FG stress и Linux/macOS не выполнялись.
+
 ## 6. Объединить состояние кадра и сохранить входные данные — R4, R5
 
 **Файлы:** `gfx.rs`, `gfx/{dlss,motion,world_post}.rs`,

@@ -175,6 +175,14 @@ impl Session {
         self.loaded
     }
 
+    pub(crate) fn reset_pending(&self) -> bool {
+        self.needs_reset
+    }
+
+    fn frame_ready(&self, allow: bool, inputs_ready: bool, reset: bool) -> bool {
+        allow && inputs_ready && self.wanted > 0 && (!self.needs_reset || reset)
+    }
+
     pub(crate) fn set_wanted(&mut self, generated: u32) {
         self.wanted = generated;
         if generated == 0 {
@@ -277,14 +285,16 @@ impl Session {
         } else {
             self.wanted.min(self.max_generated.max(1))
         };
-        let interpolate = input.allow
-            && !resized
-            && self.wanted > 0
+        let inputs_ready = !resized
             && input.depth.is_some()
             && input.motion.is_some()
             && input.constants.is_some()
-            && (!self.needs_reset || input.constants.as_ref().is_some_and(|c| c.reset))
             && !token.is_null();
+        let interpolate = self.frame_ready(
+            input.allow,
+            inputs_ready,
+            input.constants.as_ref().is_some_and(|c| c.reset),
+        );
         self.actual = if interpolate { generate } else { 0 };
         self.paused = self.wanted > 0 && !interpolate;
         if !token.is_null()
@@ -319,9 +329,6 @@ impl Session {
             }
         };
         self.apply(dx12, interpolate, generate, &input)?;
-        if interpolate {
-            self.needs_reset = false;
-        }
         Ok(tags)
     }
 
@@ -419,6 +426,9 @@ impl Session {
             self.actual = 0;
             self.paused = self.wanted > 0;
             return Err(format!("Frame Generation options failed ({code})"));
+        }
+        if on {
+            self.needs_reset = false;
         }
         Ok(())
     }
@@ -863,6 +873,57 @@ mod tests {
         session.suspend().unwrap();
         OPTIONS.with_borrow(|(calls, _)| assert_eq!(calls, &[MODE_OFF, MODE_OFF]));
         assert!(session.paused);
+    }
+
+    #[test]
+    fn pending_reset_survives_paused_frames_and_failed_resume() {
+        let mut session = Session::new(true, true);
+        session.api = Some(Api {
+            options,
+            state,
+            tag,
+            constants,
+        });
+        session.wanted = 1;
+        OPTIONS.with_borrow_mut(|state| *state = (Vec::new(), 0));
+        session.suspend().unwrap();
+        let input = Inputs {
+            depth: None,
+            motion: None,
+            constants: None,
+            color: [1280, 720],
+            depth_size: [1280, 720],
+            color_format: wgpu::TextureFormat::Rgba8Unorm,
+            allow: false,
+        };
+        for reset in [true, false, false] {
+            let on = session.frame_ready(false, true, reset);
+            assert!(!on);
+            session.apply(false, on, 1, &input).unwrap();
+            assert!(session.reset_pending());
+        }
+        assert!(!session.frame_ready(true, true, false));
+        // The renderer queries this before jitter/common constants, so the
+        // eligible frame gets reset even after menu frames consumed theirs.
+        let reset = session.reset_pending();
+        let on = session.frame_ready(true, true, reset);
+        assert!(on);
+        OPTIONS.with_borrow_mut(|(_, result)| *result = 7);
+        assert!(session.apply(false, on, 1, &input).is_err());
+        assert!(session.reset_pending());
+        OPTIONS.with_borrow_mut(|(_, result)| *result = 0);
+        session.apply(false, on, 1, &input).unwrap();
+        assert!(!session.reset_pending());
+        assert!(session.frame_ready(true, true, false));
+        session.apply(false, true, 1, &input).unwrap();
+        OPTIONS.with_borrow(|(calls, _)| {
+            assert_eq!(
+                calls,
+                &[
+                    MODE_OFF, MODE_OFF, MODE_OFF, MODE_OFF, MODE_ON, MODE_ON, MODE_ON
+                ]
+            )
+        });
     }
 
     #[test]

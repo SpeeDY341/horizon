@@ -476,6 +476,12 @@ impl Runtime {
         self.framegen.suspend()
     }
 
+    /// Pending until an eligible frame successfully enables generation. Read
+    /// this before building the frame's common camera constants, including SR.
+    pub fn framegen_reset_pending(&self) -> bool {
+        self.framegen.loaded() && self.framegen.reset_pending()
+    }
+
     /// Tag depth and motion, then set this present's options. The token is the
     /// Reflex frame already open on this thread. Barriers stay on `encoder`.
     /// The returned buffer, when present, is only the raw tag copy: submit it

@@ -6,6 +6,22 @@
 #[allow(dead_code)]
 mod optical_flow;
 
+/// Apply a pending lifecycle reset before either SR or FG builds constants.
+/// Paused frames must not consume it or continually reset ordinary TAA.
+pub(super) fn prepare_frame_history(
+    eligible: bool,
+    pending: bool,
+    post: &mut super::world_post::Post,
+    motion: Option<&mut super::motion::Motion>,
+) {
+    if eligible && pending {
+        post.reset_history();
+        if let Some(motion) = motion {
+            motion.reset();
+        }
+    }
+}
+
 pub(super) fn prepare_presentation(
     streamline: &Option<super::dlss::Shared>,
     device: &wgpu::Device,
@@ -51,6 +67,31 @@ pub(super) fn prepare_change(
 mod lifecycle_tests {
     use super::prepare_change;
     use std::cell::RefCell;
+
+    #[test]
+    fn first_eligible_frame_resets_history_after_multiple_menu_frames() {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle().with_env());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, _) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let mut post =
+            super::super::world_post::Post::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        post.track_camera = true;
+        // SR Off: menu frames still update the tracked temporal camera, just
+        // like the bug report. Their reset goes true, false, false.
+        for expected in [1.0, 0.0, 0.0] {
+            super::prepare_frame_history(false, true, &mut post, None);
+            post.jitter([1280, 720], false, glam::Mat4::IDENTITY, glam::DVec3::ZERO);
+            assert_eq!(post.temporal_jitter().unwrap()[2], expected);
+        }
+        super::prepare_frame_history(true, true, &mut post, None);
+        post.jitter([1280, 720], false, glam::Mat4::IDENTITY, glam::DVec3::ZERO);
+        assert_eq!(post.temporal_jitter().unwrap()[2], 1.0);
+        // A successful native On clears pending; ordinary frames resume.
+        super::prepare_frame_history(true, false, &mut post, None);
+        post.jitter([1280, 720], false, glam::Mat4::IDENTITY, glam::DVec3::ZERO);
+        assert_eq!(post.temporal_jitter().unwrap()[2], 0.0);
+    }
 
     #[test]
     fn checked_off_and_queue_drain_precede_mutation() {

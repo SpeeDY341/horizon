@@ -3892,6 +3892,31 @@ impl Renderer {
         self.framegen_loaded && self.framegen_mode != crate::graphics::FrameGen::Off
     }
 
+    fn framegen_frame_allowed(
+        &self,
+        frame: &Frame<'_>,
+        presenting: bool,
+        pack_reads_world: bool,
+    ) -> bool {
+        self.framegen_rendering()
+            && presenting
+            && !frame.title
+            && frame.menu_blur.is_none()
+            && self.hdr.is_none()
+            && !pack_reads_world
+            && self.window.has_focus()
+    }
+
+    fn framegen_reset_pending(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        if let Some(shared) = &self.streamline
+            && let Ok(runtime) = shared.lock()
+        {
+            return runtime.framegen_reset_pending();
+        }
+        false
+    }
+
     pub fn set_dlss(&mut self, mode: crate::graphics::Dlss) {
         self.dlss.set(mode);
     }
@@ -4120,13 +4145,7 @@ impl Renderer {
                 frame.camera,
                 jitter[2] != 0.0,
             );
-            let allow = self.framegen_rendering()
-                && presenting
-                && !frame.title
-                && frame.menu_blur.is_none()
-                && self.hdr.is_none()
-                && !pack_reads_world
-                && self.window.has_focus()
+            let allow = self.framegen_frame_allowed(frame, presenting, pack_reads_world)
                 && depth.is_some()
                 && motion.is_some();
             let color = [self.config.width, self.config.height];
@@ -4635,6 +4654,15 @@ impl Renderer {
         );
         self.world_post.set_internal_size(dlss_size);
         self.world_post.track_camera = self.framegen_rendering();
+        // Menu/loading frames may advance the temporal camera after a surface
+        // reset. Keep the request pending in the SDK session and apply it to
+        // the first eligible frame, before jitter and either SR/FG constants.
+        frame_gen::prepare_frame_history(
+            self.framegen_frame_allowed(frame, surface_frame.is_some(), !taa),
+            self.framegen_reset_pending(),
+            &mut self.world_post,
+            self.motion.as_mut(),
+        );
         if !taa
             && !self.framegen_rendering()
             && let Some(motion) = &mut self.motion
