@@ -1104,6 +1104,8 @@ impl Game<'_> {
         status["dlss"] = serde_json::to_value(horizon_client::graphics::dlss_details())
             .unwrap_or(serde_json::Value::Null);
         status["dlss_status"] = horizon_client::graphics::dlss_status().into();
+        status["framegen_status"] = horizon_client::graphics::framegen_overlay_line().into();
+        status["reflex_status"] = horizon_client::graphics::reflex_overlay_line().into();
         status["lod"] = lod;
         let (target, sampled) = self.lod.as_ref().map_or((0, 0), |lod| lod.progress());
         status["lod"]["target_tiles"] = target.into();

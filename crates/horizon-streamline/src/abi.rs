@@ -22,6 +22,11 @@
 // Rust layout translation of Streamline 2.14.16 public MIT headers.
 // Pinned source: NVIDIA-RTX/Streamline 625db07d4bca5abc67d781c42af7e7fb0761f1b6.
 use std::ffi::{c_char, c_void};
+
+// sl::PreferenceFlags from the pinned sl_core_types.h.
+pub const DISABLE_CL_STATE_TRACKING: u64 = 1 << 0;
+pub const USE_MANUAL_HOOKING: u64 = 1 << 2;
+pub const USE_FRAME_BASED_RESOURCE_TAGGING: u64 = 1 << 7;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Guid {

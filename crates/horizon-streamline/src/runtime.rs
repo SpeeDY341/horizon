@@ -192,15 +192,15 @@ impl Runtime {
             )
         };
         // sl::RenderAPI: eD3D11 = 0, eD3D12 = 1, eVulkan = 2.
-        // PreferenceFlags: eDisableCLStateTracking = 1, eUseManualHooking = 4.
-        let (render_api, flags) = match api {
-            Api::Vulkan => (2, 1),
-            Api::Dx12 => (1, 1 | 4),
+        let render_api = match api {
+            Api::Vulkan => 2,
+            Api::Dx12 => 1,
         };
         let wide: Vec<u16> = directory.as_os_str().encode_wide().chain(Some(0)).collect();
         let paths = [wide.as_ptr()];
         // Feature ids: DLSS 0, Reflex 3, PCL 4, Frame Generation 1000.
-        // Reflex's own latency DLL is unsigned and is never placed beside these.
+        // Vulkan Reflex also needs the official bin/x64/NvLowLatencyVk.dll.
+        // The SDK verifies this dependency; never bypass its signature checks.
         let mut features = Vec::new();
         if dlss {
             features.push(0u32);
@@ -237,7 +237,7 @@ impl Runtime {
             allocate: std::ptr::null(),
             release: std::ptr::null(),
             log: std::ptr::null(),
-            flags,
+            flags: preference_flags(api),
             features: features.as_ptr(),
             feature_count: features.len() as u32,
             app_id: 0,
@@ -356,6 +356,31 @@ impl Runtime {
 
     pub(crate) fn render_frame_active(&self) -> bool {
         self.frame.active
+    }
+
+    #[cfg(test)]
+    pub(crate) fn check_null_frame_tags(&self, token: *const std::ffi::c_void) {
+        type SetTag = unsafe extern "C" fn(
+            *const std::ffi::c_void,
+            *const crate::dlss_abi::Viewport,
+            *const crate::dlss_abi::Tag,
+            u32,
+            *mut std::ffi::c_void,
+        ) -> i32;
+        let tags = [crate::frame_gen::null_tag(0), crate::frame_gen::null_tag(1)];
+        // Null tags need no GPU copy/command list. This exercises the actual
+        // SDK flag check and the paused-frame contract alongside SR local tags.
+        let code = unsafe {
+            let set = self._library.get::<SetTag>(b"slSetTagForFrame\0").unwrap();
+            set(
+                token,
+                &crate::dlss_abi::Viewport::new(),
+                tags.as_ptr(),
+                2,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(code, 0, "SDK rejected null frame tags");
     }
 
     /// Errors invalidate generation for this frame; the next eligible frame
@@ -687,6 +712,36 @@ impl Runtime {
     /// Checks the actual adapter before device creation. A successful result
     /// still requires the device to be registered and DLSS to be set up.
     pub fn check_adapter(&self, adapter: &wgpu::Adapter) -> Result<(), String> {
+        self.check_feature_adapter(adapter, 0)
+    }
+
+    /// Confirm the requested presentation features on the actual registered
+    /// device. Loaded DLLs and resolved functions alone do not prove support.
+    /// A failure leaves normal rendering and independently supported SR usable.
+    pub fn check_present_features(&mut self, adapter: &wgpu::Adapter) {
+        if self.reflex.requested() {
+            let result = self
+                .check_feature_adapter(adapter, 3)
+                .and_then(|()| self.check_feature_adapter(adapter, 4));
+            if let Err(error) = result {
+                self.reflex.fail(error);
+            }
+        }
+        if self.framegen.requested() {
+            let result = self.check_feature_adapter(adapter, 1000).and_then(|()| {
+                if self.reflex.loaded() {
+                    Ok(())
+                } else {
+                    Err("Frame Generation requires available Reflex".into())
+                }
+            });
+            if let Err(error) = result {
+                self.framegen.fail(error);
+            }
+        }
+    }
+
+    fn check_feature_adapter(&self, adapter: &wgpu::Adapter, feature: u32) -> Result<(), String> {
         let info = adapter.get_info();
         let supported = matches!(info.backend, wgpu::Backend::Vulkan | wgpu::Backend::Dx12);
         if !crate::eligible(supported, info.vendor, &info.name) {
@@ -720,7 +775,7 @@ impl Runtime {
                 luid_size: 8,
                 physical_device: std::ptr::null_mut(),
             };
-            unsafe { (self.supported)(0, &adapter_info) }
+            unsafe { (self.supported)(feature, &adapter_info) }
         } else {
             use ash::vk::Handle;
             let native = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }
@@ -731,12 +786,14 @@ impl Runtime {
                 luid_size: 0,
                 physical_device: native.raw_physical_device().as_raw() as *mut std::ffi::c_void,
             };
-            unsafe { (self.supported)(0, &adapter_info) }
+            unsafe { (self.supported)(feature, &adapter_info) }
         };
         if result == 0 {
             Ok(())
         } else {
-            Err(format!("DLSS unsupported on this adapter ({result})"))
+            Err(format!(
+                "Streamline feature {feature} unsupported on this adapter ({result})"
+            ))
         }
     }
 
@@ -830,6 +887,16 @@ unsafe fn upgrade_dx12_interface(
     }
 }
 
+fn preference_flags(api: Api) -> u64 {
+    abi::DISABLE_CL_STATE_TRACKING
+        | abi::USE_FRAME_BASED_RESOURCE_TAGGING
+        | if api == Api::Dx12 {
+            abi::USE_MANUAL_HOOKING
+        } else {
+            0
+        }
+}
+
 fn valid_project_id(id: &str) -> bool {
     id.len() == 36
         && id.bytes().enumerate().all(|(i, c)| {
@@ -875,6 +942,12 @@ impl Drop for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preferences_enable_frame_tags_on_both_apis_without_ota_or_bypasses() {
+        assert_eq!(preference_flags(Api::Vulkan), 0x81);
+        assert_eq!(preference_flags(Api::Dx12), 0x85);
+    }
 
     fn constants(reset: bool) -> crate::FrameConstants {
         crate::FrameConstants {
@@ -1050,6 +1123,55 @@ mod tests {
         assert!(Runtime::load(&directory, "invalid").is_err());
         assert!(Runtime::load(&directory, "00a6bdb2-6386-4e37-8ff9-dcda4642628a").is_err());
         assert!(valid_project_id("00a6bdb2-6386-4e37-8ff9-dcda4642628a"));
+    }
+
+    fn present_feature_support(api: Api) {
+        let path = std::env::var_os("HORIZON_STREAMLINE_SDK").expect("SDK path");
+        let mut runtime = Runtime::load_with(
+            Path::new(&path),
+            "00a6bdb2-6386-4e37-8ff9-dcda4642628a",
+            api,
+            false,
+            true,
+            true,
+        )
+        .unwrap();
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = if api == Api::Dx12 {
+            wgpu::Backends::DX12
+        } else {
+            wgpu::Backends::VULKAN
+        };
+        let instance = runtime.create_instance(&desc).unwrap();
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, _) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        runtime.attach_device(&device).unwrap();
+        runtime.check_present_features(&adapter);
+        println!("{api:?}: {}", adapter.get_info().name);
+        assert!(runtime.reflex_loaded(), "{:?}", runtime.take_reflex_error());
+        assert!(
+            runtime.framegen_loaded(),
+            "{:?}",
+            runtime.take_framegen_error()
+        );
+        for mode in [1, 2, 0] {
+            runtime.set_reflex_mode(mode);
+            assert_eq!(runtime.take_reflex_error(), None);
+        }
+        runtime.suspend_framegen().unwrap();
+        drop(runtime);
+    }
+
+    #[test]
+    #[ignore = "requires the official SDK, Vulkan Reflex DLL, and RTX FG device"]
+    fn official_sdk_confirms_vulkan_present_features() {
+        present_feature_support(Api::Vulkan);
+    }
+
+    #[test]
+    #[ignore = "requires the official SDK and an RTX DirectX 12 FG device"]
+    fn official_sdk_confirms_dx12_present_features() {
+        present_feature_support(Api::Dx12);
     }
 
     #[test]

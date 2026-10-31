@@ -74,3 +74,5 @@ Copyright (c) 2022-2024 NVIDIA CORPORATION (core/DLSS), 2022-2023 (Reflex/DLSS-G
 and 2023 (PCL). All rights reserved.
 The original MIT notices are preserved at the top of each adapted file. No Nsight Perf or NGX source
 was read or copied, and no NVIDIA runtime binaries are included.
+The named preference flag values in `abi.rs` follow
+[`include/sl_core_types.h`](https://github.com/NVIDIA-RTX/Streamline/blob/625db07d4bca5abc67d781c42af7e7fb0761f1b6/include/sl_core_types.h).

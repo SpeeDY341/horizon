@@ -175,6 +175,7 @@ impl Session {
     }
 
     pub fn fail(&mut self, error: String) {
+        self.loaded = false;
         self.note_error(error);
     }
 
@@ -230,6 +231,10 @@ impl Session {
             }
         };
         self.api = Some(api);
+        self.query_state()?;
+        if self.state.0[32] == 0 {
+            return Err("Reflex low latency is unavailable on this device".into());
+        }
         self.loaded = true;
         self.send_options();
         Ok(())
@@ -426,8 +431,16 @@ impl Session {
     }
 
     fn read_latency(&mut self) {
-        let Some(api) = &self.api else {
+        if let Err(error) = self.query_state() {
+            self.note_error(error);
             return;
+        }
+        self.read_reports();
+    }
+
+    fn query_state(&mut self) -> Result<(), String> {
+        let Some(api) = &self.api else {
+            return Err("Reflex is not loaded".into());
         };
         let base = Base::new(
             0xf0bb5985,
@@ -443,9 +456,12 @@ impl Session {
             (api.get_state)(self.state.0.as_mut_ptr() as *mut c_void)
         };
         if code != 0 {
-            self.note_error(format!("Reflex state failed ({code})"));
-            return;
+            return Err(format!("Reflex state failed ({code})"));
         }
+        Ok(())
+    }
+
+    fn read_reports(&mut self) {
         let mut best_id = 0u64;
         let mut best = 0u64;
         for i in 0..REPORTS {
@@ -543,6 +559,18 @@ impl Drop for ReflexServerTick {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_reflex_cannot_open_a_frame() {
+        let mut session = Session::new(true);
+        session.loaded = true;
+        session.fail("unsupported adapter".into());
+        assert!(!session.loaded());
+        session.begin(false);
+        assert!(!session.is_open());
+        assert!(session.token().is_null());
+        assert_eq!(session.take_error().as_deref(), Some("unsupported adapter"));
+    }
     use std::mem::{offset_of, size_of};
 
     #[repr(C)]

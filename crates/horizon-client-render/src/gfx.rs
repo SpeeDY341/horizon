@@ -1294,11 +1294,11 @@ async fn open_backend(
         Ok((device, queue)) => {
             #[cfg(target_os = "windows")]
             if let Some(runtime) = &streamline {
-                runtime
+                let mut runtime = runtime
                     .lock()
-                    .map_err(|e| NoDevice::Failed(e.to_string()))?
-                    .attach_device(&device)
-                    .map_err(NoDevice::Failed)?;
+                    .map_err(|e| NoDevice::Failed(e.to_string()))?;
+                runtime.attach_device(&device).map_err(NoDevice::Failed)?;
+                runtime.check_present_features(&adapter);
             }
             Ok(Opened {
                 streamline,

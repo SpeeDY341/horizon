@@ -3,8 +3,9 @@
 Дата: 31 октября 2026 года. Статус: **часть A прошла review; код части B реализован
 и проверен на Windows, проверки Linux/macOS открыты; код части C прошёл
 независимый review, аппаратная проверка открыта; код части D прошёл review_d2;
-код E прошёл review_e PASS; код F и GPU-регрессии реализованы, review F
-ещё требуется; аппаратные проверки D–F и части G–I открыты**.
+код E прошёл review_e PASS; код F и GPU-регрессии прошли review_f PASS;
+код G и SDK-контракты реализованы, review G требуется; настоящая FG 2×,
+аппаратные проверки D–F и части H–I открыты** (обновлено 1 ноября).
 
 Основание: review 30 коммитов `763528025..35123b73f` личного форка
 `SpeeDY341/horizon`, ветка `codex/dlss-stages-0-2`.
@@ -480,7 +481,8 @@ swapchain получает hook; стресс-проверка не зависа
   queue order и lifetime рассмотрены по коду: world/SR submit → final draws /
   RESOURCE transitions → отдельный tag list → Present; owned textures остаются
   у Post/Motion. Настоящий SDK copy/Present, stress, визуальное качество motion,
-  Linux/macOS и независимый review F остаются открытыми. Флаг G не включён;
+  Linux/macOS остаются открытыми. Независимый review_f дал PASS коду F на
+  `e5a51229a5ec6c5f7682bdb6da29c968356fe34e`. На этапе F флаг G не включался;
   полный pr_ready/parity не запускались. SDK и игровые файлы не добавлялись.
 
 ## 7. Исправить контракт Streamline и доказать работу FG — R2
@@ -488,19 +490,19 @@ swapchain получает hook; стресс-проверка не зависа
 Зависит от этапов **5 и 6**. Исправление флага отдельно не считается готовой FG:
 оно сделает достижимыми ранее скрытые ошибки жизненного цикла и ресурсов.
 
-- [ ] Использовать именованные константы закреплённого SDK для Preferences.flags.
-- [ ] Включить `eUseFrameBasedResourceTagging` для выбранного пути тегирования.
-- [ ] Проверить совместимость нового режима с локальными tags SR и очисткой
+- [x] Использовать именованные константы закреплённого SDK для Preferences.flags.
+- [x] Включить `eUseFrameBasedResourceTagging` для выбранного пути тегирования.
+- [x] Проверить совместимость нового режима с локальными tags SR и очисткой
   frame-based tags при приостановке FG.
-- [ ] Проверить поддержку FG/Reflex на фактическом устройстве и доступность
+- [x] Проверить поддержку FG/Reflex на фактическом устройстве и доступность
   нужных модулей; наличие DLL и найденных функций не считать доказательством.
-- [ ] Разобрать сообщение SDK о неподписанной `NvLowLatencyVk.dll`: установить
+- [x] Разобрать сообщение SDK о неподписанной `NvLowLatencyVk.dll`: установить
   допустимый официальный комплект и подтвердить Vulkan Reflex; проверки
   подписи не обходить и не отключать.
 - [ ] Сначала подтвердить настоящий режим 2× в оконном приложении с Present.
 - [ ] Проверить успех tagging, constants и options, отсутствие SDK warnings/errors
   и фактические `numFramesActuallyPresented`.
-- [ ] Считать показанные FPS по реально прошедшему времени, отдельно от настоящих
+- [x] Считать показанные FPS по реально прошедшему времени, отдельно от настоящих
   кадров; не подменять измерение выбранным в меню множителем.
 - [ ] Разрешать 3×/4×/6× только в пределах подтверждённых возможностей устройства;
   показывать эффективный режим при ограничении запроса.
@@ -512,6 +514,48 @@ swapchain получает hook; стресс-проверка не зависа
 
 **Готово, когда:** на Vulkan и DX12 доказан показ дополнительных кадров,
 отсутствуют ошибки интеграции и симуляция не ускоряется от выбранного множителя.
+
+### Результат кода G и границы проверки (1 ноября 2026)
+
+- Preferences используют именованные флаги публичного MIT SDK 2.14.16:
+  Vulkan `0x81`, DX12 `0x85`; без OTA и обходов проверок. Production startup
+  проверяет `slIsFeatureSupported` для FG/Reflex/PCL на зарегистрированном
+  адаптере и `ReflexState.lowLatencyAvailable`. Отказ отключает потребителя,
+  сохраняя обычный рендер. Повторный уже подтверждённый Off не отправляется;
+  ошибка Off и последующий On сохраняют необходимость корректного suspend.
+- Официальный `bin/x64/NvLowLatencyVk.dll` отсутствовал в локальном native
+  комплекте: сообщение «NOT correctly signed» само по себе не доказывало
+  неподписанный существующий файл. DLL из официального SDK zip установлена
+  только в `.local/`; SHA256
+  `2A77DC3E1C724B7EEA5755BE0AE7423752E79A2459FAE72181A9F00E3507E5D6`.
+  Windows Authenticode — Valid/NVIDIA; сам Streamline подтвердил подпись.
+  Проверки подписи не отключались, сторонние бинарники не использовались.
+- RTX 5090, драйвер 621.01: пять ignored SDK tests прошли последовательно.
+  Два новых теста подтверждают FG/Reflex/PCL на Vulkan/DX12, фактическую
+  доступность low latency и успех Reflex On/Boost/Off. Оба SR pixel tests
+  отправляют настоящие null frame-tags до/после local SR tags на одном token;
+  SR readback и общий constants/token остаются валидными.
+- Показанные FPS считаются из SDK `numFramesActuallyPresented / elapsed`,
+  настоящие — из числа application presents за тот же интервал. Множитель
+  не участвует в измерении. Unit test включает задержку 2–4 секунды и SDK
+  counts 0/1/2. Control status экспортирует строки FG/Reflex для диагностики.
+- Ordinary Streamline: **17 passed, 5 ignored**; renderer `gfx::tests` —
+  **23 passed**. Clippy Streamline/render/client lib/bins/tests с `-D warnings`,
+  fmt, diff check и public-tree прошли. Полный pr_ready/parity не запускался.
+  Локальный SDK test log: `.local/dlss/logs/g-sdk-tests.txt`.
+- Оконный DX12 game smoke с отдельными scratch homes достиг настоящего
+  Present, загрузил FG (SDK max generated 5) и Reflex (измерение 9.4 ms),
+  но FG оставалась paused без фокуса. Он выполнялся после исправления flags,
+  до последующих G support/rate/Off изменений. SDK сообщил repeated initial
+  Off (добавлена регрессия/дедупликация) и advisory о синхронизации GetState;
+  все эти calls/Present имели один tid. Advisory не объявляется устранённым.
+- Навык [computer-use](C:/Users/godsp/.codex/plugins/cache/openai-bundled/computer-use/26.1027.30824/skills/computer-use/SKILL.md)
+  применён для фокуса: CUA Raise вернул `GetCursorPos: access denied
+  (0x80070005)`, восстановление observation было aborted before dispatch;
+  UI-ввод остановлен. Известный тестовый PID завершён через control quit.
+  **Настоящая FG 2× на Vulkan/DX12, live generation tags, warnings-free
+  Present, качество HUD/руки и stress остаются непроверенными.** Headless
+  SDK support/SR tests их не заменяют. Review G ещё не выполнен.
 
 ## 8. Выполнить итоговую проверку качества
 
@@ -590,8 +634,9 @@ swapchain получает hook; стресс-проверка не зависа
 - [ ] Часть E: общий frame token/constants и отдельная валидность TAA history
   прошли review_e PASS и targeted/SDK SR tests; аппаратная проверка открыта.
 - [ ] Часть F: сохранение depth/motion и headless GPU readback на Vulkan/DX12
-  реализованы и проверены; review F и native FG/game проверка открыты.
-- [ ] Часть G: frame-based tagging и аппаратная проверка FG 2×.
+  реализованы и проверены; review_f PASS, native FG/game проверка открыта.
+- [ ] Часть G: код frame-based tagging, support и FPS реализован, SDK-контракты
+  прошли; review G и настоящая FG 2× остаются открытыми.
 - [ ] Часть H: обработка ошибок, подтверждённые множители и диагностические статусы.
 - [ ] Часть I: финальная документация, результаты матрицы и повторный review.
 

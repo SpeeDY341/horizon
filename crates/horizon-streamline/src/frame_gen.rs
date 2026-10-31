@@ -135,13 +135,12 @@ pub(crate) struct Session {
     actual: u32,
     paused: bool,
     status: u32,
-    presented_second: u32,
-    presented_shown: u32,
-    have_second: bool,
+    rate: PresentRate,
     second_at: Instant,
     last_color: Option<[u32; 2]>,
     error: Option<String>,
     needs_reset: bool,
+    off_confirmed: bool,
 }
 
 impl Session {
@@ -156,13 +155,12 @@ impl Session {
             actual: 0,
             paused: true,
             status: 0,
-            presented_second: 0,
-            presented_shown: 0,
-            have_second: false,
+            rate: PresentRate::default(),
             second_at: Instant::now(),
             last_color: None,
             error: None,
             needs_reset: true,
+            off_confirmed: false,
         }
     }
 
@@ -203,6 +201,7 @@ impl Session {
 
     pub(crate) fn fail(&mut self, error: String) {
         self.loaded = false;
+        self.off_confirmed = false;
         self.error = Some(error);
     }
 
@@ -213,7 +212,9 @@ impl Session {
         self.last_color = None;
         self.actual = 0;
         self.paused = self.wanted > 0;
-        if let Some(api) = &self.api {
+        if let Some(api) = &self.api
+            && !self.off_confirmed
+        {
             // Sizes/formats are optional in the pinned v5 ABI. No frame token
             // or live input texture is needed to turn generation off.
             let options = GOptions::new(MODE_OFF, 1, [0; 2], [0; 2], 0, 0, 0);
@@ -223,6 +224,7 @@ impl Session {
             if code != 0 {
                 return Err(format!("Frame Generation suspend failed ({code})"));
             }
+            self.off_confirmed = true;
         }
         Ok(())
     }
@@ -343,12 +345,12 @@ impl Session {
         if state.max_generated > 0 {
             self.max_generated = state.max_generated;
         }
-        self.presented_second = self.presented_second.saturating_add(state.presented);
-        if self.second_at.elapsed() >= Duration::from_secs(1) {
-            self.presented_shown = self.presented_second;
-            self.presented_second = 0;
-            self.have_second = true;
-            self.second_at = Instant::now();
+        let now = Instant::now();
+        if self
+            .rate
+            .sample(state.presented, now.duration_since(self.second_at))
+        {
+            self.second_at = now;
         }
         if state.status != self.status {
             self.status = state.status;
@@ -371,12 +373,12 @@ impl Session {
         if self.paused || self.status != 0 || self.actual == 0 {
             return "Frame Gen: paused".into();
         }
-        let shown = if self.have_second {
-            self.presented_shown
-        } else {
-            self.presented_second
-        };
-        format!("Frame Gen: {}x · {shown} shown", self.actual + 1)
+        format!(
+            "Frame Gen: {}x · {:.0} shown FPS · {:.0} rendered FPS",
+            self.actual + 1,
+            self.rate.shown,
+            self.rate.rendered
+        )
     }
 
     pub(crate) fn note(&mut self, error: String) {
@@ -393,6 +395,9 @@ impl Session {
         let Some(api) = &self.api else {
             return Ok(());
         };
+        if !on && self.off_confirmed {
+            return Ok(());
+        }
         let options = GOptions::new(
             if on { MODE_ON } else { MODE_OFF },
             generate,
@@ -413,6 +418,7 @@ impl Session {
         let viewport = sl::Viewport::new();
         // Safety: options and the viewport outlive the call. The callback is null.
         let code = unsafe { (api.options)(&viewport, &options) };
+        self.off_confirmed = code == 0 && !on;
         if code != 0 {
             self.actual = 0;
             self.paused = self.wanted > 0;
@@ -684,6 +690,30 @@ impl Session {
     }
 }
 
+/// SDK presents and application presents measured over the same real interval.
+/// The requested generation multiplier never participates in this measurement.
+#[derive(Default)]
+struct PresentRate {
+    presented: u64,
+    frames: u64,
+    shown: f64,
+    rendered: f64,
+}
+impl PresentRate {
+    fn sample(&mut self, presented: u32, elapsed: Duration) -> bool {
+        self.presented = self.presented.saturating_add(u64::from(presented));
+        self.frames = self.frames.saturating_add(1);
+        if elapsed < Duration::from_secs(1) {
+            return false;
+        }
+        self.shown = self.presented as f64 / elapsed.as_secs_f64();
+        self.rendered = self.frames as f64 / elapsed.as_secs_f64();
+        self.presented = 0;
+        self.frames = 0;
+        true
+    }
+}
+
 impl GOptions {
     fn new(
         mode: u32,
@@ -761,7 +791,7 @@ fn live_tag(resource: &mut sl::Resource, kind: u32, size: [u32; 2]) -> sl::Tag {
     }
 }
 
-fn null_tag(kind: u32) -> sl::Tag {
+pub(crate) fn null_tag(kind: u32) -> sl::Tag {
     sl::Tag {
         base: tag_base(),
         resource: std::ptr::null_mut(),
@@ -807,6 +837,19 @@ fn color_format(format: wgpu::TextureFormat, dx12: bool) -> u32 {
 mod tests {
     use super::*;
     use std::mem::{offset_of, size_of};
+
+    #[test]
+    fn present_rates_use_sdk_counts_and_elapsed_time_including_stalls() {
+        let mut rate = PresentRate::default();
+        assert!(!rate.sample(2, Duration::from_millis(100)));
+        assert!(rate.sample(2, Duration::from_secs(2)));
+        assert_eq!((rate.shown, rate.rendered), (2., 1.));
+        // A selected 2x mode can still present only a real frame, or none.
+        assert!(rate.sample(1, Duration::from_secs(1)));
+        assert_eq!((rate.shown, rate.rendered), (1., 1.));
+        assert!(rate.sample(0, Duration::from_secs(4)));
+        assert_eq!((rate.shown, rate.rendered), (0., 0.25));
+    }
 
     thread_local! {
         static OPTIONS: std::cell::RefCell<(Vec<u32>, i32)> = const { std::cell::RefCell::new((Vec::new(), 0)) };
@@ -871,6 +914,7 @@ mod tests {
         session.wanted = 1;
         OPTIONS.with_borrow_mut(|state| *state = (Vec::new(), 0));
         session.suspend().unwrap();
+        session.suspend().unwrap(); // already confirmed Off before any Present
         let input = Inputs {
             depth: None,
             motion: None,
@@ -900,14 +944,7 @@ mod tests {
         assert!(!session.reset_pending());
         assert!(session.frame_ready(true, true, false));
         session.apply(false, true, 1, &input).unwrap();
-        OPTIONS.with_borrow(|(calls, _)| {
-            assert_eq!(
-                calls,
-                &[
-                    MODE_OFF, MODE_OFF, MODE_OFF, MODE_OFF, MODE_ON, MODE_ON, MODE_ON
-                ]
-            )
-        });
+        OPTIONS.with_borrow(|(calls, _)| assert_eq!(calls, &[MODE_OFF, MODE_ON, MODE_ON, MODE_ON]));
     }
 
     #[test]

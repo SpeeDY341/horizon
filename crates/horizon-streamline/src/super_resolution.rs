@@ -564,7 +564,12 @@ mod tests {
                 aspect: 640. / 360.,
                 reset: i == 0,
             };
-            runtime.lock().unwrap().begin_render_frame();
+            {
+                let mut owner = runtime.lock().unwrap();
+                owner.begin_render_frame();
+                let token = owner.common_constants(frame).unwrap();
+                owner.check_null_frame_tags(token);
+            }
             let output = sr.evaluate(&color, &depth, &motion, frame).unwrap();
             // FG requests the same snapshot after SR; this exercises the real
             // SDK-backed common path without claiming generated Present.
@@ -572,6 +577,7 @@ mod tests {
             let token = owner.common_constants(frame).unwrap();
             assert!(!token.is_null());
             assert_eq!(owner.common_constants(frame).unwrap(), token);
+            owner.check_null_frame_tags(token);
             owner.end_render_frame(true);
             drop(owner);
             println!("timing {:?}", sr.performance());
@@ -738,12 +744,18 @@ mod tests {
                 aspect: 640. / 360.,
                 reset: i == 0,
             };
-            runtime.lock().unwrap().begin_render_frame();
+            {
+                let mut owner = runtime.lock().unwrap();
+                owner.begin_render_frame();
+                let token = owner.common_constants(frame).unwrap();
+                owner.check_null_frame_tags(token);
+            }
             let output = sr.evaluate(&color, &depth, &motion, frame).unwrap();
             let mut owner = runtime.lock().unwrap();
             let token = owner.common_constants(frame).unwrap();
             assert!(!token.is_null());
             assert_eq!(owner.common_constants(frame).unwrap(), token);
+            owner.check_null_frame_tags(token);
             owner.end_render_frame(true);
             drop(owner);
             let read = device.create_buffer(&wgpu::BufferDescriptor {
