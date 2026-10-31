@@ -1101,6 +1101,9 @@ impl Game<'_> {
                 .eye_position()
                 .map(|e| self.shown_name_tags(glam::DVec3::from_array(e))),
         });
+        status["dlss"] = serde_json::to_value(horizon_client::graphics::dlss_details())
+            .unwrap_or(serde_json::Value::Null);
+        status["dlss_status"] = horizon_client::graphics::dlss_status().into();
         status["lod"] = lod;
         let (target, sampled) = self.lod.as_ref().map_or((0, 0), |lod| lod.progress());
         status["lod"]["target_tiles"] = target.into();

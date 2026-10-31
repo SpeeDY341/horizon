@@ -8,6 +8,12 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
+mod dlss;
+pub use dlss::{
+    DlssPreset, DlssReport, dlss_details, dlss_monitor_enabled, dlss_monitor_lines,
+    report_dlss_details, set_dlss_monitor_enabled,
+};
+
 pub const FILE: &str = "horizon-graphics.txt";
 /// Written beside it before HDR output is switched on and removed once the first HDR frame is
 /// presented. Found at the next start, it means HDR output took the game down, so HDR starts off.
@@ -445,6 +451,8 @@ pub struct Graphics {
     /// TAA upscaling; anything but `Native` comes with `taa` on.
     pub upscaling: Upscaling,
     pub dlss: Dlss,
+    pub dlss_preset: DlssPreset,
+    pub dlss_monitor: bool,
     /// HDR output (HDR10, or scRGB), where the display path offers it.
     pub hdr: bool,
     /// HDR paper white (where SDR white sits), in nits; 0 is Auto: the desktop's SDR
@@ -495,6 +503,8 @@ impl Default for Graphics {
             taa: false,
             upscaling: Upscaling::Native,
             dlss: Dlss::Off,
+            dlss_preset: DlssPreset::Auto,
+            dlss_monitor: false,
             hdr: false,
             hdr_paper_white: 0,
             hdr_peak: 0,
@@ -563,6 +573,8 @@ impl Graphics {
                 "taa" => g.taa = flag(g.taa),
                 "upscaling" => g.upscaling = Upscaling::parse(value),
                 "dlss" => g.dlss = Dlss::parse(value),
+                "dlssPreset" => g.dlss_preset = DlssPreset::parse(value),
+                "dlssMonitor" => g.dlss_monitor = flag(g.dlss_monitor),
                 "hdr" => g.hdr = flag(g.hdr),
                 "hdrPaperWhite" => {
                     g.hdr_paper_white = match number(g.hdr_paper_white) {
@@ -598,7 +610,7 @@ impl Graphics {
     }
     pub fn serialize(&self) -> String {
         format!(
-            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\ndlss:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrKey:{}\nbatteryMode:{}\ngraphicsApi:{}\npickedShaderPack:{}\n",
+            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\ndlss:{}\ndlssPreset:{}\ndlssMonitor:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrKey:{}\nbatteryMode:{}\ngraphicsApi:{}\npickedShaderPack:{}\n",
             self.preset.name(),
             self.lod_distance,
             self.far_detail.name(),
@@ -626,6 +638,8 @@ impl Graphics {
             bool_text(self.taa),
             self.upscaling.name(),
             self.dlss.name(),
+            self.dlss_preset.name(),
+            bool_text(self.dlss_monitor),
             bool_text(self.hdr),
             self.hdr_paper_white,
             self.hdr_peak,
@@ -771,6 +785,8 @@ mod tests {
             taa: true,
             upscaling: Upscaling::Balanced,
             dlss: Dlss::Quality,
+            dlss_preset: DlssPreset::M,
+            dlss_monitor: true,
             hdr: true,
             hdr_paper_white: 240,
             hdr_peak: 1400,

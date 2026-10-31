@@ -382,6 +382,7 @@ impl Game<'_> {
                 s.file.int("maxAnisotropyBit"),
             );
             r.set_dlss(s.horizon.dlss);
+            r.set_dlss_options(s.horizon.dlss_preset, s.horizon.dlss_monitor);
             r.set_world_post(
                 s.horizon.resolution_scale as f32 / 100.0,
                 s.horizon.fxaa,

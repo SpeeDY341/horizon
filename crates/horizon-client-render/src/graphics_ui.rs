@@ -2,7 +2,9 @@
 //! they show, in what groups, with what description and cost, and their
 //! input. How they look comes from `graphics_style`.
 use crate::{
-    graphics::{Dlss, FarDetail, GraphicsApi, Overlay, Pacing, PresentMode, Preset, Upscaling},
+    graphics::{
+        Dlss, DlssPreset, FarDetail, GraphicsApi, Overlay, Pacing, PresentMode, Preset, Upscaling,
+    },
     graphics_style::{Cost, STYLE},
     hud::{HudAtlas, HudBatch},
     lang,
@@ -42,6 +44,12 @@ pub enum H {
     Upscaling,
     Dlss,
     DlssStatus,
+    DlssPreset,
+    DlssNetwork,
+    DlssVersion,
+    StreamlineVersion,
+    DlssRender,
+    DlssMonitor,
     Hdr,
     /// Opens `Level::Hdr`.
     HdrSettings,
@@ -280,6 +288,36 @@ pub fn rows(level: Level) -> Vec<Row> {
             ),
             h(H::DlssStatus, None, "Actual renderer and fallback reason."),
             h(
+                H::DlssPreset,
+                High,
+                "Requests a model. Auto is the SDK default. L and M cost more.",
+            ),
+            h(
+                H::DlssNetwork,
+                None,
+                "Requested network family, not proof of the SDK's effective model.",
+            ),
+            h(
+                H::DlssVersion,
+                None,
+                "DLSS version reported by the running SDK, not a guessed marketing name.",
+            ),
+            h(
+                H::StreamlineVersion,
+                None,
+                "Version of the initialized Streamline plugin.",
+            ),
+            h(
+                H::DlssRender,
+                None,
+                "Actual DLSS input and output sizes. Equal mode sizes are flagged in monitor.",
+            ),
+            h(
+                H::DlssMonitor,
+                Low,
+                "Shows DLSS timings, sizes and completed calls. Writes samples to the game log.",
+            ),
+            h(
                 H::HdrSettings,
                 None,
                 "HDR output on an HDR display: lava, fire and sunlight shine brighter.",
@@ -467,6 +505,30 @@ impl H {
             H::Upscaling => labelled("Upscaling", g.upscaling.label()),
             H::Dlss => labelled("DLSS", g.dlss.label()),
             H::DlssStatus => labelled("DLSS Status", crate::graphics::dlss_status()),
+            H::DlssPreset => labelled("DLSS Preset", g.dlss_preset.name()),
+            H::DlssNetwork => labelled("Requested Network", g.dlss_preset.network()),
+            H::DlssVersion | H::StreamlineVersion => {
+                let r = crate::graphics::dlss_details();
+                let parts: Vec<_> = r.versions.split(" / ").collect();
+                Text::literal(
+                    parts
+                        .get(usize::from(self == H::StreamlineVersion))
+                        .copied()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("SDK not loaded"),
+                )
+            }
+            H::DlssRender => {
+                let r = crate::graphics::dlss_details();
+                labelled(
+                    "Render",
+                    format!(
+                        "{}x{} > {}x{}",
+                        r.render_size[0], r.render_size[1], r.output_size[0], r.output_size[1]
+                    ),
+                )
+            }
+            H::DlssMonitor => labelled("DLSS Monitor", on_off(g.dlss_monitor)),
             H::Hdr => labelled("HDR", on_off(g.hdr)),
             H::HdrSettings => Text::literal(lang::get("HDR Settings...")),
             H::HdrPaperWhite => match g.hdr_paper_white {
@@ -585,7 +647,13 @@ impl H {
                     g.fxaa = false;
                 }
             }
-            H::DlssStatus => {}
+            H::DlssStatus
+            | H::DlssNetwork
+            | H::DlssVersion
+            | H::StreamlineVersion
+            | H::DlssRender => {}
+            H::DlssPreset => g.dlss_preset = step(&DlssPreset::ALL, g.dlss_preset, back),
+            H::DlssMonitor => g.dlss_monitor = !g.dlss_monitor,
             H::Hdr => g.hdr = !g.hdr,
             H::BatteryMode => g.battery = !g.battery,
             H::GraphicsApi => g.api = step(GraphicsApi::choices(), g.api, back),
@@ -707,6 +775,11 @@ impl Item {
                     | H::BatteryMode
                     | H::GraphicsApi
                     | H::DlssStatus
+                    | H::DlssNetwork
+                    | H::DlssVersion
+                    | H::StreamlineVersion
+                    | H::DlssRender
+                    | H::DlssMonitor
             ) | Item::Vanilla(
                 Opt::GuiScale
                     | Opt::Fullscreen

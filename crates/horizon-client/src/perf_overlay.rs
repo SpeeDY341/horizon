@@ -23,18 +23,22 @@ impl FrameGraph {
         self.frames.push_back((frame_ms, cpu_ms, gpu));
     }
     pub fn draw(&self, mode: Overlay, batch: &mut HudBatch, atlas: &HudAtlas) {
-        if mode == Overlay::Off || self.frames.is_empty() {
+        let monitor = crate::graphics::dlss_monitor_enabled();
+        if (mode == Overlay::Off && !monitor) || self.frames.is_empty() {
             return;
         }
         let n = self.frames.len() as f32;
         let avg = |f: fn(&(f32, f32, f32)) -> f32| self.frames.iter().map(f).sum::<f32>() / n;
         let (frame, cpu, gpu) = (avg(|f| f.0), avg(|f| f.1), avg(|f| f.2));
         let worst = self.frames.iter().map(|f| f.0).fold(0.0f32, f32::max);
-        let lines = [
+        let mut lines = vec![
             format!("{:.0} fps", 1000.0 / frame.max(0.001)),
             format!("frame {frame:.1} ms  max {worst:.1}"),
             format!("cpu {cpu:.1}  gpu {gpu:.1} ms"),
         ];
+        if monitor {
+            lines.extend(crate::graphics::dlss_monitor_lines());
+        }
         let width = 120.0f32.max(
             lines
                 .iter()

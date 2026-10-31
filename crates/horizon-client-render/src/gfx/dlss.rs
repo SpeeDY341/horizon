@@ -1,5 +1,5 @@
 //! Safe renderer-side control; all native handles remain in horizon-streamline.
-use crate::graphics::{self, Dlss};
+use crate::graphics::{self, Dlss, DlssPreset, DlssReport};
 use glam::Mat4;
 #[cfg(target_os = "windows")]
 pub(super) type Shared = std::sync::Arc<std::sync::Mutex<horizon_streamline::Runtime>>;
@@ -49,6 +49,13 @@ pub(super) struct State {
     startup_failure: Option<String>,
     configuration: Option<(Dlss, [u32; 2])>,
     reset: bool,
+    preset: DlssPreset,
+    pub monitoring: bool,
+    pub motion_cpu_ms: f32,
+    report: DlssReport,
+    report_at: std::time::Instant,
+    sums: [f32; 4],
+    samples: u32,
 }
 impl State {
     pub fn new(shared: Option<Shared>, requested: bool, info: &wgpu::AdapterInfo) -> Self {
@@ -72,6 +79,13 @@ impl State {
             },
             configuration: None,
             reset: true,
+            preset: DlssPreset::Auto,
+            monitoring: false,
+            motion_cpu_ms: 0.0,
+            report: DlssReport::default(),
+            report_at: std::time::Instant::now(),
+            sums: [0.0; 4],
+            samples: 0,
         }
     }
     pub fn set(&mut self, requested: Dlss) {
@@ -81,6 +95,50 @@ impl State {
             self.reset = true;
         }
         self.requested = requested;
+    }
+    pub fn set_options(&mut self, preset: DlssPreset, monitoring: bool) {
+        if self.preset != preset {
+            self.failure = None;
+            self.configuration = None;
+            self.reset = true;
+            self.sums = [0.0; 4];
+            self.samples = 0;
+        }
+        self.preset = preset;
+        self.monitoring = monitoring;
+        graphics::set_dlss_monitor_enabled(monitoring);
+    }
+    #[cfg(target_os = "windows")]
+    fn record(&mut self) {
+        let perf = self.engine.as_ref().unwrap().performance();
+        let current = [
+            perf.cpu_copy_ms,
+            perf.cpu_evaluate_ms,
+            perf.cpu_total_ms,
+            self.motion_cpu_ms,
+        ];
+        for (sum, value) in self.sums.iter_mut().zip(current) {
+            *sum += value;
+        }
+        self.samples += 1;
+        if self.report_at.elapsed().as_millis() < 500 {
+            return;
+        }
+        self.report.cpu_ms = std::array::from_fn(|i| self.sums[i] / self.samples as f32);
+        self.report.motion_cpu_ms = self.sums[3] / self.samples as f32;
+        self.report.gpu_ms = perf.gpu_ms;
+        self.report.gpu_samples = perf.gpu_samples;
+        self.report.completed_frames = perf.completed_frames;
+        self.report.reset_frames = perf.reset_frames;
+        graphics::report_dlss_details(self.report.clone());
+        if self.monitoring
+            && let Ok(json) = serde_json::to_string(&self.report)
+        {
+            log::info!("DLSS monitor: {json}");
+        }
+        self.report_at = std::time::Instant::now();
+        self.sums = [0.0; 4];
+        self.samples = 0;
     }
     #[cfg(target_os = "windows")]
     fn fail(&mut self, e: String) {
@@ -126,6 +184,13 @@ impl State {
                 );
                 return None;
             };
+            if self.report.versions.is_empty() {
+                self.report.versions = shared
+                    .lock()
+                    .ok()
+                    .and_then(|r| r.dlss_versions().ok())
+                    .unwrap_or_else(|| "SDK version unavailable".into());
+            }
             if self.engine.is_none() {
                 match horizon_streamline::SuperResolution::new(shared.clone(), device, queue) {
                     Ok(e) => self.engine = Some(e),
@@ -137,14 +202,40 @@ impl State {
             }
             if self.configuration != Some((self.requested, output)) {
                 self.reset = true;
+                self.report.sdk_sizes = self
+                    .engine
+                    .as_ref()
+                    .unwrap()
+                    .recommended_sizes(output, self.preset.value())
+                    .map(|table| std::array::from_fn(|i| table[i][0]))
+                    .unwrap_or([[0; 2]; 4]);
             }
-            match self
-                .engine
+            self.engine
                 .as_mut()
                 .unwrap()
-                .configure(self.requested.mode(), output)
-            {
+                .set_monitoring(self.monitoring);
+            match self.engine.as_mut().unwrap().configure_with_preset(
+                self.requested.mode(),
+                output,
+                self.preset.value(),
+            ) {
                 Ok(size) => {
+                    if self.configuration != Some((self.requested, output)) {
+                        log::info!(
+                            "DLSS {} preset request {}: {}x{} -> {}x{}; SDK sizes {:?}",
+                            self.requested.label(),
+                            self.preset.name(),
+                            size[0],
+                            size[1],
+                            output[0],
+                            output[1],
+                            self.report.sdk_sizes
+                        );
+                    }
+                    self.report.requested_preset = self.preset.name().into();
+                    self.report.render_size = size;
+                    self.report.output_size = output;
+                    graphics::report_dlss_details(self.report.clone());
                     self.configuration = Some((self.requested, output));
                     Some(size)
                 }
@@ -211,7 +302,12 @@ impl State {
                         log::info!("DLSS Super Resolution active: {}", self.requested.label());
                     }
                     self.reset = false;
-                    graphics::report_dlss("Active");
+                    graphics::report_dlss(format!(
+                        "Active {}x{} > {}x{}",
+                        size[0], size[1], self.report.output_size[0], self.report.output_size[1]
+                    ));
+                    self.report.render_size = size;
+                    self.record();
                     Some(view)
                 }
                 Err(e) => {

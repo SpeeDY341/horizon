@@ -3738,6 +3738,10 @@ impl Renderer {
         self.dlss.set(mode);
     }
 
+    pub fn set_dlss_options(&mut self, preset: crate::graphics::DlssPreset, monitor: bool) {
+        self.dlss.set_options(preset, monitor);
+    }
+
     /// `upscale`: output pixels per rendered pixel, for TAA to rebuild (1: native).
     pub fn set_world_post(&mut self, scale: f32, antialias: bool, taa: bool, upscale: f32) {
         let taa = taa && self.world_post.supports_taa();
@@ -5933,6 +5937,7 @@ impl Renderer {
                 native.timing.as_mut(),
             );
         } else if scaled.is_some() {
+            let motion_started = self.dlss.monitoring.then(std::time::Instant::now);
             if self.motion_vectors_enabled()
                 && let Some(motion) = &mut self.motion
             {
@@ -5954,6 +5959,8 @@ impl Renderer {
                     motion.reset();
                 }
             }
+            self.dlss.motion_cpu_ms =
+                motion_started.map_or(0.0, |t| t.elapsed().as_secs_f32() * 1000.0);
             let dlss_result = if dlss_size.is_some() {
                 let motion = self.motion.as_ref().and_then(|m| m.view());
                 if let Some(motion) = motion {
