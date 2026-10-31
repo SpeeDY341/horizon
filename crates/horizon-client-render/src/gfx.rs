@@ -37,6 +37,7 @@ fn entity_shader() -> String {
 mod crumbling_tests;
 mod entity_batch;
 mod entity_outline;
+mod motion;
 pub mod motion_history;
 mod weather;
 use entity_batch::EntityBatch;
@@ -632,6 +633,7 @@ pub struct Renderer {
     layout: crate::chunk::ColumnLayout,
     /// Resolution scale, FXAA and TAA (Horizon settings).
     world_post: world_post::Post,
+    motion: Option<motion::Motion>,
     /// HDR output (Horizon setting): `Some` while the swapchain is HDR.
     hdr: Option<hdr::Hdr>,
     /// The HDR output the window's surface can present.
@@ -2768,6 +2770,12 @@ impl Renderer {
             });
         let depth = Self::depth(&device, &config);
         let world_post = world_post::Post::new(&device, config.format.remove_srgb_suffix());
+        let info = adapter.get_info();
+        let motion = (info.backend == wgpu::Backend::Vulkan
+            && info.vendor == 0x10de
+            && info.name.to_ascii_uppercase().contains("RTX")
+            && std::env::var("HORIZON_DLSS_MOTION").as_deref() == Ok("1"))
+        .then(|| motion::Motion::new(&device, &atlas_view));
         let uploads = upload::Uploads::new(&device);
         let section_uploads = upload::Uploads::with_chunk(&device, SECTION_UPLOAD_CHUNK);
         let stars = stars::Stars::new(&device, config.format.remove_srgb_suffix());
@@ -2928,6 +2936,7 @@ impl Renderer {
             occlusion: occlusion::Occlusion::new(crate::chunk::MIN_Y, crate::chunk::HEIGHT / 16),
             layout: crate::chunk::ColumnLayout::VANILLA,
             world_post,
+            motion,
             hdr: None,
             hdr_output,
             hdr_marker: None,
@@ -3399,6 +3408,9 @@ impl Renderer {
     }
     /// Drops every section, for a level whose chunks hold `layout`.
     pub fn clear_sections(&mut self, layout: crate::chunk::ColumnLayout) {
+        if let Some(motion) = &mut self.motion {
+            motion.reset();
+        }
         self.block_entities.clear();
         self.section_uploaded.clear();
         self.block_entity_revision = next_block_entity_revision();
@@ -3668,11 +3680,7 @@ impl Renderer {
     }
     /// Experimental data preparation is opt-in and restricted to Vulkan RTX.
     pub fn motion_vectors_enabled(&self) -> bool {
-        let info = self.adapter.get_info();
-        info.backend == wgpu::Backend::Vulkan
-            && info.vendor == 0x10de
-            && info.name.to_ascii_uppercase().contains("RTX")
-            && std::env::var("HORIZON_DLSS_MOTION").as_deref() == Ok("1")
+        self.motion.is_some()
     }
 
     /// `upscale`: output pixels per rendered pixel, for TAA to rebuild (1: native).
@@ -4126,6 +4134,9 @@ impl Renderer {
         let taa = !frame.title
             && self.pack_post.as_ref().is_none_or(|p| p.1.is_none())
             && self.native.as_ref().is_none_or(|n| n.post.is_none());
+        if !taa && let Some(motion) = &mut self.motion {
+            motion.reset();
+        }
         let jittered = self.world_post.jitter(
             [self.config.width, self.config.height],
             taa,
@@ -5857,6 +5868,23 @@ impl Renderer {
                 native.timing.as_mut(),
             );
         } else if scaled.is_some() {
+            if let Some(motion) = &mut self.motion {
+                if let Some(jitter) = self.world_post.temporal_jitter() {
+                    motion.render(
+                        &self.device,
+                        &self.queue,
+                        &mut encoder,
+                        frame,
+                        view_proj,
+                        jitter,
+                        world_depth,
+                        self.world_post.size().unwrap(),
+                        &self.indices,
+                    );
+                } else {
+                    motion.reset();
+                }
+            }
             self.world_post
                 .finish(&self.queue, &mut encoder, &view_target);
         }

@@ -405,6 +405,11 @@ impl Post {
             .map(|t| (t.color.clone(), t.depth.clone()))
     }
 
+    /// Exactly the jitter used for this frame's world, including target rebuild resets.
+    pub fn temporal_jitter(&self) -> Option<[f32; 4]> {
+        self.taa_on.then_some(self.taa_this_frame.jitter)
+    }
+
     /// The size of the world's own target, when it has one.
     pub fn size(&self) -> Option<[u32; 2]> {
         self.target.as_ref().map(|t| t.size)
