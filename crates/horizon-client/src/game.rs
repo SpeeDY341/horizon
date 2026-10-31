@@ -13794,6 +13794,12 @@ impl Game<'_> {
                 .boss_overlay
                 .darken_amount(self.clock.fraction() as f32),
             menu_blur: self.menu_blur(),
+            framegen_allowed: self.screen.allows_framegen(
+                self.player.is_some(),
+                self.screen_over_playing(),
+                self.loading_reason().is_some() || self.remote_loading(),
+                self.pauses_game(),
+            ),
             post_effects: horizon_client::post_chain::Request {
                 effects: &requested_post_effects,
                 root: &self.options.resources,
@@ -17086,6 +17092,7 @@ fn loading_frame(hud: &HudBatch) -> Frame<'_> {
         chunk_fade: 0.0,
         post_effects: horizon_client::post_chain::Request::none(),
         menu_blur: None,
+        framegen_allowed: false,
     }
 }
 

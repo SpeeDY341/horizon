@@ -1211,35 +1211,37 @@ mod tests {
                     color_format: wgpu::TextureFormat::Rgba8Unorm,
                     allow: true,
                 };
-                let record = |session: &mut Session| {
+                let record = |session: &mut Session, allow| {
                     let mut encoder = device.create_command_encoder(&Default::default());
+                    let mut input = input();
+                    input.allow = allow;
                     let tags = session
                         .record(
                             backend == wgpu::Backends::DX12,
                             std::ptr::dangling_mut(),
                             &device,
                             &mut encoder,
-                            input(),
+                            input,
                         )
                         .unwrap();
                     queue.submit(std::iter::once(encoder.finish()).chain(tags));
                 };
                 TAGS.with_borrow_mut(Vec::clear);
                 FAIL.set(failure);
-                record(&mut session);
+                record(&mut session, true);
                 TAGS.with_borrow(|calls| assert_eq!(calls, &[true, false]));
                 assert!(session.off_confirmed);
                 assert_eq!(session.actual, 0);
                 assert!(session.reset_pending());
                 FAIL.set((false, false));
-                record(&mut session);
+                record(&mut session, true);
                 assert_eq!(
                     session.actual, 0,
                     "no implicit retry after failed SDK frame"
                 );
                 session.set_wanted(0);
                 session.set_wanted(5);
-                record(&mut session);
+                record(&mut session, true);
                 assert_eq!(
                     session.actual, 1,
                     "driver cap, not request, selects the options"
@@ -1250,8 +1252,27 @@ mod tests {
                 assert!(session.line().contains("2x configured (6x requested)"));
                 assert!(session.line().contains("0 SDK shown FPS"));
                 assert!(session.rate.rendered > 0.);
+                // Renderer menu policy sets allow=false even when blur is
+                // absent and valid world inputs are still available. Exercise
+                // the actual recording/submission path, not only frame_ready.
+                TAGS.with_borrow_mut(Vec::clear);
+                OPTIONS.with_borrow_mut(|state| *state = (Vec::new(), 0));
+                for _ in 0..3 {
+                    record(&mut session, false);
+                    assert_eq!(session.actual, 0);
+                    assert!(session.off_confirmed);
+                    assert!(session.reset_pending());
+                    assert_eq!(session.wanted, 5);
+                }
+                TAGS.with_borrow(|calls| assert_eq!(calls, &[false, false, false]));
+                OPTIONS.with_borrow(|(calls, _)| assert_eq!(calls, &[MODE_OFF]));
+                record(&mut session, true);
+                assert_eq!(session.actual, 1);
+                assert!(!session.reset_pending());
+                TAGS.with_borrow(|calls| assert_eq!(calls.last(), Some(&true)));
+                OPTIONS.with_borrow(|(calls, _)| assert_eq!(calls, &[MODE_OFF, MODE_ON]));
                 session.min_side = 128;
-                record(&mut session);
+                record(&mut session, true);
                 assert_eq!(session.actual, 0, "below driver minimum must pause");
                 TAGS.with_borrow(|calls| assert_eq!(calls.last(), Some(&false)));
                 session.suspend().unwrap();

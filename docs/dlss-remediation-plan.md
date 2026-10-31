@@ -6,10 +6,12 @@ review после исправлений, включая review_g2 и review_h3 
 полная аппаратная lifecycle/визуальная приёмка и сборки Linux/macOS открыты.**
 Итоговые результаты и команды: [dlss-validation.md](dlss-validation.md).
 
-Повторный полный review `8b33c7954` открыл F1–F5. Для F1 добавлен
-creation path DX12 и настоящий SDK-тест буферов/resize/recreate; свежий
-независимый review исправления ещё требуется. Прежние PASS не означают
-полной приёмки интеграции; активная FG 2× остаётся недоказанной.
+Повторный полный review `8b33c7954` открыл F1–F5. Исправление F1 принято
+`fix_f1_review2` на `aad4e963f`: **PASS**. Для F2 добавлено семантическое
+разрешение FG по gameplay/screen/loading state, независимо от blur; свежий
+независимый review F2 ещё требуется. F3–F5 и аппаратная приёмка открыты.
+Прежние PASS не означают полной приёмки интеграции; активная FG 2× остаётся
+недоказанной.
 
 Основание: review 30 коммитов `763528025..35123b73f` личного форка
 `SpeeDY341/horizon`, ветка `codex/dlss-stages-0-2`.
@@ -380,7 +382,7 @@ swapchain получает hook; стресс-проверка не зависа
 - [x] Проверить расстановку маркеров Reflex в коде относительно ввода, подготовки
   кадра, всех относящихся к нему submit и Present, включая отдельный server thread.
 
-### Повторное исправление F1 (1 ноября 2026, review pending)
+### Повторное исправление F1 (1 ноября 2026, fix_f1_review2 PASS)
 
 - Независимый review `14789df1f` дал **FAIL**: при внешнем drop queue/device/
   adapter/instance перед Runtime его собственные COM-ссылки переживали HAL pin
@@ -388,7 +390,8 @@ swapchain получает hook; стресс-проверка не зависа
   удержание d3d12.dll в probe устраняло crash и позволяло новый SDK session.
   Исправление удерживает тот же Arc библиотеки непосредственно в SdkLifetime,
   независимо от hook: shutdown → native/proxy COM Release → SDK DLL → D3D12 DLL
-  → global lease. Обратного владения SDK через pin нет. Повторный review нужен.
+  → global lease. Обратного владения SDK через pin нет. Свежий независимый
+  `fix_f1_review2` проверил `aad4e963f` и дал **PASS**; активная FG 2× открыта.
   На исправлении extended native test прошёл за 19.42 s: 12 конфигураций,
   оба teardown и три последовательных SDK session. Также заново прошли
   ordinary 21 / 7 ignored, renderer/Streamline Clippy lib/tests `-D warnings`,
@@ -422,6 +425,30 @@ swapchain получает hook; стресс-проверка не зависа
 - MIT license и заголовки закреплённого SDK проверены до чтения источников;
   перечень прочитанного добавлен в THIRD_PARTY_NOTICES.md. SDK, подготовленные
   ресурсы и локальные логи не включаются в commit. F2–F5 этим этапом не закрыты.
+
+### Повторное исправление F2 (1 ноября 2026, fresh review pending)
+
+- База: `aad4e963f` (F1, `fix_f1_review2` **PASS**). `Frame.framegen_allowed`
+  передаёт семантическое разрешение: только Playing с игроком, без GUI поверх
+  Playing, pause и local/remote loading. Все остальные Screen, включая
+  GameModeSwitcher, inventory/chat/death, запрещают FG. HUD/tab/portal effects
+  остаются gameplay до открытия экрана или начала loading.
+- Все loading-frame builders явно запрещают FG. Renderer использует это
+  разрешение независимо от menu blur; title/focus/HDR/shader/presentation и
+  input/reset gates сохранены. Новые Screen требуют явного решения в match.
+- Production policy: 2 client bin tests прошли; матрица включает Paused/Options
+  при blur 0/5, скрытое pause menu, inventory/chat/death, все остальные Screen,
+  loading/world transition, pause, GUI поверх Playing и возврат в gameplay.
+- Настоящий Session::record с GPU submit и подменённой границей SDK проверен
+  на Vulkan/DX12: после On три запрещённых кадра дают только cleared tags,
+  один Off, actual=0, сохранённый wanted/reset, затем разрешённый кадр даёт
+  live tags/On и потребляет reset. Это regression, не доказательство active FG.
+- Streamline ordinary: 21 passed / 7 ignored; явный GPU mock test: 1 passed
+  (оба API); renderer lifecycle/history: 6 passed. Targeted Clippy для
+  renderer/Streamline/client lib/bins/tests с `-D warnings`, workspace fmt,
+  public-tree и diff checks прошли. Игра не запускалась; full pr_ready,
+  Linux/macOS и focused FG/визуальная приёмка не выполнялись. Свежий независимый
+  review F2 ещё требуется; F3–F5 не изменены.
 
 ### Результат кода E (31 октября 2026)
 

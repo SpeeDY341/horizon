@@ -408,6 +408,9 @@ pub struct Frame<'a> {
     /// `Screen.extractBlurredBackground`: blur the frame by this radius
     /// (`menuBackgroundBlurriness`) before the screen is drawn over it.
     pub menu_blur: Option<f32>,
+    /// Gameplay permits frame generation: no open screen, pause or loading.
+    /// This is semantic state, independent of the menu's visual blur radius.
+    pub framegen_allowed: bool,
     /// `Options.chunkSectionFadeInTime`, in seconds: how long a section takes to fade in once
     /// uploaded (0 draws it whole at once).
     pub chunk_fade: f32,
@@ -3958,7 +3961,7 @@ impl Renderer {
         self.framegen_rendering()
             && presenting
             && !frame.title
-            && frame.menu_blur.is_none()
+            && frame.framegen_allowed
             && self.hdr.is_none()
             && !pack_reads_world
             && self.window.has_focus()

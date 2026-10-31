@@ -1,13 +1,15 @@
 # DLSS remediation: validation record
 
-Updated 1 November 2026. Code under test: `dbde495af566192b488df99937aa6956248e22d3`,
+Updated 1 November 2026. Original aggregate code under test: `dbde495af566192b488df99937aa6956248e22d3`,
 compared with the original fork base `763528025d89cf575d7335e2a78d7fc48397d449`.
 This record distinguishes implemented behavior, automated evidence and hardware
 acceptance. The complete integration is **not yet accepted for release**.
 
-The repeat full review of `8b33c7954` found F1–F5. F1 now has a DX12
-creation integration and a native SDK regression; its fresh independent review
-is pending. Earlier per-part PASS results do not close the repeat review.
+The repeat full review of `8b33c7954` found F1–F5. F1's DX12 creation and
+lifetime fix passed fresh independent `fix_f1_review2` on `aad4e963f`.
+F2 now uses gameplay/screen/loading state rather than blur to suspend FG;
+its fresh independent review is pending. F3–F5 and hardware acceptance remain
+open. Earlier per-part PASS results do not close the repeat review.
 
 ## Implementation and independent review
 
@@ -36,6 +38,37 @@ record, subject to the final independent review.
 
 ## Reproducing isolated Windows checks
 
+F2's semantic menu suspension change is based on F1's accepted `aad4e963f`.
+The renderer consumes `Frame.framegen_allowed`, set only for Playing with a
+player and no screen overlay, pause or local/remote loading. Every GUI screen
+and every loading frame disables FG regardless of visual blur. HUD, tab list
+and portal effects remain gameplay until a GUI or loading state opens. Existing
+title, focus, HDR, shader, presentation, input and history-reset gates remain.
+
+Targeted Windows checks passed for F2:
+
+```powershell
+cargo test --locked -p horizon-client --bin horizon-client framegen_ -- --test-threads=1
+cargo test --locked -p horizon-streamline --lib -- --test-threads=1
+cargo test --locked -p horizon-streamline --lib failed_live_tags_or_options -- --ignored --test-threads=1 --nocapture
+cargo test --locked -p horizon-client-render --lib gfx::frame_gen::lifecycle_tests -- --test-threads=1
+cargo clippy --locked -p horizon-client-render -p horizon-streamline -p horizon-client --lib --bins --tests -- -D warnings
+```
+
+Results: 2 policy/loading-frame tests; 21 ordinary Streamline tests with 7
+explicitly ignored; 1 explicit GPU recording test on both Vulkan and DX12;
+6 renderer lifecycle/history tests. Policy covers pause/Options with blur 0/5,
+hidden pause menu, inventory/chat/death, every other Screen, loading/world
+transition, paused simulation, screens over Playing and gameplay resume.
+The GPU test uses production Session::record and submit with mock SDK calls:
+three blocked frames retain wanted/reset, report actual=0, clear all tags and
+send Off once; eligible resume sends live tags/On and consumes reset. Existing
+history tests confirm blocked frames do not repeatedly reset fallback TAA.
+Formatting, public-tree and diff checks also passed. No game was launched;
+focused FG/extra displayed frames, Linux/macOS and full pr_ready were not run.
+Fresh independent F2 review is pending; these tests do not close hardware
+acceptance or F3–F5.
+
 F1's explicit regression command is:
 
 ```powershell
@@ -56,7 +89,7 @@ D3D12 DLL pin prevented it. The fix keeps HAL's actual D3D12 library Arc directl
 in SdkLifetime until after shutdown, native/proxy COM Release and SDK DLL unload.
 It does not retain a hook or Runtime. The native regression now runs the full
 two-chain/resize scenario in both teardown orders and reinitializes the SDK
-after each. This fix awaits a new independent review.
+after each. Fresh independent `fix_f1_review2` accepted `aad4e963f` (PASS).
 The extended native test passed in 19.42 seconds (12 configurations and three
 SDK sessions); 21 ordinary tests, targeted renderer/Streamline Clippy, workspace
 and explicit HAL formatting and diff checks passed again on the fix.

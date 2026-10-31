@@ -10,6 +10,39 @@ use horizon_client::{
 };
 
 impl Screen {
+    /// FG is suspended for every GUI, including unblurred in-game screens.
+    /// HUD, tab list and portal effects leave `Playing` and are still gameplay;
+    /// books/signs/dialogs also need the separate overlay guard.
+    pub(super) fn allows_framegen(
+        self,
+        has_player: bool,
+        screen_overlay: bool,
+        loading: bool,
+        paused: bool,
+    ) -> bool {
+        let gameplay = match self {
+            Self::Playing => true,
+            Self::GameModeSwitcher
+            | Self::Paused
+            | Self::Options
+            | Self::Chat
+            | Self::Creative
+            | Self::Inventory
+            | Self::Dead
+            | Self::Stats
+            | Self::Advancements
+            | Self::WorldOptions
+            | Self::Friends
+            | Self::CommandBlock
+            | Self::BlockEditor
+            | Self::ServerLinks
+            | Self::ConfirmLink
+            | Self::DialogWarning
+            | Self::Win => false,
+        };
+        gameplay && has_player && !screen_overlay && !loading && !paused
+    }
+
     /// Screen.extractBackground for non-isInGameUi screens, and
     /// PauseScreen.extractBackground only when showPauseMenu is true.
     pub(super) fn blurs_background(self, pause_menu: bool) -> bool {
@@ -548,6 +581,62 @@ mod tests {
             assert!(!screen.blurs_background(true));
             assert!(!screen.blurs_background(false));
         }
+    }
+
+    #[test]
+    fn framegen_suspends_for_screens_independently_of_blur_and_resumes() {
+        for radius in [0.0, 5.0] {
+            for pause_menu in [false, true] {
+                for screen in [
+                    Screen::Paused,
+                    Screen::Options,
+                    Screen::Inventory,
+                    Screen::Creative,
+                    Screen::Chat,
+                    Screen::Dead,
+                    Screen::GameModeSwitcher,
+                    Screen::Stats,
+                    Screen::Advancements,
+                    Screen::WorldOptions,
+                    Screen::Friends,
+                    Screen::CommandBlock,
+                    Screen::BlockEditor,
+                    Screen::ServerLinks,
+                    Screen::ConfirmLink,
+                    Screen::DialogWarning,
+                    Screen::Win,
+                ] {
+                    let blur =
+                        (screen.blurs_background(pause_menu) && radius >= 1.0).then_some(radius);
+                    // A focused multiplayer menu need not pause simulation.
+                    assert!(!screen.allows_framegen(true, false, false, false));
+                    if radius == 0.0 {
+                        assert!(blur.is_none());
+                    }
+                    assert!(Screen::Playing.allows_framegen(true, false, false, false));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn framegen_blocks_loading_world_transition_pause_and_screens_over_playing() {
+        // These states can retain Screen::Playing while a loading screen or
+        // GUI covers the world. Loading also covers portals with no blur.
+        for (player, overlay, loading, paused) in [
+            (false, false, false, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, false, false, true),
+            (false, false, true, false),
+        ] {
+            assert!(!Screen::Playing.allows_framegen(player, overlay, loading, paused));
+        }
+        let hud = horizon_client::hud::HudBatch::new([800, 600]);
+        let loading = super::super::loading_frame(&hud);
+        assert!(!loading.framegen_allowed);
+        assert!(loading.menu_blur.is_none());
+        assert!(Screen::Playing.allows_framegen(true, false, false, false));
     }
 
     #[test]
