@@ -35,3 +35,8 @@ mod tests {
         assert!(!super::eligible(true, 0x10de, "GeForce GTX 1080"));
     }
 }
+
+#[cfg(target_os = "windows")]
+mod monitor;
+#[cfg(target_os = "windows")]
+pub use monitor::Performance;

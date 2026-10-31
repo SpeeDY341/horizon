@@ -110,6 +110,7 @@ impl Targets {
         color: &wgpu::TextureView,
         depth: &wgpu::TextureView,
         motion: &wgpu::TextureView,
+        timing: Option<(&crate::monitor::Monitor, usize)>,
     ) -> Result<(), String> {
         for source in [color, depth, motion] {
             if [source.texture().width(), source.texture().height()] != self.size {
@@ -118,6 +119,9 @@ impl Targets {
         }
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let mut encoder = device.create_command_encoder(&Default::default());
+        if let Some((m, slot)) = timing {
+            m.stamp(&mut encoder, slot, 0);
+        }
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("DLSS input copy"),
             layout: &self.copy.get_bind_group_layout(0),
@@ -178,6 +182,9 @@ impl Targets {
             })],
             ..Default::default()
         }));
+        if let Some((m, slot)) = timing {
+            m.stamp(&mut encoder, slot, 1);
+        }
         let commands = encoder.finish();
         if let Some(e) = pollster::block_on(scope.pop()) {
             return Err(e.to_string());
@@ -190,6 +197,7 @@ impl Targets {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        timing: Option<(&crate::monitor::Monitor, usize)>,
         evaluate: impl FnOnce(*mut c_void, &mut [sl::Resource; 4]) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut encoder = device.create_command_encoder(&Default::default());
@@ -209,6 +217,9 @@ impl Targets {
                     },
                 }),
         );
+        if let Some((m, slot)) = timing {
+            m.stamp(&mut encoder, slot, 2);
+        }
         let before = encoder.finish();
         let mut encoder = device.create_command_encoder(&Default::default());
         let views = self.views.as_ref().unwrap();
@@ -286,7 +297,13 @@ impl Targets {
                 state: wgpu::TextureUses::RESOURCE,
             }),
         );
+        if let Some((m, slot)) = timing {
+            m.end(&mut encoder, slot);
+        }
         queue.submit([before, native_commands, encoder.finish()]);
+        if let Some((m, slot)) = timing {
+            m.submitted(slot);
+        }
         Ok(())
     }
 }

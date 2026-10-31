@@ -81,6 +81,8 @@ pub struct SuperResolution {
     queue: wgpu::Queue,
     pub(crate) targets: Option<super::evaluate::Targets>,
     configuration: Option<(u32, [u32; 2], u32)>,
+    monitor: Option<crate::monitor::Monitor>,
+    performance: crate::Performance,
     // Last: shutdown must run with the device and instance still retained by Runtime.
     _runtime: Arc<Mutex<Runtime>>,
 }
@@ -121,8 +123,47 @@ impl SuperResolution {
             queue: queue.clone(),
             targets: None,
             configuration: None,
+            monitor: None,
+            performance: crate::Performance::default(),
             _runtime: runtime,
         })
+    }
+
+    pub fn set_monitoring(&mut self, enabled: bool) {
+        if enabled && self.monitor.is_none() {
+            self.monitor = crate::monitor::Monitor::new(&self.device, &self.queue);
+        } else if !enabled {
+            self.monitor = None;
+        }
+    }
+    pub fn performance(&self) -> crate::Performance {
+        self.performance
+    }
+
+    /// Quality, Balanced, Performance, Ultra Performance, as the SDK reports them.
+    /// Each entry is optimal, minimum, maximum render size.
+    pub fn recommended_sizes(
+        &self,
+        output: [u32; 2],
+        preset: u32,
+    ) -> Result<[[[u32; 2]; 3]; 4], String> {
+        let _owner = self._runtime.lock().map_err(|e| e.to_string())?;
+        let mut sizes = [[[0; 2]; 3]; 4];
+        for (at, mode) in [3, 2, 1, 4].into_iter().enumerate() {
+            let mut options = sl::Options::new(mode, output);
+            options.presets = [preset; 6];
+            let mut size = sl::Optimal::new();
+            // Safety: live plugin, initialized ABI structures; session lock held.
+            unsafe {
+                check((self.api.optimal)(&options, &mut size))?;
+            }
+            sizes[at] = [
+                [size.width, size.height],
+                [size.min_width, size.min_height],
+                [size.max_width, size.max_height],
+            ];
+        }
+        Ok(sizes)
     }
 
     /// Mode values are the SDK's Quality=3, Balanced=2, Performance=1,
@@ -192,6 +233,7 @@ impl SuperResolution {
         let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let internal = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
         let memory = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let started = std::time::Instant::now();
         let result = self.evaluate_frame(color, depth, motion, frame);
         let memory = pollster::block_on(memory.pop());
         let internal = pollster::block_on(internal.pop());
@@ -199,6 +241,7 @@ impl SuperResolution {
         if let Some(e) = memory.or(internal).or(validation) {
             return Err(e.to_string());
         }
+        self.performance.cpu_total_ms = started.elapsed().as_secs_f32() * 1000.0;
         result
     }
 
@@ -212,7 +255,18 @@ impl SuperResolution {
         let _session = self._runtime.lock().map_err(|e| e.to_string())?;
         let viewport = sl::Viewport::new();
         let targets = self.targets.as_ref().ok_or("DLSS is not configured")?;
-        targets.copy_inputs(&self.device, &self.queue, color, depth, motion)?;
+        let slot = self.monitor.as_mut().and_then(|m| m.begin(&self.device));
+        let timing = self.monitor.as_ref().zip(slot);
+        let started = std::time::Instant::now();
+        if let Err(e) = targets.copy_inputs(&self.device, &self.queue, color, depth, motion, timing)
+        {
+            if let Some((m, slot)) = timing {
+                m.cancel(slot);
+            }
+            return Err(e);
+        }
+        self.performance.cpu_copy_ms = started.elapsed().as_secs_f32() * 1000.0;
+        let started = std::time::Instant::now();
         let identity = [
             [1., 0., 0., 0.],
             [0., 1., 0., 0.],
@@ -256,36 +310,50 @@ impl SuperResolution {
         unsafe {
             check((self.api.constants)(&constants, token, &viewport))?;
         }
-        targets.evaluate_native(&self.device, &self.queue, |cmd, resources| {
-            let mut tags = resources
-                .iter_mut()
-                .zip([3, 0, 1, 4])
-                .map(|(r, kind)| sl::Tag {
-                    base: Base::new(
-                        0x4c6a5aad,
-                        0xb445,
-                        0x496c,
-                        [0x87, 0xff, 0x1a, 0xf3, 0x84, 0x5b, 0xe6, 0x53],
-                        1,
-                    ),
-                    extent: [0, 0, r.width, r.height],
-                    resource: r,
-                    kind,
-                    lifecycle: 2,
-                })
-                .collect::<Vec<_>>();
-            let mut inputs = vec![&viewport.base as *const Base];
-            inputs.extend(tags.iter_mut().map(|t| &t.base as *const Base));
-            unsafe {
-                check((self.api.evaluate)(
-                    0,
-                    token,
-                    inputs.as_ptr(),
-                    inputs.len() as u32,
-                    cmd,
-                ))
+        let result =
+            targets.evaluate_native(&self.device, &self.queue, timing, |cmd, resources| {
+                let mut tags = resources
+                    .iter_mut()
+                    .zip([3, 0, 1, 4])
+                    .map(|(r, kind)| sl::Tag {
+                        base: Base::new(
+                            0x4c6a5aad,
+                            0xb445,
+                            0x496c,
+                            [0x87, 0xff, 0x1a, 0xf3, 0x84, 0x5b, 0xe6, 0x53],
+                            1,
+                        ),
+                        extent: [0, 0, r.width, r.height],
+                        resource: r,
+                        kind,
+                        lifecycle: 2,
+                    })
+                    .collect::<Vec<_>>();
+                let mut inputs = vec![&viewport.base as *const Base];
+                inputs.extend(tags.iter_mut().map(|t| &t.base as *const Base));
+                unsafe {
+                    check((self.api.evaluate)(
+                        0,
+                        token,
+                        inputs.as_ptr(),
+                        inputs.len() as u32,
+                        cmd,
+                    ))
+                }
+            });
+        self.performance.cpu_evaluate_ms = started.elapsed().as_secs_f32() * 1000.0;
+        if let Err(e) = result {
+            if let Some((m, slot)) = timing {
+                m.cancel(slot);
             }
-        })?;
+            return Err(e);
+        }
+        self.performance.completed_frames += 1;
+        self.performance.reset_frames += u64::from(frame.reset);
+        if let Some(m) = &self.monitor {
+            self.performance.gpu_ms = m.gpu_ms;
+            self.performance.gpu_samples = m.samples;
+        }
         Ok(targets.output.create_view(&Default::default()))
     }
 }
@@ -326,21 +394,43 @@ mod tests {
         let instance = runtime.create_instance(&desc).unwrap();
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
         runtime.check_adapter(&adapter).unwrap();
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: adapter.features()
+                & (wgpu::Features::TIMESTAMP_QUERY
+                    | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
+            ..Default::default()
+        }))
+        .unwrap();
         runtime.attach_device(&device).unwrap();
         let versions = runtime.dlss_versions().unwrap();
         println!("{versions}");
         assert!(!versions.contains("DLSS 0.0.0"));
         let runtime = Arc::new(Mutex::new(runtime));
         let mut sr = SuperResolution::new(runtime.clone(), &device, &queue).unwrap();
+        for (label, preset) in [("Auto", 0), ("K", 11)] {
+            for output in [[640, 360], [1920, 1080], [2560, 1440], [3840, 2160]] {
+                let table = sr.recommended_sizes(output, preset).unwrap();
+                println!(
+                    "preset={label} output={}x{} quality={:?} balanced={:?} performance={:?} ultra={:?}",
+                    output[0], output[1], table[0], table[1], table[2], table[3]
+                );
+                let optimal = [table[0][0], table[1][0], table[2][0], table[3][0]];
+                assert!(
+                    optimal[0][0] > optimal[1][0]
+                        && optimal[1][0] > optimal[2][0]
+                        && optimal[2][0] > optimal[3][0],
+                    "DLSS modes collapsed to one render size: {optimal:?}"
+                );
+            }
+        }
         for mode in [3, 2, 1, 4] {
-            let size = sr.configure_with_preset(mode, [640, 360], 11).unwrap();
+            let size = sr.configure_with_preset(mode, [1920, 1080], 0).unwrap();
             println!(
-                "mode={mode} render={}x{} output=640x360 requested=K",
+                "configured mode={mode} render={}x{} output=1920x1080",
                 size[0], size[1]
             );
         }
+        sr.set_monitoring(true);
         let size = sr.configure(3, [640, 360]).unwrap();
         let make = |format, usage| {
             device
@@ -428,6 +518,7 @@ mod tests {
                 reset: i == 0,
             };
             let output = sr.evaluate(&color, &depth, &motion, frame).unwrap();
+            println!("timing {:?}", sr.performance());
             let read = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size: 256,

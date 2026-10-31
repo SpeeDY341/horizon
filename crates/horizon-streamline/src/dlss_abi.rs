@@ -78,8 +78,10 @@ impl Options {
             invert_x: 0,
             invert_y: 0,
             presets: [0; 6],
+            // NVIDIA's default. Alpha upscaling is a separate, slower path and
+            // the world is copied as opaque colour; the HUD is drawn afterwards.
             auto_exposure: 1,
-            alpha: 1,
+            alpha: 0,
         }
     }
 }
