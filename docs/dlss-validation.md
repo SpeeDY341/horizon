@@ -69,6 +69,19 @@ focused FG/extra displayed frames, Linux/macOS and full pr_ready were not run.
 Fresh independent F2 review is pending; these tests do not close hardware
 acceptance or F3–F5.
 
+Fresh review rejected F2 commit `4126aeb50`: its loading predicate reused the
+visual panorama helper, which excludes Nether/End screens. PlayerPosition can
+restore the player before LevelLoadTracker finishes, allowing FG during portal
+loading. The follow-up uses a separate semantic remote loading predicate: any
+active tracker, connecting without a player or reconfiguration suspends FG.
+Visual panorama/blur policy is unchanged. The targeted client command above now
+passes 3 tests: the new regression feeds a real LevelLoadTracker through
+Other/NetherPortal/EndPortal, with a restored player still waiting for server,
+player chunk, ready/close delay and screen finish, then gameplay resume. The
+same predicate is used by the production Frame producer. Targeted client/render/
+Streamline lib/bins/tests Clippy, formatting, public-tree and diff checks passed
+again on this follow-up. Fresh independent review of this follow-up is pending.
+
 F1's explicit regression command is:
 
 ```powershell

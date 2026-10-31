@@ -11,7 +11,8 @@ use horizon_client::{
 
 impl Screen {
     /// FG is suspended for every GUI, including unblurred in-game screens.
-    /// HUD, tab list and portal effects leave `Playing` and are still gameplay;
+    /// HUD, tab list and the in-world portal effect remain gameplay. Portal
+    /// loading screens need the loading guard even after a player is restored;
     /// books/signs/dialogs also need the separate overlay guard.
     pub(super) fn allows_framegen(
         self,

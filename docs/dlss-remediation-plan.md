@@ -428,6 +428,12 @@ swapchain получает hook; стресс-проверка не зависа
 
 ### Повторное исправление F2 (1 ноября 2026, fresh review pending)
 
+- Свежий review `4126aeb50` дал **FAIL**: `remote_loading` отвечает за
+  panorama/blur и исключает Nether/End loading. После PlayerPosition игрок уже
+  есть, но LevelLoadTracker ещё показывает loading screen. Исправление использует
+  отдельный `remote_framegen_loading`: любой активный tracker, connecting без
+  игрока или reconfiguration запрещает FG, независимо от Reason. Визуальная
+  политика `remote_loading` сохранена. Повторный независимый review требуется.
 - База: `aad4e963f` (F1, `fix_f1_review2` **PASS**). `Frame.framegen_allowed`
   передаёт семантическое разрешение: только Playing с игроком, без GUI поверх
   Playing, pause и local/remote loading. Все остальные Screen, включая
@@ -436,9 +442,12 @@ swapchain получает hook; стресс-проверка не зависа
 - Все loading-frame builders явно запрещают FG. Renderer использует это
   разрешение независимо от menu blur; title/focus/HDR/shader/presentation и
   input/reset gates сохранены. Новые Screen требуют явного решения в match.
-- Production policy: 2 client bin tests прошли; матрица включает Paused/Options
+- Production policy: 3 client bin tests прошли; матрица включает Paused/Options
   при blur 0/5, скрытое pause menu, inventory/chat/death, все остальные Screen,
   loading/world transition, pause, GUI поверх Playing и возврат в gameplay.
+  Регрессия использует production loading predicate с настоящим LevelLoadTracker
+  для Other/NetherPortal/EndPortal: уже восстановленный игрок ждёт server/chunk,
+  ready/close delay и finish; FG разрешается после закрытия loading screen.
 - Настоящий Session::record с GPU submit и подменённой границей SDK проверен
   на Vulkan/DX12: после On три запрещённых кадра дают только cleared tags,
   один Off, actual=0, сохранённый wanted/reset, затем разрешённый кадр даёт

@@ -7960,6 +7960,19 @@ impl Game<'_> {
         horizon_client::level_loading::draw_connecting(batch, atlas, &status, self.cursor, cancel);
         true
     }
+    /// Semantic FG suspension, including portal loads after PlayerPosition
+    /// restores the player but before the level tracker closes its screen.
+    /// `remote_loading` below is visual panorama/blur policy, not this state.
+    pub(super) fn remote_framegen_loading(&self) -> bool {
+        self.remote.as_ref().is_some_and(|r| {
+            framegen_loading(
+                self.player.is_some(),
+                &r.level_load,
+                r.reconfiguring.is_some(),
+            )
+        })
+    }
+
     /// Connected or connecting with no player yet: `ConnectScreen`, then
     /// `LevelLoadingScreen`, over the panorama with its blur.
     pub(super) fn remote_loading(&self) -> bool {
@@ -8682,9 +8695,60 @@ fn client_millis() -> u64 {
         .as_millis() as u64
 }
 
+/// A live tracker always owns a loading screen, regardless of its background
+/// or whether PlayerPosition has already reconstructed the local player.
+fn framegen_loading(
+    has_player: bool,
+    load: &horizon_client::level_loading::LevelLoadTracker,
+    reconfiguring: bool,
+) -> bool {
+    !has_player || load.is_active() || reconfiguring
+}
+
 #[cfg(test)]
 mod tests {
     use super::synced_local_use;
+
+    #[test]
+    fn framegen_waits_for_every_loading_screen_after_player_is_restored() {
+        use horizon_client::level_loading::{
+            LEVEL_LOAD_CLOSE_DELAY_MS, LevelLoadTracker, PlayerCheck, Reason,
+        };
+        for reason in [Reason::Other, Reason::NetherPortal, Reason::EndPortal] {
+            let mut load = LevelLoadTracker::new(LEVEL_LOAD_CLOSE_DELAY_MS);
+            assert!(super::framegen_loading(false, &load, false)); // connecting
+            load.start_client_load(100, reason);
+            // PlayerPosition can restore a player while WaitingForServer or
+            // WaitingForPlayerChunk still owns the actual loading screen.
+            let has_player = true;
+            let allowed = |load: &LevelLoadTracker| {
+                super::super::Screen::Playing.allows_framegen(
+                    has_player,
+                    false,
+                    super::framegen_loading(has_player, load, false),
+                    false,
+                )
+            };
+            assert!(!allowed(&load), "{reason:?}: waiting for server");
+            load.loading_packets_received();
+            let player = PlayerCheck {
+                outside_build_height: false,
+                spectator: false,
+                alive: true,
+            };
+            load.tick_client_load(200, player);
+            assert!(!allowed(&load), "{reason:?}: waiting for player chunk");
+            load.player_section_ready();
+            load.tick_client_load(300, player);
+            assert!(!load.is_level_ready(300 + LEVEL_LOAD_CLOSE_DELAY_MS - 1));
+            assert!(!allowed(&load), "{reason:?}: screen close delay");
+            assert!(load.is_level_ready(300 + LEVEL_LOAD_CLOSE_DELAY_MS));
+            assert!(!allowed(&load), "{reason:?}: until screen is closed");
+            load.finish();
+            assert!(allowed(&load), "{reason:?}: resumed gameplay");
+            assert!(super::framegen_loading(true, &load, true)); // reconfigure
+        }
+    }
 
     #[test]
     fn the_server_stopping_the_use_lowers_the_shield() {

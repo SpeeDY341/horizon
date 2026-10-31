@@ -13797,7 +13797,7 @@ impl Game<'_> {
             framegen_allowed: self.screen.allows_framegen(
                 self.player.is_some(),
                 self.screen_over_playing(),
-                self.loading_reason().is_some() || self.remote_loading(),
+                self.loading_reason().is_some() || self.remote_framegen_loading(),
                 self.pauses_game(),
             ),
             post_effects: horizon_client::post_chain::Request {
