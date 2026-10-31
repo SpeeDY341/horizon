@@ -5,13 +5,14 @@ mod abi;
 #[cfg(target_os = "windows")]
 mod runtime;
 #[cfg(target_os = "windows")]
-pub use runtime::{Requirements, Runtime};
+pub use runtime::{Api, Requirements, Runtime};
 
-/// Cheap prefilter only. Streamline must still confirm DLSS support on the
-/// actual Vulkan physical device; a vendor/name match is not that confirmation.
-pub fn eligible(vulkan: bool, vendor: u32, name: &str) -> bool {
+/// Cheap prefilter only. `supported_api` is true for Vulkan and DirectX 12.
+/// Streamline must still confirm DLSS on that adapter; a name match is not
+/// that confirmation.
+pub fn eligible(supported_api: bool, vendor: u32, name: &str) -> bool {
     cfg!(target_os = "windows")
-        && vulkan
+        && supported_api
         && vendor == 0x10de
         && name.to_ascii_uppercase().contains("RTX")
 }

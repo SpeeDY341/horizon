@@ -222,6 +222,38 @@ impl Targets {
         }
         let before = encoder.finish();
         let mut encoder = device.create_command_encoder(&Default::default());
+        if unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }.is_some() {
+            self.record_directx12(&mut encoder, &textures, evaluate)?;
+        } else {
+            self.record_vulkan(&mut encoder, &textures, evaluate)?;
+        }
+        let native_commands = encoder.finish();
+        let mut encoder = device.create_command_encoder(&Default::default());
+        // DLSS restores the tagged input states. wgpu resumes ownership here.
+        encoder.transition_resources(
+            std::iter::empty(),
+            std::iter::once(wgpu::TextureTransition {
+                texture: &self.output,
+                selector: None,
+                state: wgpu::TextureUses::RESOURCE,
+            }),
+        );
+        if let Some((m, slot)) = timing {
+            m.end(&mut encoder, slot);
+        }
+        queue.submit([before, native_commands, encoder.finish()]);
+        if let Some((m, slot)) = timing {
+            m.submitted(slot);
+        }
+        Ok(())
+    }
+
+    fn record_vulkan(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        textures: &[&wgpu::Texture; 4],
+        evaluate: impl FnOnce(*mut c_void, &mut [sl::Resource; 4]) -> Result<(), String>,
+    ) -> Result<(), String> {
         let views = self.views.as_ref().unwrap();
         // Safety: these four textures were allocated on this device by this
         // package. Guards retain them throughout the call, and no render pass
@@ -232,9 +264,8 @@ impl Targets {
             let raw_views = views
                 .each_ref()
                 .map(|v| v.as_hal::<wgpu::hal::api::Vulkan>().unwrap().raw_handle());
-            // wgpu's snatch lock is device-wide and non-reentrant. The three
-            // inputs and all views are private to Targets; only the output can
-            // be shared with the caller. Retain its single guard during DLSS.
+            // Only the output can be shared with the caller. Retain its guard
+            // during DLSS so it cannot be snatched out from under the call.
             let _output_guard = self.output.as_hal::<wgpu::hal::api::Vulkan>().unwrap();
             let formats = [
                 vk::Format::R16G16B16A16_SFLOAT,
@@ -257,53 +288,122 @@ impl Targets {
                     | vk::ImageUsageFlags::TRANSFER_SRC
                     | vk::ImageUsageFlags::COLOR_ATTACHMENT,
             ];
-            let mut resources = std::array::from_fn(|i| sl::Resource {
-                base: Base::new(
-                    0x3a9d70cf,
-                    0x2418,
-                    0x4b72,
-                    [0x83, 0x91, 0x13, 0xf8, 0x72, 0x1c, 0x72, 0x61],
-                    1,
-                ),
-                kind: 0,
-                native: images[i].as_raw() as *mut c_void,
-                memory: std::ptr::null_mut(),
-                view: raw_views[i].as_raw() as *mut c_void,
-                state: layouts[i].as_raw() as u32,
-                width: textures[i].width(),
-                height: textures[i].height(),
-                format: formats[i].as_raw() as u32,
-                mips: 1,
-                layers: 1,
-                gpu_address: 0,
-                flags: 0,
-                usage: usages[i].as_raw(),
-                internal_flags: 0,
-                reserved: 0,
+            let mut resources = std::array::from_fn(|i| {
+                tagged_resource(
+                    images[i].as_raw() as *mut c_void,
+                    raw_views[i].as_raw() as *mut c_void,
+                    layouts[i].as_raw() as u32,
+                    textures[i].width(),
+                    textures[i].height(),
+                    formats[i].as_raw() as u32,
+                    usages[i].as_raw(),
+                )
             });
             encoder.as_hal_mut::<wgpu::hal::api::Vulkan, _, _>(|hal| {
                 let hal = hal.ok_or("Vulkan command encoder missing")?;
                 evaluate(hal.raw_handle().as_raw() as *mut c_void, &mut resources)
-            })?;
-        }
-        let native_commands = encoder.finish();
-        let mut encoder = device.create_command_encoder(&Default::default());
-        // DLSS restores the tagged input states. wgpu resumes ownership here.
-        encoder.transition_resources(
-            std::iter::empty(),
-            std::iter::once(wgpu::TextureTransition {
-                texture: &self.output,
-                selector: None,
-                state: wgpu::TextureUses::RESOURCE,
-            }),
-        );
-        if let Some((m, slot)) = timing {
-            m.end(&mut encoder, slot);
-        }
-        queue.submit([before, native_commands, encoder.finish()]);
-        if let Some((m, slot)) = timing {
-            m.submitted(slot);
+            })?
         }
         Ok(())
+    }
+
+    fn record_directx12(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        textures: &[&wgpu::Texture; 4],
+        evaluate: impl FnOnce(*mut c_void, &mut [sl::Resource; 4]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        // These match wgpu-hal's barriers for TextureUses::RESOURCE and
+        // STORAGE_READ_WRITE. The depth copy is sampled, so it is a shader
+        // resource (0xC0), not a depth-read target. Views are not required.
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        const UNORDERED_ACCESS: u32 = 0x8;
+        const R16G16B16A16_FLOAT: u32 = 10;
+        const R16G16_FLOAT: u32 = 34;
+        const D32_FLOAT: u32 = 40;
+        let states = [
+            SHADER_RESOURCE,
+            SHADER_RESOURCE,
+            SHADER_RESOURCE,
+            UNORDERED_ACCESS,
+        ];
+        let formats = [
+            R16G16B16A16_FLOAT,
+            D32_FLOAT,
+            R16G16_FLOAT,
+            R16G16B16A16_FLOAT,
+        ];
+        // Safety: textures belong to this device. Pointers stay valid while
+        // the textures do. The command list stays open for wgpu to close.
+        unsafe {
+            let mut images = [std::ptr::null_mut(); 4];
+            for (i, texture) in textures.iter().enumerate() {
+                let hal = texture
+                    .as_hal::<wgpu::hal::api::Dx12>()
+                    .ok_or("DirectX 12 texture missing")?;
+                images[i] = hal.raw_resource_ptr();
+                if images[i].is_null() {
+                    return Err("DirectX 12 texture missing".into());
+                }
+            }
+            let _output_guard = self
+                .output
+                .as_hal::<wgpu::hal::api::Dx12>()
+                .ok_or("DirectX 12 output missing")?;
+            let mut resources = std::array::from_fn(|i| {
+                tagged_resource(
+                    images[i],
+                    std::ptr::null_mut(),
+                    states[i],
+                    textures[i].width(),
+                    textures[i].height(),
+                    formats[i],
+                    0,
+                )
+            });
+            encoder.as_hal_mut::<wgpu::hal::api::Dx12, _, _>(|hal| {
+                let hal = hal.ok_or("DirectX 12 command encoder missing")?;
+                let list = hal
+                    .raw_open_command_list_ptr()
+                    .ok_or("DirectX 12 command list is not open")?;
+                evaluate(list, &mut resources)
+            })?
+        }
+        Ok(())
+    }
+}
+
+fn tagged_resource(
+    native: *mut c_void,
+    view: *mut c_void,
+    state: u32,
+    width: u32,
+    height: u32,
+    format: u32,
+    usage: u32,
+) -> sl::Resource {
+    sl::Resource {
+        base: Base::new(
+            0x3a9d70cf,
+            0x2418,
+            0x4b72,
+            [0x83, 0x91, 0x13, 0xf8, 0x72, 0x1c, 0x72, 0x61],
+            1,
+        ),
+        kind: 0,
+        native,
+        memory: std::ptr::null_mut(),
+        view,
+        state,
+        width,
+        height,
+        format,
+        mips: 1,
+        layers: 1,
+        gpu_address: 0,
+        flags: 0,
+        usage,
+        internal_flags: 0,
+        reserved: 0,
     }
 }

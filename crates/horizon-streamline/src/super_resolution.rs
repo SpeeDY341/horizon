@@ -67,6 +67,51 @@ impl Api {
         }
     }
 }
+/// Safety: callers hold the guards only to compare identities. The handles
+/// remain valid because `device`, `queue` and the registered device are alive.
+unsafe fn same_device(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    owner: &Runtime,
+) -> Result<(), String> {
+    let registered = owner
+        .registered_device()
+        .ok_or("DLSS device is not registered")?;
+    unsafe {
+        if let Some(d) = device.as_hal::<wgpu::hal::api::Vulkan>() {
+            let q = queue
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .ok_or("Vulkan queue missing")?;
+            let registered = registered
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .ok_or("Registered Vulkan device missing")?;
+            if d.raw_device().handle() != registered.raw_device().handle() {
+                return Err("DLSS runtime/device mismatch".into());
+            }
+            if d.raw_device().handle() != q.raw_device().handle() {
+                return Err("DLSS queue/device mismatch".into());
+            }
+            return Ok(());
+        }
+        if let Some(d) = device.as_hal::<wgpu::hal::api::Dx12>() {
+            let q = queue
+                .as_hal::<wgpu::hal::api::Dx12>()
+                .ok_or("DirectX 12 queue missing")?;
+            let registered = registered
+                .as_hal::<wgpu::hal::api::Dx12>()
+                .ok_or("Registered DirectX 12 device missing")?;
+            let ptr = d.raw_device_ptr();
+            if ptr.is_null() || ptr != registered.raw_device_ptr() {
+                return Err("DLSS runtime/device mismatch".into());
+            }
+            if ptr != q.raw_device_ptr() {
+                return Err("DLSS queue/device mismatch".into());
+            }
+            return Ok(());
+        }
+    }
+    Err("DLSS device is neither Vulkan nor DirectX 12".into())
+}
 fn check(code: i32) -> Result<(), String> {
     if code == 0 {
         Ok(())
@@ -95,26 +140,7 @@ impl SuperResolution {
     ) -> Result<Self, String> {
         let owner = runtime.lock().map_err(|e| e.to_string())?;
         // Safety: read-only guards verify the queue and device match before copying.
-        unsafe {
-            let d = device
-                .as_hal::<wgpu::hal::api::Vulkan>()
-                .ok_or("Vulkan device missing")?;
-            let q = queue
-                .as_hal::<wgpu::hal::api::Vulkan>()
-                .ok_or("Vulkan queue missing")?;
-            let registered = owner
-                .registered_device()
-                .ok_or("DLSS device is not registered")?;
-            let registered = registered
-                .as_hal::<wgpu::hal::api::Vulkan>()
-                .ok_or("Registered Vulkan device missing")?;
-            if d.raw_device().handle() != registered.raw_device().handle() {
-                return Err("DLSS runtime/device mismatch".into());
-            }
-            if d.raw_device().handle() != q.raw_device().handle() {
-                return Err("DLSS queue/device mismatch".into());
-            }
-        }
+        unsafe { same_device(device, queue, &owner)? };
         let api = Api::load(&owner)?;
         drop(owner);
         Ok(Self {
@@ -560,6 +586,170 @@ mod tests {
             rx.recv().unwrap().unwrap();
             let pixels = read.slice(..).get_mapped_range().unwrap();
             println!("Frame {i}: {:?}", &pixels[..8]);
+            for (n, expected) in [0x3400u16, 0x3800, 0x3a00, 0x3c00].into_iter().enumerate() {
+                let actual = u16::from_le_bytes([pixels[n * 2], pixels[n * 2 + 1]]);
+                assert!(
+                    actual.abs_diff(expected) < 32,
+                    "Unexpected DLSS pixel: {actual:x}"
+                );
+            }
+        }
+        drop(sr);
+        drop(runtime);
+    }
+
+    #[test]
+    #[ignore = "requires the official SDK and an RTX DirectX 12 device"]
+    fn real_dlss_evaluates_a_directx12_frame() {
+        let path = std::env::var_os("HORIZON_STREAMLINE_SDK").expect("SDK");
+        let mut runtime = Runtime::load_for(
+            std::path::Path::new(&path),
+            "00a6bdb2-6386-4e37-8ff9-dcda4642628a",
+            crate::Api::Dx12,
+        )
+        .unwrap();
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::DX12;
+        let instance = runtime.create_instance(&desc).unwrap();
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        println!("Adapter: {}", adapter.get_info().name);
+        runtime.check_adapter(&adapter).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        runtime.attach_device(&device).unwrap();
+        let versions = runtime.dlss_versions().unwrap();
+        println!("{versions}");
+        assert!(!versions.contains("DLSS 0.0.0"));
+        let runtime = Arc::new(Mutex::new(runtime));
+        let mut sr = SuperResolution::new(runtime.clone(), &device, &queue).unwrap();
+        let size = sr.configure(3, [640, 360]).unwrap();
+        let make = |format, usage| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: None,
+                    size: wgpu::Extent3d {
+                        width: size[0],
+                        height: size[1],
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC;
+        let color = make(wgpu::TextureFormat::Rgba8Unorm, usage);
+        let depth = make(wgpu::TextureFormat::Depth32Float, usage);
+        let motion = make(wgpu::TextureFormat::Rg16Float, usage);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        for (view, clear) in [
+            (
+                &color,
+                wgpu::Color {
+                    r: 0.25,
+                    g: 0.5,
+                    b: 0.75,
+                    a: 1.,
+                },
+            ),
+            (&motion, wgpu::Color::TRANSPARENT),
+        ] {
+            drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            }));
+        }
+        drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0.5),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        }));
+        queue.submit([encoder.finish()]);
+        let id = [
+            [1., 0., 0., 0.],
+            [0., 1., 0., 0.],
+            [0., 0., 1., 0.],
+            [0., 0., 0., 1.],
+        ];
+        for i in 0..3 {
+            let frame = FrameConstants {
+                projection: id,
+                inverse_projection: id,
+                reprojection: id,
+                inverse_reprojection: id,
+                jitter_pixels: [0.; 2],
+                camera: [[0.; 3], [0., 1., 0.], [1., 0., 0.], [0., 0., -1.]],
+                near: 0.05,
+                far: 1000.,
+                fov: 1.2,
+                aspect: 640. / 360.,
+                reset: i == 0,
+            };
+            let output = sr.evaluate(&color, &depth, &motion, frame).unwrap();
+            let read = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 256,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: output.texture(),
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 320,
+                        y: 180,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &read,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit([encoder.finish()]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            read.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                tx.send(r).unwrap();
+            });
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            rx.recv().unwrap().unwrap();
+            let pixels = read.slice(..).get_mapped_range().unwrap();
+            println!("DirectX 12 frame {i}: {:?}", &pixels[..8]);
             for (n, expected) in [0x3400u16, 0x3800, 0x3a00, 0x3c00].into_iter().enumerate() {
                 let actual = u16::from_le_bytes([pixels[n * 2], pixels[n * 2 + 1]]);
                 assert!(

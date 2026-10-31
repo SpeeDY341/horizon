@@ -7,11 +7,16 @@ pub(super) type Shared = std::sync::Arc<std::sync::Mutex<horizon_streamline::Run
 pub(super) type Shared = ();
 
 pub(super) fn load(enabled: bool, backend: wgpu::Backends) -> Option<Shared> {
-    if !enabled || backend != wgpu::Backends::VULKAN {
+    if !enabled || !matches!(backend, wgpu::Backends::VULKAN | wgpu::Backends::DX12) {
         return None;
     }
     #[cfg(target_os = "windows")]
     {
+        let api = if backend == wgpu::Backends::DX12 {
+            horizon_streamline::Api::Dx12
+        } else {
+            horizon_streamline::Api::Vulkan
+        };
         let path = std::env::var_os("HORIZON_STREAMLINE_SDK")
             .map(std::path::PathBuf::from)
             .or_else(|| {
@@ -22,7 +27,11 @@ pub(super) fn load(enabled: bool, backend: wgpu::Backends) -> Option<Shared> {
         let result = path
             .ok_or("Streamline directory missing".to_owned())
             .and_then(|p| {
-                horizon_streamline::Runtime::load(&p, "00a6bdb2-6386-4e37-8ff9-dcda4642628a")
+                horizon_streamline::Runtime::load_for(
+                    &p,
+                    "00a6bdb2-6386-4e37-8ff9-dcda4642628a",
+                    api,
+                )
             });
         match result {
             Ok(runtime) => Some(std::sync::Arc::new(std::sync::Mutex::new(runtime))),
@@ -67,11 +76,11 @@ impl State {
             failure: None,
             startup_failure: if !cfg!(target_os = "windows") {
                 Some("TAA: Windows".into())
-            } else if info.backend != wgpu::Backend::Vulkan
+            } else if !matches!(info.backend, wgpu::Backend::Vulkan | wgpu::Backend::Dx12)
                 || info.vendor != 0x10de
                 || !info.name.to_ascii_uppercase().contains("RTX")
             {
-                Some("TAA: Vulkan RTX".into())
+                Some("TAA: RTX".into())
             } else {
                 requested
                     .then(graphics::dlss_status)
@@ -339,13 +348,26 @@ mod tests {
     #[test]
     fn unsupported_adapters_keep_an_accurate_fallback_reason() {
         for info in [
-            adapter(wgpu::Backend::Dx12, 0x10de, "RTX 5090"),
+            adapter(wgpu::Backend::Dx12, 0x1002, "Radeon"),
             adapter(wgpu::Backend::Vulkan, 0x1002, "Radeon"),
+            adapter(wgpu::Backend::Gl, 0x10de, "RTX 5090"),
         ] {
             let mut state = State::new(None, true, &info);
             state.set(Dlss::Quality);
             assert!(state.startup_failure.as_ref().unwrap().starts_with("TAA:"));
             assert!(state.configuration.is_none());
+        }
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn directx12_and_vulkan_rtx_can_host_dlss() {
+        for backend in [wgpu::Backend::Dx12, wgpu::Backend::Vulkan] {
+            let state = State::new(
+                None,
+                false,
+                &adapter(backend, 0x10de, "NVIDIA GeForce RTX 5090"),
+            );
+            assert!(state.startup_failure.is_none(), "{backend:?}");
         }
     }
     #[cfg(target_os = "windows")]

@@ -430,16 +430,18 @@ pub struct ScreenshotRequest {
     pub size: Option<[u32; 2]>,
 }
 pub struct Renderer {
-    streamline: Option<dlss::Shared>,
-    dlss: dlss::State,
-    instance: wgpu::Instance,
-    adapter: wgpu::Adapter,
     /// The window's swapchain; `None` when rendering offscreen (`--offscreen`).
+    /// Declared before Streamline so a DirectX 12 swapchain proxy is released
+    /// while Streamline is still loaded. Its `Release` calls back into it.
     surface: Option<wgpu::Surface<'static>>,
     /// The surface `release_surface` set aside for the renderer that replaces
     /// this one on the same device: reused, not created again, as a new
     /// surface for the window can come back lost (Wayland on Mesa).
     spare_surface: std::sync::Mutex<Option<wgpu::Surface<'static>>>,
+    streamline: Option<dlss::Shared>,
+    dlss: dlss::State,
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
     /// The offscreen colour target, sized like `config`.
     offscreen: Option<wgpu::Texture>,
     /// Offscreen submissions still on the GPU: at most two frames run ahead.
@@ -1106,7 +1108,7 @@ async fn open_with_retry(
     let first = match first {
         Err(NoDevice::Failed(e) | NoDevice::NoAdapter(e)) if enable_dlss => {
             crate::graphics::report_dlss("TAA: startup");
-            log::warn!("DLSS startup failed, retrying ordinary Vulkan: {e}");
+            log::warn!("DLSS startup failed, retrying without DLSS: {e}");
             open_backend(backends, window, offscreen, false, layers, false).await
         }
         result => result,
@@ -1276,6 +1278,21 @@ fn startup_step(step: std::fmt::Arguments) {
     log::info!("Horizon renderer: {step}");
     log::logger().flush();
 }
+/// Point the DirectX 12 swapchain at Streamline's proxy. Vulkan's interposer
+/// already owns presentation, and a failure here keeps the native swapchain.
+#[cfg(target_os = "windows")]
+fn note_dx12_swapchain(runtime: &Option<dlss::Shared>, surface: &wgpu::Surface<'_>) {
+    let Some(runtime) = runtime else {
+        return;
+    };
+    let hooked = match runtime.lock() {
+        Ok(mut runtime) => runtime.note_dx12_swapchain(surface),
+        Err(e) => Err(e.to_string()),
+    };
+    if let Err(e) = hooked {
+        log::warn!("DLSS DirectX 12 presentation hook failed: {e}");
+    }
+}
 /// How far the first frame on a new device got, for `startup_step`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FirstFrame {
@@ -1412,6 +1429,8 @@ impl Renderer {
                 ));
             }
             surface.configure(&device, &config);
+            #[cfg(target_os = "windows")]
+            note_dx12_swapchain(&streamline, surface);
             let hdr_output = hdr::output(&caps);
             crate::graphics::offer_hdr(hdr_output.is_some());
             if previous.is_none() {
@@ -2817,7 +2836,7 @@ impl Renderer {
         let depth = Self::depth(&device, &config);
         let world_post = world_post::Post::new(&device, config.format.remove_srgb_suffix());
         let info = adapter.get_info();
-        let motion = (info.backend == wgpu::Backend::Vulkan
+        let motion = (matches!(info.backend, wgpu::Backend::Vulkan | wgpu::Backend::Dx12)
             && info.vendor == 0x10de
             && info.name.to_ascii_uppercase().contains("RTX")
             && (streamline.is_some()
@@ -3625,6 +3644,8 @@ impl Renderer {
                 &self.surface_config(),
                 self.hdr.as_ref(),
             );
+            #[cfg(target_os = "windows")]
+            note_dx12_swapchain(&self.streamline, surface);
         }
     }
     fn send_hdr_metadata(&self) {
@@ -3727,7 +3748,7 @@ impl Renderer {
         crate::graphics::report(now);
         true
     }
-    /// Experimental data preparation is opt-in and restricted to Vulkan RTX.
+    /// Experimental data preparation is opt-in and restricted to Vulkan or DirectX 12 RTX.
     pub fn motion_vectors_enabled(&self) -> bool {
         self.motion.is_some()
             && (self.dlss.requested != crate::graphics::Dlss::Off

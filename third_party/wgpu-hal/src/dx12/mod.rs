@@ -651,6 +651,35 @@ impl Surface {
         Some(self.swap_chain.read().as_ref()?.raw.clone())
     }
 
+    /// Replace the stored swap chain with a proxy, for Streamline manual hooking.
+    ///
+    /// `upgrade` receives the current `IDXGISwapChain3` pointer. It returns that
+    /// same pointer, null on failure, or a new `IDXGISwapChain3`/`IDXGISwapChain4`
+    /// the caller owns (one reference). Streamline's proxy AddRefs the native
+    /// chain, so dropping the previous pointer leaves the proxy's reference.
+    ///
+    /// # Safety
+    /// A different non-null pointer must be an `IDXGISwapChain3` with exactly
+    /// one owned reference.
+    pub unsafe fn upgrade_swap_chain(
+        &self,
+        upgrade: impl FnOnce(*mut ffi::c_void) -> *mut ffi::c_void,
+    ) -> bool {
+        let mut guard = self.swap_chain.write();
+        let Some(chain) = guard.as_mut() else {
+            return false;
+        };
+        let native = chain.raw.as_raw();
+        let proxy = upgrade(native);
+        if proxy.is_null() {
+            return false;
+        }
+        if proxy != native {
+            chain.raw = unsafe { Dxgi::IDXGISwapChain3::from_raw(proxy) };
+        }
+        true
+    }
+
     /// Returns the waitable handle associated with this swap chain, if any.
     /// Handle is only valid while the swap chain is alive.
     pub unsafe fn waitable_handle(&self) -> Option<Foundation::HANDLE> {
@@ -717,6 +746,16 @@ unsafe impl Sync for Adapter {}
 impl Adapter {
     pub fn as_raw(&self) -> &Dxgi::IDXGIAdapter3 {
         &self.raw
+    }
+
+    /// DXGI adapter LUID, little-endian `LowPart` then `HighPart`.
+    pub fn adapter_luid(&self) -> Option<[u8; 8]> {
+        let desc = unsafe { self.raw.GetDesc2() }.ok()?;
+        let low = desc.AdapterLuid.LowPart.to_le_bytes();
+        let high = desc.AdapterLuid.HighPart.to_le_bytes();
+        Some([
+            low[0], low[1], low[2], low[3], high[0], high[1], high[2], high[3],
+        ])
     }
 }
 
@@ -815,6 +854,18 @@ pub struct Queue {
 impl Queue {
     pub fn as_raw(&self) -> &Direct3D12::ID3D12CommandQueue {
         &self.raw
+    }
+
+    /// Device that created this queue. Null if the device cannot be queried.
+    pub fn raw_device_ptr(&self) -> *mut ffi::c_void {
+        let mut device: Option<Direct3D12::ID3D12Device> = None;
+        if unsafe { self.raw.GetDevice(&mut device) }.is_err() {
+            return core::ptr::null_mut();
+        }
+        device
+            .as_ref()
+            .map(|device| device.as_raw())
+            .unwrap_or(core::ptr::null_mut())
     }
 
     /// Stage a `ID3D12CommandQueue::Wait(fence, value)` for the next
@@ -1003,6 +1054,13 @@ pub struct CommandEncoder {
     counters: Arc<wgt::HalCounters>,
 }
 
+impl CommandEncoder {
+    /// Open command list. Recording must not close it; `end_encoding` does that.
+    pub fn raw_open_command_list_ptr(&self) -> Option<*mut ffi::c_void> {
+        self.list.as_ref().map(|list| list.as_raw())
+    }
+}
+
 unsafe impl Send for CommandEncoder {}
 unsafe impl Sync for CommandEncoder {}
 
@@ -1079,6 +1137,10 @@ pub struct Texture {
 impl Texture {
     pub unsafe fn raw_resource(&self) -> &Direct3D12::ID3D12Resource {
         &self.resource
+    }
+
+    pub fn raw_resource_ptr(&self) -> *mut ffi::c_void {
+        self.resource.as_raw()
     }
 
     /// Pin the D3D12 plane slice for every view and copy derived from

@@ -43,7 +43,7 @@ if (!(Test-Path $options)) {
 }
 Write-Host 'DLSS test world. Sound is off. Settings in this folder are kept between launches.'
 Write-Host 'Esc, Options, Horizon Settings, Advanced Graphics: Anti-aliasing, Upscaler, Quality.'
-Write-Host 'Graphics API applies on the next launch. DLSS itself runs on Vulkan only.'
+Write-Host 'Graphics API applies on the next launch. DLSS runs on Vulkan and DirectX 12.'
 Write-Host ('Test files and log: ' + $scratch)
 Push-Location $root
 try {

@@ -56,7 +56,7 @@ Anti-aliasing cycles Off, FXAA and TAA (`fxaa` and `taa` in `horizon-graphics.tx
 
 Upscaling (`upscaling` in `horizon-graphics.txt`) renders the world smaller than the resolution scale's size and rebuilds it: Native 1×, Quality 1.5×, Balanced 1.7×, Performance 2× and Ultra Performance 3× fewer pixels along each axis (FSR's and DLSS's ratios). The built-in upscaler lets TAA rebuild that size. The jitter then runs over 8 frames per output pixel, and each frame counts in an output pixel by how near its sample lands. Textures keep the mipmap level of the smaller frame, so far blocks are softer than at Native.
 
-Anti-aliasing, the upscaler and that quality stay on the screen together. The upscaler is Standard (the built-in one) or DLSS (`dlss` in the same file). Quality is shared: while DLSS is selected it is the DLSS mode, and Native is full-resolution DLAA. Choosing TAA or FXAA selects Standard. Choosing DLSS sets anti-aliasing to Off. The built-in ratio applies while TAA is on.
+Anti-aliasing, the upscaler and that quality stay on the screen together. The upscaler is Standard (the built-in one) or DLSS (`dlss` in the same file). Quality is shared: while DLSS is selected it is the DLSS mode, and Native is full-resolution DLAA. Choosing TAA or FXAA selects Standard. Choosing DLSS sets anti-aliasing to Off. The built-in ratio applies while TAA is on. DLSS Super Resolution runs on Windows, on Vulkan and DirectX 12, on an NVIDIA RTX GPU, and stays off until it is selected.
 
 Not implemented: anisotropic filtering (wgpu needs linear magnification for it, which blurs close blocks), MSAA (FXAA or TAA instead) and exclusive fullscreen (fullscreen is borderless).
 

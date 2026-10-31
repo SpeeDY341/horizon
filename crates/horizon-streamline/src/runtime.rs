@@ -15,6 +15,13 @@ impl Drop for Lease {
     }
 }
 
+/// Which graphics API this process-global session was initialized for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Api {
+    Vulkan,
+    Dx12,
+}
+
 #[derive(Debug)]
 pub struct Requirements {
     pub instance_extensions: Vec<String>,
@@ -25,15 +32,21 @@ pub struct Requirements {
     pub graphics_queues: u32,
 }
 
-/// Initialized SDK, owned by the render thread. Must remain loaded throughout Vulkan use
-/// and be shut down after draining GPU work, before device destruction.
-/// This currently provides startup requirements, not a DLSS evaluation path.
+/// Initialized SDK, owned by the render thread. Must remain loaded while its
+/// device or a DirectX 12 swapchain proxy is in use, and be shut down after
+/// draining GPU work and releasing that proxy, before device destruction.
 pub struct Runtime {
+    api: Api,
     shutdown: abi::Shutdown,
     requirements: abi::GetRequirements,
     supported: abi::IsSupported,
+    set_d3d_device: abi::SetD3DDevice,
+    upgrade_interface: abi::UpgradeInterface,
     device: Option<wgpu::Device>,
     instance: Option<wgpu::Instance>,
+    /// Proxy swapchain last installed. A second upgrade of the same pointer is
+    /// rejected when manual hooking is on, and means the proxy is still in place.
+    dx12_swapchain: usize,
     directory: std::path::PathBuf,
     pub(crate) _library: libloading::os::windows::Library,
     _session: Lease,
@@ -42,7 +55,14 @@ pub struct Runtime {
 impl Runtime {
     /// Initialize from an explicitly selected SDK directory. Only the official
     /// production SDK belongs here. No PATH/current-directory DLL lookup.
+    /// Vulkan keeps the interposer in charge of its hooks.
     pub fn load(directory: &Path, project_id: &str) -> Result<Self, String> {
+        Self::load_for(directory, project_id, Api::Vulkan)
+    }
+
+    /// `api` selects Vulkan or DirectX 12 for this process. DirectX 12 uses
+    /// manual hooking: the host registers the device and the swapchain.
+    pub fn load_for(directory: &Path, project_id: &str, api: Api) -> Result<Self, String> {
         if !directory.is_absolute() {
             return Err("Streamline requires an absolute SDK directory".into());
         }
@@ -74,7 +94,7 @@ impl Runtime {
         .map_err(|e| e.to_string())?;
         // Resolve every required symbol before initialization, so a partial
         // incompatible DLL never leaves an initialized process-global SDK.
-        let (init, shutdown, requirements, loaded, supported) = unsafe {
+        let (init, shutdown, requirements, loaded, supported, set_d3d_device, upgrade_interface) = unsafe {
             (
                 *library
                     .get::<abi::Init>(b"slInit\0")
@@ -91,7 +111,19 @@ impl Runtime {
                 *library
                     .get::<abi::IsSupported>(b"slIsFeatureSupported\0")
                     .map_err(|e| e.to_string())?,
+                *library
+                    .get::<abi::SetD3DDevice>(b"slSetD3DDevice\0")
+                    .map_err(|e| e.to_string())?,
+                *library
+                    .get::<abi::UpgradeInterface>(b"slUpgradeInterface\0")
+                    .map_err(|e| e.to_string())?,
             )
+        };
+        // sl::RenderAPI: eD3D11 = 0, eD3D12 = 1, eVulkan = 2.
+        // PreferenceFlags: eDisableCLStateTracking = 1, eUseManualHooking = 4.
+        let (render_api, flags) = match api {
+            Api::Vulkan => (2, 1),
+            Api::Dx12 => (1, 1 | 4),
         };
         let wide: Vec<u16> = directory.as_os_str().encode_wide().chain(Some(0)).collect();
         let paths = [wide.as_ptr()];
@@ -112,14 +144,14 @@ impl Runtime {
             allocate: std::ptr::null(),
             release: std::ptr::null(),
             log: std::ptr::null(),
-            flags: 1, // No OTA or unrequested features; interposer manages Vulkan hooks.
+            flags,
             features: features.as_ptr(),
             feature_count: 1,
             app_id: 0,
             engine: 0,
             engine_version: c"Horizon 0.1".as_ptr(),
             project_id: project_id.as_ptr(),
-            render_api: 2,
+            render_api,
         };
         // Safety: ABI layout matches pinned headers; all pointers live through
         // slInit, whose contract copies preferences and strings internally.
@@ -137,11 +169,15 @@ impl Runtime {
             return Err(format!("Streamline did not load DLSS ({result})"));
         }
         Ok(Self {
+            api,
             shutdown,
             requirements,
             supported,
+            set_d3d_device,
+            upgrade_interface,
             device: None,
             instance: None,
+            dx12_swapchain: 0,
             directory,
             _library: library,
             _session: guard,
@@ -190,6 +226,24 @@ impl Runtime {
         if self.instance.is_some() {
             return Err("Streamline instance already created".into());
         }
+        if self.api == Api::Dx12 {
+            if desc.backends != wgpu::Backends::DX12 {
+                return Err(
+                    "Streamline DirectX 12 instance must use DirectX 12 exclusively".into(),
+                );
+            }
+            // DirectX 12 does not use the display handle. wgpu creates the
+            // device itself; Streamline sees it through slSetD3DDevice.
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: desc.backends,
+                flags: desc.flags,
+                memory_budget_thresholds: desc.memory_budget_thresholds,
+                backend_options: desc.backend_options.clone(),
+                display: None,
+            });
+            self.instance = Some(instance.clone());
+            return Ok(instance);
+        }
         if desc.backends != wgpu::Backends::VULKAN {
             return Err("Streamline instance must use Vulkan exclusively".into());
         }
@@ -219,6 +273,22 @@ impl Runtime {
         if self.device.is_some() {
             return Err("Streamline device already registered".into());
         }
+        if self.api == Api::Dx12 {
+            // Safety: the guard keeps the device alive. The pointer is the
+            // native ID3D12Device, which slSetD3DDevice copies from.
+            let ptr = unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }
+                .ok_or("DirectX 12 device missing")?
+                .raw_device_ptr();
+            if ptr.is_null() {
+                return Err("DirectX 12 device missing".into());
+            }
+            let result = unsafe { (self.set_d3d_device)(ptr) };
+            if result != 0 {
+                return Err(format!("Streamline device registration failed ({result})"));
+            }
+            self.device = Some(device.clone());
+            return Ok(());
+        }
         let instance = self
             .instance
             .as_ref()
@@ -246,39 +316,98 @@ impl Runtime {
         self.device.as_ref()
     }
 
-    /// Checks the actual physical adapter before device creation. A successful
-    /// result still requires a correctly created Vulkan device and DLSS setup.
+    /// Checks the actual adapter before device creation. A successful result
+    /// still requires the device to be registered and DLSS to be set up.
     pub fn check_adapter(&self, adapter: &wgpu::Adapter) -> Result<(), String> {
-        use ash::vk::Handle;
         let info = adapter.get_info();
-        if !crate::eligible(
-            info.backend == wgpu::Backend::Vulkan,
-            info.vendor,
-            &info.name,
-        ) {
-            return Err("DLSS requires Vulkan on an NVIDIA RTX adapter".into());
+        let supported = matches!(info.backend, wgpu::Backend::Vulkan | wgpu::Backend::Dx12);
+        if !crate::eligible(supported, info.vendor, &info.name) {
+            return Err("DLSS requires Vulkan or DirectX 12 on an NVIDIA RTX adapter".into());
         }
-        // Safety: read-only native access; the guard and adapter keep it alive.
-        let native = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }
-            .ok_or("Vulkan adapter unavailable")?;
-        let info = abi::AdapterInfo {
-            base: abi::Base::new(
-                0x0677315f,
-                0xa746,
-                0x4492,
-                [0x9f, 0x42, 0xcb, 0x61, 0x42, 0xc9, 0xc3, 0xd4],
-                1,
-            ),
-            luid: std::ptr::null(),
-            luid_size: 0,
-            physical_device: native.raw_physical_device().as_raw() as *mut std::ffi::c_void,
+        let matches_session = match self.api {
+            Api::Vulkan => info.backend == wgpu::Backend::Vulkan,
+            Api::Dx12 => info.backend == wgpu::Backend::Dx12,
         };
-        // Safety: matching SDK ABI, live physical device and initialized SDK.
-        let result = unsafe { (self.supported)(0, &info) };
+        if !matches_session {
+            return Err("DLSS graphics API does not match this adapter".into());
+        }
+        let base = abi::Base::new(
+            0x0677315f,
+            0xa746,
+            0x4492,
+            [0x9f, 0x42, 0xcb, 0x61, 0x42, 0xc9, 0xc3, 0xd4],
+            1,
+        );
+        // Safety: matching SDK ABI. The hal guard and adapter stay alive across
+        // the call. A Vulkan physical device makes Streamline ignore the LUID.
+        let result = if self.api == Api::Dx12 {
+            let native = unsafe { adapter.as_hal::<wgpu::hal::api::Dx12>() }
+                .ok_or("DirectX 12 adapter unavailable")?;
+            let luid = native
+                .adapter_luid()
+                .ok_or("DirectX 12 adapter LUID unavailable")?;
+            let adapter_info = abi::AdapterInfo {
+                base,
+                luid: luid.as_ptr(),
+                luid_size: 8,
+                physical_device: std::ptr::null_mut(),
+            };
+            unsafe { (self.supported)(0, &adapter_info) }
+        } else {
+            use ash::vk::Handle;
+            let native = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }
+                .ok_or("Vulkan adapter unavailable")?;
+            let adapter_info = abi::AdapterInfo {
+                base,
+                luid: std::ptr::null(),
+                luid_size: 0,
+                physical_device: native.raw_physical_device().as_raw() as *mut std::ffi::c_void,
+            };
+            unsafe { (self.supported)(0, &adapter_info) }
+        };
         if result == 0 {
             Ok(())
         } else {
             Err(format!("DLSS unsupported on this adapter ({result})"))
+        }
+    }
+
+    /// Install Streamline's DirectX 12 swapchain proxy so Present retires
+    /// frame tokens. No-op on Vulkan, where the interposer already does this.
+    /// Failure leaves the native swapchain in place.
+    pub fn note_dx12_swapchain(&mut self, surface: &wgpu::Surface) -> Result<(), String> {
+        if self.api != Api::Dx12 {
+            return Ok(());
+        }
+        let upgrade = self.upgrade_interface;
+        let known = self.dx12_swapchain;
+        // Safety: the surface guard keeps the hal surface alive. The callback
+        // only calls slUpgradeInterface and does not record commands.
+        let hal = unsafe { surface.as_hal::<wgpu::hal::api::Dx12>() }
+            .ok_or("DirectX 12 surface missing")?;
+        let mut installed = 0usize;
+        let ok = unsafe {
+            hal.upgrade_swap_chain(|native| {
+                let mut ptr = native;
+                let code = upgrade(&mut ptr);
+                if code == 0 && !ptr.is_null() {
+                    installed = ptr as usize;
+                    return ptr;
+                }
+                // Manual hooking rejects a second upgrade of a live proxy and
+                // leaves the pointer unchanged.
+                if !native.is_null() && native as usize == known {
+                    installed = known;
+                    return native;
+                }
+                std::ptr::null_mut()
+            })
+        };
+        if ok {
+            self.dx12_swapchain = installed;
+            Ok(())
+        } else {
+            Err("Streamline did not hook the DirectX 12 swapchain".into())
         }
     }
 

@@ -131,6 +131,8 @@ impl Requirements {
 }
 pub type Init = unsafe extern "C" fn(*const Preferences, u64) -> i32;
 pub type Shutdown = unsafe extern "C" fn() -> i32;
+pub type SetD3DDevice = unsafe extern "C" fn(*mut c_void) -> i32;
+pub type UpgradeInterface = unsafe extern "C" fn(*mut *mut c_void) -> i32;
 pub type IsLoaded = unsafe extern "C" fn(u32, *mut bool) -> i32;
 #[repr(C)]
 pub struct AdapterInfo {

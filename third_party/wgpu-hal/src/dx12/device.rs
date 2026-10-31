@@ -458,6 +458,10 @@ impl super::Device {
         &self.raw
     }
 
+    pub fn raw_device_ptr(&self) -> *mut ffi::c_void {
+        self.raw.as_raw()
+    }
+
     pub fn raw_queue(&self) -> &Direct3D12::ID3D12CommandQueue {
         &self.present_queue
     }
