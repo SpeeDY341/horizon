@@ -398,6 +398,47 @@ impl Dlss {
             .unwrap_or_default()
     }
 }
+
+/// NVIDIA Reflex. Off until the player turns it on. The SDK loads only at the
+/// next start, and it never replaces the game's own frame cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Reflex {
+    #[default]
+    Off,
+    On,
+    Boost,
+}
+impl Reflex {
+    pub const ALL: [Self; 3] = [Self::Off, Self::On, Self::Boost];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Boost => "boost",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::On => "On",
+            Self::Boost => "On + Boost",
+        }
+    }
+    /// Streamline's ReflexMode: off, low latency, low latency with boost.
+    pub fn sdk(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::On => 1,
+            Self::Boost => 2,
+        }
+    }
+    fn parse(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|v| v.name() == s)
+            .unwrap_or_default()
+    }
+}
 static DLSS_STATUS: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 pub fn report_dlss(status: impl Into<String>) {
     *DLSS_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = status.into();
@@ -408,6 +449,20 @@ pub fn dlss_status() -> String {
         "Off".into()
     } else {
         s.clone()
+    }
+}
+
+static REFLEX_LINE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// The latency line for the performance overlay. Empty hides it.
+pub fn report_reflex(line: impl Into<String>) {
+    *REFLEX_LINE.lock().unwrap_or_else(|e| e.into_inner()) = line.into();
+}
+pub fn reflex_overlay_line() -> Option<String> {
+    let line = REFLEX_LINE.lock().unwrap_or_else(|e| e.into_inner());
+    if line.is_empty() {
+        None
+    } else {
+        Some(line.clone())
     }
 }
 
@@ -492,6 +547,8 @@ pub struct Graphics {
     pub dlss: Dlss,
     pub dlss_preset: DlssPreset,
     pub dlss_monitor: bool,
+    /// Reflex low latency. Off until chosen. The first On needs a restart.
+    pub reflex: Reflex,
     /// HDR output (HDR10, or scRGB), where the display path offers it.
     pub hdr: bool,
     /// HDR paper white (where SDR white sits), in nits; 0 is Auto: the desktop's SDR
@@ -544,6 +601,7 @@ impl Default for Graphics {
             dlss: Dlss::Off,
             dlss_preset: DlssPreset::Auto,
             dlss_monitor: false,
+            reflex: Reflex::Off,
             hdr: false,
             hdr_paper_white: 0,
             hdr_peak: 0,
@@ -620,6 +678,7 @@ impl Graphics {
                 "dlss" => g.dlss = Dlss::parse(value),
                 "dlssPreset" => g.dlss_preset = DlssPreset::parse(value),
                 "dlssMonitor" => g.dlss_monitor = flag(g.dlss_monitor),
+                "reflex" => g.reflex = Reflex::parse(value),
                 "hdr" => g.hdr = flag(g.hdr),
                 "hdrPaperWhite" => {
                     g.hdr_paper_white = match number(g.hdr_paper_white) {
@@ -653,9 +712,7 @@ impl Graphics {
         }
         // Older menus stored the DLSS quality separately and could hide the
         // shared quality. The DLSS value was the one on screen, so it wins.
-        if !upscaling_off
-            && let Some(quality) = g.dlss.quality()
-        {
+        if !upscaling_off && let Some(quality) = g.dlss.quality() {
             g.upscaling = quality;
             g.fxaa = false;
             g.taa = false;
@@ -717,7 +774,7 @@ impl Graphics {
     }
     pub fn serialize(&self) -> String {
         format!(
-            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\ndlss:{}\ndlssPreset:{}\ndlssMonitor:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrKey:{}\nbatteryMode:{}\ngraphicsApi:{}\npickedShaderPack:{}\n",
+            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\ndlss:{}\ndlssPreset:{}\ndlssMonitor:{}\nreflex:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrKey:{}\nbatteryMode:{}\ngraphicsApi:{}\npickedShaderPack:{}\n",
             self.preset.name(),
             self.lod_distance,
             self.far_detail.name(),
@@ -747,6 +804,7 @@ impl Graphics {
             self.dlss.name(),
             self.dlss_preset.name(),
             bool_text(self.dlss_monitor),
+            self.reflex.name(),
             bool_text(self.hdr),
             self.hdr_paper_white,
             self.hdr_peak,
@@ -894,6 +952,7 @@ mod tests {
             dlss: Dlss::Quality,
             dlss_preset: DlssPreset::M,
             dlss_monitor: true,
+            reflex: Reflex::Boost,
             hdr: true,
             hdr_paper_white: 240,
             hdr_peak: 1400,
@@ -918,7 +977,13 @@ mod tests {
         assert_eq!(off.dlss, Dlss::Quality);
         assert_eq!(off.dlss_mode(), Dlss::Off);
         assert!(off.taa);
-        assert_eq!(Graphics::parse("upscaling:nope\n").upscaling, Upscaling::Native);
+        assert_eq!(
+            Graphics::parse("upscaling:nope\n").upscaling,
+            Upscaling::Native
+        );
+        assert_eq!(Graphics::parse("reflex:boost\n").reflex, Reflex::Boost);
+        assert_eq!(Graphics::parse("reflex:on\n").reflex, Reflex::On);
+        assert_eq!(Graphics::parse("reflex:nope\n").reflex, Reflex::Off);
         let mut chosen = Graphics::default();
         chosen.select_dlss_upscaler();
         chosen.set_upscale_quality(Upscaling::Off);

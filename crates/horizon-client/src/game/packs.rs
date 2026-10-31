@@ -273,6 +273,7 @@ impl Game<'_> {
                     Some(textures),
                     self.settings.horizon.api,
                     self.settings.horizon.dlss != horizon_client::graphics::Dlss::Off,
+                    self.settings.horizon.reflex,
                 )
             })
             .transpose()

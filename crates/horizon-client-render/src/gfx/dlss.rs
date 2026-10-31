@@ -6,8 +6,8 @@ pub(super) type Shared = std::sync::Arc<std::sync::Mutex<horizon_streamline::Run
 #[cfg(not(target_os = "windows"))]
 pub(super) type Shared = ();
 
-pub(super) fn load(enabled: bool, backend: wgpu::Backends) -> Option<Shared> {
-    if !enabled || !matches!(backend, wgpu::Backends::VULKAN | wgpu::Backends::DX12) {
+pub(super) fn load(dlss: bool, reflex: bool, backend: wgpu::Backends) -> Option<Shared> {
+    if (!dlss && !reflex) || !matches!(backend, wgpu::Backends::VULKAN | wgpu::Backends::DX12) {
         return None;
     }
     #[cfg(target_os = "windows")]
@@ -27,24 +27,37 @@ pub(super) fn load(enabled: bool, backend: wgpu::Backends) -> Option<Shared> {
         let result = path
             .ok_or("Streamline directory missing".to_owned())
             .and_then(|p| {
-                horizon_streamline::Runtime::load_for(
+                horizon_streamline::Runtime::load_with(
                     &p,
                     "00a6bdb2-6386-4e37-8ff9-dcda4642628a",
                     api,
+                    dlss,
+                    reflex,
                 )
             });
         match result {
-            Ok(runtime) => Some(std::sync::Arc::new(std::sync::Mutex::new(runtime))),
+            Ok(runtime) => {
+                if reflex && !runtime.reflex_requested() {
+                    log::warn!("Reflex plugins were not found beside the Streamline SDK");
+                }
+                let shared = std::sync::Arc::new(std::sync::Mutex::new(runtime));
+                horizon_streamline::install_reflex(&shared);
+                Some(shared)
+            }
             Err(e) => {
-                graphics::report_dlss("TAA: SDK error");
-                log::warn!("DLSS unavailable: {e}");
+                if dlss {
+                    graphics::report_dlss("TAA: SDK error");
+                }
+                log::warn!("Streamline unavailable: {e}");
                 None
             }
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        graphics::report_dlss("TAA: Windows");
+        if dlss {
+            graphics::report_dlss("TAA: Windows");
+        }
         None
     }
 }

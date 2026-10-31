@@ -58,6 +58,8 @@ Upscaling (`upscaling` in `horizon-graphics.txt`) renders the world smaller than
 
 Anti-aliasing, the upscaler and that quality stay on the screen together. The upscaler is Standard (the built-in one) or DLSS (`dlss` in the same file). Quality is shared: Off runs neither upscaler, and while DLSS is selected any other quality is the DLSS mode. Native is full-resolution DLAA. Choosing TAA or FXAA selects Standard. Choosing DLSS sets anti-aliasing to Off. The built-in ratio applies while TAA is on. DLSS Super Resolution runs on Windows, on Vulkan and DirectX 12, on an NVIDIA RTX GPU, and stays off until it is selected.
 
+Reflex (`reflex` in the same file) is Off, On, or On + Boost. It is off by default, runs on that same Windows Vulkan and DirectX 12 path, leaves the frame cap where it is, and needs one restart the first time it is turned on. The performance overlay then shows the latency the library reports; zero means the frame markers are wrong.
+
 Not implemented: anisotropic filtering (wgpu needs linear magnification for it, which blurs close blocks), MSAA (FXAA or TAA instead) and exclusive fullscreen (fullscreen is borderless).
 
 ## Benchmark

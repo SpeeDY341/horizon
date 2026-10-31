@@ -371,6 +371,9 @@ impl Game<'_> {
     /// run. The native server tick hook brackets it (`ServerTickStart` before
     /// the first level, `ServerTickEnd` after the last).
     pub(super) fn tick_server(&mut self, paused: bool) -> Result<()> {
+        // Reflex's simulation interval belongs to the frame on screen. This
+        // claims that frame only when the window has not already marked it.
+        let _reflex = horizon_client::gfx::reflex_server_tick();
         // `tickRateManager.tick()` once per server tick, before any level
         // (each `ServerLevel.tick` only reads `runsNormally`), and the native
         // `ServerTickStart` before that level work, where NeoForge fires

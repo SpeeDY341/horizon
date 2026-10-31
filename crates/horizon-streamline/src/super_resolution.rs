@@ -326,9 +326,14 @@ impl SuperResolution {
             flags: [1, 1, 0, u8::from(frame.reset), 0, 0, 0],
             separation: 40.,
         };
-        let mut token = std::ptr::null_mut();
-        unsafe {
-            check((self.api.token)(&mut token, std::ptr::null()))?;
+        // Reflex, when it is marking this presented frame, already owns the
+        // token. A second token would make Super Resolution and the present
+        // disagree. With Reflex off, this is null and DLSS allocates its own.
+        let mut token = _session.frame_token();
+        if token.is_null() {
+            unsafe {
+                check((self.api.token)(&mut token, std::ptr::null()))?;
+            }
         }
         if token.is_null() {
             return Err("DLSS returned no frame token".into());

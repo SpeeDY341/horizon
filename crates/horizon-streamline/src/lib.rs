@@ -41,3 +41,22 @@ mod tests {
 mod monitor;
 #[cfg(target_os = "windows")]
 pub use monitor::Performance;
+
+#[cfg(target_os = "windows")]
+mod reflex;
+#[cfg(target_os = "windows")]
+pub use reflex::{ReflexServerTick, install as install_reflex, reflex_server_tick};
+
+/// No Reflex session exists off Windows. The server tick runs unchanged.
+#[cfg(not(target_os = "windows"))]
+pub struct ReflexServerTick;
+
+#[cfg(not(target_os = "windows"))]
+impl Drop for ReflexServerTick {
+    fn drop(&mut self) {}
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn reflex_server_tick() -> ReflexServerTick {
+    ReflexServerTick
+}

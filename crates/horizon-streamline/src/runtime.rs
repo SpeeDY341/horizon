@@ -48,6 +48,8 @@ pub struct Runtime {
     /// rejected when manual hooking is on, and means the proxy is still in place.
     dx12_swapchain: usize,
     directory: std::path::PathBuf,
+    reflex: crate::reflex::Session,
+    dlss_requested: bool,
     pub(crate) _library: libloading::os::windows::Library,
     _session: Lease,
 }
@@ -62,7 +64,20 @@ impl Runtime {
 
     /// `api` selects Vulkan or DirectX 12 for this process. DirectX 12 uses
     /// manual hooking: the host registers the device and the swapchain.
+    /// Super Resolution only. Reflex stays unloaded.
     pub fn load_for(directory: &Path, project_id: &str, api: Api) -> Result<Self, String> {
+        Self::load_with(directory, project_id, api, true, false)
+    }
+
+    /// `dlss` and `reflex` choose which plugins this process loads. A plugin
+    /// that is not requested is not loaded. DirectX 12 uses manual hooking.
+    pub fn load_with(
+        directory: &Path,
+        project_id: &str,
+        api: Api,
+        dlss: bool,
+        reflex: bool,
+    ) -> Result<Self, String> {
         if !directory.is_absolute() {
             return Err("Streamline requires an absolute SDK directory".into());
         }
@@ -127,7 +142,22 @@ impl Runtime {
         };
         let wide: Vec<u16> = directory.as_os_str().encode_wide().chain(Some(0)).collect();
         let paths = [wide.as_ptr()];
-        let features = [0u32]; // Super Resolution only.
+        // Feature ids: DLSS 0, Reflex 3, PCL 4. Reflex's own latency DLL is
+        // unsigned and is never placed beside these plugins.
+        let mut features = Vec::new();
+        if dlss {
+            features.push(0u32);
+        }
+        let reflex = reflex
+            && directory.join("sl.reflex.dll").is_file()
+            && directory.join("sl.pcl.dll").is_file();
+        if reflex {
+            features.push(3);
+            features.push(4);
+        }
+        if features.is_empty() {
+            return Err("Streamline has no requested plugins".into());
+        }
         let preferences = abi::Preferences {
             base: abi::Base::new(
                 0x1ca10965,
@@ -146,7 +176,7 @@ impl Runtime {
             log: std::ptr::null(),
             flags,
             features: features.as_ptr(),
-            feature_count: 1,
+            feature_count: features.len() as u32,
             app_id: 0,
             engine: 0,
             engine_version: c"Horizon 0.1".as_ptr(),
@@ -161,12 +191,27 @@ impl Runtime {
         }
         let mut dlss_loaded = false;
         // Safety: initialized SDK, valid writable bool and loaded function ABI.
-        let result = unsafe { loaded(0, &mut dlss_loaded) };
-        if result != 0 || !dlss_loaded {
-            unsafe {
-                shutdown();
+        if dlss {
+            let result = unsafe { loaded(0, &mut dlss_loaded) };
+            if result != 0 || !dlss_loaded {
+                unsafe {
+                    shutdown();
+                }
+                return Err(format!("Streamline did not load DLSS ({result})"));
             }
-            return Err(format!("Streamline did not load DLSS ({result})"));
+        }
+        if reflex {
+            let (mut reflex_loaded, mut pcl_loaded) = (false, false);
+            let reflex_code = unsafe { loaded(3, &mut reflex_loaded) };
+            let pcl_code = unsafe { loaded(4, &mut pcl_loaded) };
+            if reflex_code != 0 || pcl_code != 0 || !reflex_loaded || !pcl_loaded {
+                unsafe {
+                    shutdown();
+                }
+                return Err(format!(
+                    "Streamline did not load Reflex ({reflex_code}/{pcl_code})"
+                ));
+            }
         }
         Ok(Self {
             api,
@@ -179,9 +224,78 @@ impl Runtime {
             instance: None,
             dx12_swapchain: 0,
             directory,
+            reflex: crate::reflex::Session::new(reflex),
+            dlss_requested: dlss,
             _library: library,
             _session: guard,
         })
+    }
+
+    pub fn dlss_requested(&self) -> bool {
+        self.dlss_requested
+    }
+
+    pub fn reflex_requested(&self) -> bool {
+        self.reflex.requested()
+    }
+
+    /// Plugins are loaded and their functions were found after the device existed.
+    pub fn reflex_loaded(&self) -> bool {
+        self.reflex.loaded()
+    }
+
+    pub fn reflex_open(&self) -> bool {
+        self.reflex.is_open()
+    }
+
+    pub fn set_reflex_mode(&mut self, mode: u32) {
+        self.reflex.set_mode(mode);
+    }
+
+    /// Start the presented frame. Sleeps only when this token was not already
+    /// slept at the previous present. `allow_sleep` is false offscreen.
+    pub fn reflex_begin(&mut self, allow_sleep: bool) {
+        self.reflex.begin(allow_sleep);
+    }
+
+    pub fn reflex_end_simulation(&mut self) {
+        self.reflex.end_simulation();
+    }
+
+    pub fn reflex_submit(&mut self, start: bool) {
+        self.reflex.submit(start);
+    }
+
+    pub fn reflex_present(&mut self, start: bool) {
+        self.reflex.present(start);
+    }
+
+    pub fn reflex_abandon_if_open(&mut self) {
+        self.reflex.abandon_if_open();
+    }
+
+    /// The token of the frame on screen, or null when Reflex is not marking it.
+    /// DLSS must reuse this token instead of allocating another one.
+    pub(crate) fn frame_token(&self) -> *mut std::ffi::c_void {
+        self.reflex.token()
+    }
+
+    pub fn reflex_line(&self) -> String {
+        self.reflex.line()
+    }
+
+    pub fn take_reflex_error(&mut self) -> Option<String> {
+        self.reflex.take_error()
+    }
+
+    /// Mark simulation on the server thread only when the window has not
+    /// already done it for this presented frame. Returns the token address.
+    pub(crate) fn reflex_claim_server(&mut self) -> Option<usize> {
+        self.reflex.claim_server()
+    }
+
+    pub(crate) fn reflex_finish_server(&mut self, token: usize) {
+        self.reflex.finish_server(token);
     }
 
     /// Versions reported by the initialized DLSS plugin, not file names.
@@ -287,6 +401,7 @@ impl Runtime {
                 return Err(format!("Streamline device registration failed ({result})"));
             }
             self.device = Some(device.clone());
+            self.bind_reflex();
             return Ok(());
         }
         let instance = self
@@ -309,7 +424,16 @@ impl Runtime {
         // vkCreateDevice came from the interposer: it already registered and
         // initialized the device. slSetVulkanInfo is for manual hooking only.
         self.device = Some(device.clone());
+        self.bind_reflex();
         Ok(())
+    }
+
+    /// Feature functions exist only after the device is registered. A Reflex
+    /// failure leaves the device usable and the frame path unchanged.
+    fn bind_reflex(&mut self) {
+        if let Err(error) = self.reflex.bind(&self._library) {
+            self.reflex.fail(error);
+        }
     }
 
     pub(crate) fn registered_device(&self) -> Option<&wgpu::Device> {

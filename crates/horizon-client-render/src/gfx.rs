@@ -440,6 +440,9 @@ pub struct Renderer {
     spare_surface: std::sync::Mutex<Option<wgpu::Surface<'static>>>,
     streamline: Option<dlss::Shared>,
     dlss: dlss::State,
+    /// Reflex as saved. The SDK is loaded only when this was On or Boost at startup.
+    reflex_mode: crate::graphics::Reflex,
+    reflex_loaded: bool,
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     /// The offscreen colour target, sized like `config`.
@@ -1066,6 +1069,7 @@ async fn open_device(
     api: GraphicsApi,
     layers: u32,
     enable_dlss: bool,
+    enable_reflex: bool,
 ) -> Result<Opened> {
     let order = backend_order(
         api.with_env(),
@@ -1078,7 +1082,16 @@ async fn open_device(
         if attempt > 0 {
             log::warn!("Horizon renderer: trying {name} ({})", failures.join("; "));
         }
-        match open_with_retry(backends, window, offscreen, layers, enable_dlss).await {
+        match open_with_retry(
+            backends,
+            window,
+            offscreen,
+            layers,
+            enable_dlss,
+            enable_reflex,
+        )
+        .await
+        {
             Ok(opened) => return Ok(opened),
             Err(e) => failures.push(e),
         }
@@ -1103,13 +1116,24 @@ async fn open_with_retry(
     offscreen: bool,
     layers: u32,
     enable_dlss: bool,
+    enable_reflex: bool,
 ) -> std::result::Result<Opened, String> {
-    let first = open_backend(backends, window, offscreen, false, layers, enable_dlss).await;
+    let first = open_backend(
+        backends,
+        window,
+        offscreen,
+        false,
+        layers,
+        enable_dlss,
+        enable_reflex,
+    )
+    .await;
+    let streamline = enable_dlss || enable_reflex;
     let first = match first {
-        Err(NoDevice::Failed(e) | NoDevice::NoAdapter(e)) if enable_dlss => {
+        Err(NoDevice::Failed(e) | NoDevice::NoAdapter(e)) if streamline => {
             crate::graphics::report_dlss("TAA: startup");
-            log::warn!("DLSS startup failed, retrying without DLSS: {e}");
-            open_backend(backends, window, offscreen, false, layers, false).await
+            log::warn!("Streamline startup failed, retrying without it: {e}");
+            open_backend(backends, window, offscreen, false, layers, false, false).await
         }
         result => result,
     };
@@ -1120,7 +1144,7 @@ async fn open_with_retry(
                  ones wgpu hides as non-conformant",
                 backends_name(backends)
             );
-            match open_backend(backends, window, offscreen, true, layers, false).await {
+            match open_backend(backends, window, offscreen, true, layers, false, false).await {
                 Ok(opened) => {
                     log::warn!(
                         "Horizon renderer: using {} although its driver reports no Vulkan \
@@ -1145,9 +1169,10 @@ async fn open_backend(
     allow_nonconformant: bool,
     layers: u32,
     enable_dlss: bool,
+    enable_reflex: bool,
 ) -> std::result::Result<Opened, NoDevice> {
     let name = backends_name(backends);
-    let streamline = dlss::load(enable_dlss, backends);
+    let streamline = dlss::load(enable_dlss, enable_reflex, backends);
     let descriptor = instance_descriptor(backends, Some(window), allow_nonconformant);
     #[cfg(target_os = "windows")]
     let instance = match &streamline {
@@ -1182,11 +1207,14 @@ async fn open_backend(
     };
     #[cfg(target_os = "windows")]
     if let Some(runtime) = &streamline {
-        runtime
+        let runtime = runtime
             .lock()
-            .map_err(|e| NoDevice::Failed(e.to_string()))?
-            .check_adapter(&adapter)
-            .map_err(NoDevice::Failed)?;
+            .map_err(|e| NoDevice::Failed(e.to_string()))?;
+        // Reflex-only startup did not load the DLSS plugin, so its adapter
+        // query would fail and take the device down with it.
+        if runtime.dlss_requested() {
+            runtime.check_adapter(&adapter).map_err(NoDevice::Failed)?;
+        }
     }
     describe_adapter(&adapter);
     let info = adapter.get_info();
@@ -1278,6 +1306,11 @@ fn startup_step(step: std::fmt::Arguments) {
     log::info!("Horizon renderer: {step}");
     log::logger().flush();
 }
+/// Brackets one server tick with a Reflex simulation marker when the window
+/// has not already marked the frame that will be presented.
+pub fn reflex_server_tick() -> horizon_streamline::ReflexServerTick {
+    horizon_streamline::reflex_server_tick()
+}
 /// Point the DirectX 12 swapchain at Streamline's proxy. Vulkan's interposer
 /// already owns presentation, and a failure here keeps the native swapchain.
 #[cfg(target_os = "windows")]
@@ -1347,6 +1380,7 @@ impl Renderer {
         previous: Option<&Self>,
         api: GraphicsApi,
         enable_dlss: bool,
+        reflex: crate::graphics::Reflex,
     ) -> Result<Self> {
         let split = sprite_split();
         if layers > split * SPRITE_ARRAYS {
@@ -1391,7 +1425,17 @@ impl Renderer {
                     queue: renderer.queue.clone(),
                 }
             }
-            None => open_device(&window, offscreen, api, layers, enable_dlss).await?,
+            None => {
+                open_device(
+                    &window,
+                    offscreen,
+                    api,
+                    layers,
+                    enable_dlss,
+                    reflex != crate::graphics::Reflex::Off,
+                )
+                .await?
+            }
         };
         let info = adapter.get_info();
         crate::graphics::suggest_reduced_far_detail(crate::graphics::lod_capped(&info));
@@ -2864,7 +2908,16 @@ impl Renderer {
                 on_off(gpu_timer.is_some()),
             ));
         }
-        Ok(Self {
+        #[cfg(target_os = "windows")]
+        let reflex_loaded = streamline.as_ref().is_some_and(|runtime| {
+            runtime
+                .lock()
+                .ok()
+                .is_some_and(|runtime| runtime.reflex_loaded())
+        });
+        #[cfg(not(target_os = "windows"))]
+        let reflex_loaded = false;
+        let mut renderer = Self {
             dlss: dlss::State::new(streamline.clone(), enable_dlss, &info),
             streamline,
             display: DisplayWatch::default(),
@@ -3036,7 +3089,11 @@ impl Renderer {
             fullbright: false,
             animated_textures: true,
             present_modes,
-        })
+            reflex_mode: reflex,
+            reflex_loaded,
+        };
+        renderer.set_reflex(reflex);
+        Ok(renderer)
     }
     /// LevelRenderer.submitBlockOutline: the buffer holds `edges` per stroke, the black
     /// secondary stroke first when high contrast is on.
@@ -3759,6 +3816,132 @@ impl Renderer {
         self.dlss.set(mode);
     }
 
+    /// Apply Reflex without touching the frame cap. The SDK is the one loaded
+    /// at startup; turning it on for the first time needs a restart.
+    pub fn set_reflex(&mut self, mode: crate::graphics::Reflex) {
+        self.reflex_mode = mode;
+        #[cfg(target_os = "windows")]
+        if let Some(shared) = &self.streamline
+            && let Ok(mut runtime) = shared.lock()
+        {
+            if let Some(error) = runtime.take_reflex_error() {
+                log::warn!("Reflex: {error}");
+            }
+            if self.reflex_loaded {
+                runtime.set_reflex_mode(mode.sdk());
+                let line = runtime.reflex_line();
+                drop(runtime);
+                crate::graphics::report_reflex(line);
+                return;
+            }
+        }
+        self.report_reflex_unloaded();
+    }
+
+    fn report_reflex_unloaded(&self) {
+        let line = if self.reflex_mode == crate::graphics::Reflex::Off {
+            String::new()
+        } else if self.reflex_failed_to_bind() {
+            "Reflex: unavailable".into()
+        } else {
+            "Reflex: restart".into()
+        };
+        crate::graphics::report_reflex(line);
+    }
+
+    /// Plugins were requested and the SDK started, but the device never bound
+    /// Reflex. Choosing it while it was off at startup is not this case.
+    fn reflex_failed_to_bind(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            self.streamline.as_ref().is_some_and(|runtime| {
+                runtime
+                    .lock()
+                    .ok()
+                    .is_some_and(|runtime| runtime.reflex_requested() && !runtime.reflex_loaded())
+            })
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn reflex_with(&mut self, body: impl FnOnce(&mut horizon_streamline::Runtime)) {
+        let Some(shared) = &self.streamline else {
+            return;
+        };
+        let Ok(mut runtime) = shared.lock() else {
+            return;
+        };
+        body(&mut runtime);
+        if let Some(error) = runtime.take_reflex_error() {
+            log::warn!("Reflex: {error}");
+        }
+        let line = runtime.reflex_line();
+        drop(runtime);
+        if self.reflex_loaded {
+            crate::graphics::report_reflex(line);
+        }
+    }
+
+    /// Consume the token slept at the last present, then mark input and simulation.
+    pub fn reflex_begin(&mut self) {
+        #[cfg(target_os = "windows")]
+        if self.reflex_loaded {
+            let presents = self.surface.is_some();
+            self.reflex_with(|runtime| runtime.reflex_begin(presents));
+        }
+    }
+
+    fn reflex_ensure(&mut self) {
+        #[cfg(target_os = "windows")]
+        if self.reflex_loaded {
+            let open = self
+                .streamline
+                .as_ref()
+                .and_then(|runtime| runtime.lock().ok())
+                .is_some_and(|runtime| runtime.reflex_open());
+            if !open {
+                self.reflex_begin();
+                self.reflex_with(|runtime| runtime.reflex_end_simulation());
+            }
+        }
+    }
+
+    fn reflex_end_simulation(&mut self) {
+        #[cfg(target_os = "windows")]
+        if self.reflex_loaded {
+            self.reflex_with(|runtime| runtime.reflex_end_simulation());
+        }
+    }
+
+    fn reflex_submit(&mut self, start: bool) {
+        #[cfg(target_os = "windows")]
+        if self.reflex_loaded {
+            self.reflex_with(|runtime| runtime.reflex_submit(start));
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = start;
+    }
+
+    fn reflex_present(&mut self, start: bool) {
+        #[cfg(target_os = "windows")]
+        if self.reflex_loaded {
+            self.reflex_with(|runtime| runtime.reflex_present(start));
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = start;
+    }
+
+    fn reflex_close_if_open(&mut self) {
+        #[cfg(target_os = "windows")]
+        if self.reflex_loaded {
+            self.reflex_with(|runtime| runtime.reflex_abandon_if_open());
+        }
+    }
+
     pub fn set_dlss_options(&mut self, preset: crate::graphics::DlssPreset, monitor: bool) {
         self.dlss.set_options(preset, monitor);
     }
@@ -4097,11 +4280,16 @@ impl Renderer {
         }
     }
     pub fn render(&mut self, frame: &Frame) -> Result<bool> {
+        // A loading frame has no earlier begin. Mark an empty simulation so
+        // the presented frame still has the markers Reflex expects.
+        self.reflex_ensure();
         let rendered = self.draw_frame(frame);
         // A frame that was not drawn still submits the section copies.
+        // That copy is not the frame Reflex is timing.
         if let Some(copies) = self.take_section_copies() {
             self.queue.submit([copies]);
         }
+        self.reflex_close_if_open();
         rendered
     }
     fn draw_frame(&mut self, frame: &Frame) -> Result<bool> {
@@ -6247,7 +6435,10 @@ impl Renderer {
             startup_step(format_args!("submitting the first frame"));
             self.first_frame = FirstFrame::Drawn;
         }
+        self.reflex_end_simulation();
+        self.reflex_submit(true);
         let submission = crate::spans::time("submit", || self.queue.submit([commands]));
+        self.reflex_submit(false);
         if let Some(cull) = &mut self.cull {
             cull.submitted();
         }
@@ -6285,7 +6476,9 @@ impl Renderer {
             if first_frame {
                 startup_step(format_args!("presenting the first frame"));
             }
+            self.reflex_present(true);
             self.queue.present(surface_frame);
+            self.reflex_present(false);
             if self.hdr.is_some()
                 && let Some(marker) = self.hdr_marker.take()
             {

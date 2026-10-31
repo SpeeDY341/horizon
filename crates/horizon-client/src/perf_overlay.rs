@@ -24,7 +24,8 @@ impl FrameGraph {
     }
     pub fn draw(&self, mode: Overlay, batch: &mut HudBatch, atlas: &HudAtlas) {
         let monitor = crate::graphics::dlss_monitor_enabled();
-        if (mode == Overlay::Off && !monitor) || self.frames.is_empty() {
+        let reflex = crate::graphics::reflex_overlay_line();
+        if (mode == Overlay::Off && !monitor && reflex.is_none()) || self.frames.is_empty() {
             return;
         }
         let n = self.frames.len() as f32;
@@ -38,6 +39,9 @@ impl FrameGraph {
         ];
         if monitor {
             lines.extend(crate::graphics::dlss_monitor_lines());
+        }
+        if let Some(line) = reflex {
+            lines.push(line);
         }
         let width = 120.0f32.max(
             lines

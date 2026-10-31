@@ -3,7 +3,8 @@
 //! input. How they look comes from `graphics_style`.
 use crate::{
     graphics::{
-        Dlss, DlssPreset, FarDetail, GraphicsApi, Overlay, Pacing, PresentMode, Preset, Upscaling,
+        Dlss, DlssPreset, FarDetail, GraphicsApi, Overlay, Pacing, PresentMode, Preset, Reflex,
+        Upscaling,
     },
     graphics_style::{Cost, STYLE},
     hud::{HudAtlas, HudBatch},
@@ -50,6 +51,7 @@ pub enum H {
     StreamlineVersion,
     DlssRender,
     DlssMonitor,
+    Reflex,
     Hdr,
     /// Opens `Level::Hdr`.
     HdrSettings,
@@ -318,6 +320,11 @@ pub fn rows(level: Level) -> Vec<Row> {
                 "Shows DLSS timings, sizes and completed calls. Writes samples to the game log.",
             ),
             h(
+                H::Reflex,
+                Low,
+                "Lowers latency. Boost may cost frames. FPS cap stays. Restart once.",
+            ),
+            h(
                 H::HdrSettings,
                 None,
                 "HDR output on an HDR display: lava, fire and sunlight shine brighter.",
@@ -532,6 +539,7 @@ impl H {
                 )
             }
             H::DlssMonitor => labelled("DLSS Monitor", on_off(g.dlss_monitor)),
+            H::Reflex => labelled("Reflex", g.reflex.label()),
             H::Hdr => labelled("HDR", on_off(g.hdr)),
             H::HdrSettings => Text::literal(lang::get("HDR Settings...")),
             H::HdrPaperWhite => match g.hdr_paper_white {
@@ -656,6 +664,7 @@ impl H {
             | H::DlssRender => {}
             H::DlssPreset => g.dlss_preset = step(&DlssPreset::ALL, g.dlss_preset, back),
             H::DlssMonitor => g.dlss_monitor = !g.dlss_monitor,
+            H::Reflex => g.reflex = step(&Reflex::ALL, g.reflex, back),
             H::Hdr => g.hdr = !g.hdr,
             H::BatteryMode => g.battery = !g.battery,
             H::GraphicsApi => g.api = step(GraphicsApi::choices(), g.api, back),
@@ -782,6 +791,7 @@ impl Item {
                     | H::StreamlineVersion
                     | H::DlssRender
                     | H::DlssMonitor
+                    | H::Reflex
             ) | Item::Vanilla(
                 Opt::GuiScale
                     | Opt::Fullscreen
