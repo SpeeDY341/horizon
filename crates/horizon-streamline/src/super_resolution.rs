@@ -1,0 +1,419 @@
+//! DLSS owns its inputs. Native code never receives arbitrary engine handles.
+use crate::{Runtime, abi::Base, dlss_abi as sl};
+use std::{
+    ffi::{CStr, c_void},
+    sync::{Arc, Mutex},
+};
+
+#[derive(Clone, Copy)]
+pub struct FrameConstants {
+    /// Row-vector, row-major matrices, without jitter.
+    pub projection: [[f32; 4]; 4],
+    pub inverse_projection: [[f32; 4]; 4],
+    pub reprojection: [[f32; 4]; 4],
+    pub inverse_reprojection: [[f32; 4]; 4],
+    pub jitter_pixels: [f32; 2],
+    pub camera: [[f32; 3]; 4],
+    pub near: f32,
+    pub far: f32,
+    pub fov: f32,
+    pub aspect: f32,
+    pub reset: bool,
+}
+
+struct Api {
+    optimal: sl::GetOptimal,
+    options: sl::SetOptions,
+    token: sl::NewToken,
+    constants: sl::SetConstants,
+    evaluate: sl::Evaluate,
+}
+impl Api {
+    fn load(runtime: &Runtime) -> Result<Self, String> {
+        // Safety: exact pinned SDK ABI; runtime outlives these function pointers.
+        unsafe {
+            let get = *runtime
+                ._library
+                .get::<sl::GetFunction>(b"slGetFeatureFunction\0")
+                .map_err(|e| e.to_string())?;
+            let function = |name: &CStr| -> Result<*mut c_void, String> {
+                let mut p = std::ptr::null_mut();
+                check(get(0, name.as_ptr(), &mut p))?;
+                if p.is_null() {
+                    return Err("Null DLSS function".into());
+                }
+                Ok(p)
+            };
+            Ok(Self {
+                optimal: std::mem::transmute::<*mut c_void, sl::GetOptimal>(function(
+                    c"slDLSSGetOptimalSettings",
+                )?),
+                options: std::mem::transmute::<*mut c_void, sl::SetOptions>(function(
+                    c"slDLSSSetOptions",
+                )?),
+                token: *runtime
+                    ._library
+                    .get::<sl::NewToken>(b"slGetNewFrameToken\0")
+                    .map_err(|e| e.to_string())?,
+                constants: *runtime
+                    ._library
+                    .get::<sl::SetConstants>(b"slSetConstants\0")
+                    .map_err(|e| e.to_string())?,
+                evaluate: *runtime
+                    ._library
+                    .get::<sl::Evaluate>(b"slEvaluateFeature\0")
+                    .map_err(|e| e.to_string())?,
+            })
+        }
+    }
+}
+fn check(code: i32) -> Result<(), String> {
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(format!("NVIDIA DLSS error {code}"))
+    }
+}
+
+pub struct SuperResolution {
+    api: Api,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pub(crate) targets: Option<super::evaluate::Targets>,
+    configuration: Option<(u32, [u32; 2])>,
+    // Last: shutdown must run with the device and instance still retained by Runtime.
+    _runtime: Arc<Mutex<Runtime>>,
+}
+
+impl SuperResolution {
+    pub fn new(
+        runtime: Arc<Mutex<Runtime>>,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<Self, String> {
+        let owner = runtime.lock().map_err(|e| e.to_string())?;
+        // Safety: read-only guards verify the queue and device match before copying.
+        unsafe {
+            let d = device
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .ok_or("Vulkan device missing")?;
+            let q = queue
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .ok_or("Vulkan queue missing")?;
+            if d.raw_device().handle() != q.raw_device().handle() {
+                return Err("DLSS queue/device mismatch".into());
+            }
+        }
+        let api = Api::load(&owner)?;
+        drop(owner);
+        Ok(Self {
+            api,
+            device: device.clone(),
+            queue: queue.clone(),
+            targets: None,
+            configuration: None,
+            _runtime: runtime,
+        })
+    }
+
+    /// Mode values are the SDK's Quality=3, Balanced=2, Performance=1,
+    /// Ultra Performance=4, DLAA=6. Size is obtained from NVIDIA, never guessed.
+    pub fn configure(&mut self, mode: u32, output: [u32; 2]) -> Result<[u32; 2], String> {
+        if ![1, 2, 3, 4, 6].contains(&mode)
+            || output.contains(&0)
+            || output.iter().any(|n| *n > 8192)
+        {
+            return Err("Invalid DLSS mode or output size".into());
+        }
+        if self.configuration == Some((mode, output)) {
+            return Ok(self.targets.as_ref().unwrap().size);
+        }
+        let viewport = sl::Viewport::new();
+        let options = sl::Options::new(mode, output);
+        let mut optimal = sl::Optimal::new();
+        // Safety: initialized DLSS on a registered Vulkan device and pinned ABI.
+        unsafe {
+            check((self.api.optimal)(&options, &mut optimal))?;
+            check((self.api.options)(&viewport, &options))?;
+        }
+        let size = [optimal.width, optimal.height];
+        if size.contains(&0) || size.iter().zip(output).any(|(a, b)| *a > b) {
+            return Err("Invalid DLSS render size".into());
+        }
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| e.to_string())?;
+        self.targets = Some(super::evaluate::Targets::new(&self.device, size, output));
+        self.configuration = Some((mode, output));
+        Ok(size)
+    }
+
+    /// Caller has submitted world rendering on this device's queue. Input
+    /// resources are copied and validated by wgpu before native DLSS runs.
+    pub fn evaluate(
+        &mut self,
+        color: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        motion: &wgpu::TextureView,
+        frame: FrameConstants,
+    ) -> Result<wgpu::TextureView, String> {
+        let viewport = sl::Viewport::new();
+        let targets = self.targets.as_ref().ok_or("DLSS is not configured")?;
+        targets.copy_inputs(&self.device, &self.queue, color, depth, motion)?;
+        let identity = [
+            [1., 0., 0., 0.],
+            [0., 1., 0., 0.],
+            [0., 0., 1., 0.],
+            [0., 0., 0., 1.],
+        ];
+        let constants = sl::Constants {
+            base: Base::new(
+                0xdcd35ad7,
+                0x4e4a,
+                0x4bad,
+                [0xa9, 0x0c, 0xe0, 0xc4, 0x9e, 0xb2, 0x3a, 0xfe],
+                2,
+            ),
+            matrices: [
+                frame.projection,
+                frame.inverse_projection,
+                identity,
+                frame.reprojection,
+                frame.inverse_reprojection,
+            ],
+            jitter: frame.jitter_pixels,
+            motion_scale: [1., 1.],
+            pinhole: [0.; 2],
+            camera: frame.camera,
+            near: frame.near,
+            far: frame.far,
+            fov: frame.fov,
+            aspect: frame.aspect,
+            invalid_motion: f32::MIN,
+            flags: [1, 1, 0, u8::from(frame.reset), 0, 0, 0],
+            separation: 40.,
+        };
+        let mut token = std::ptr::null_mut();
+        unsafe {
+            check((self.api.token)(&mut token, std::ptr::null()))?;
+        }
+        if token.is_null() {
+            return Err("DLSS returned no frame token".into());
+        }
+        unsafe {
+            check((self.api.constants)(&constants, token, &viewport))?;
+        }
+        targets.evaluate_native(&self.device, &self.queue, |cmd, resources| {
+            let mut tags = resources
+                .iter_mut()
+                .zip([3, 0, 1, 4])
+                .map(|(r, kind)| sl::Tag {
+                    base: Base::new(
+                        0x4c6a5aad,
+                        0xb445,
+                        0x496c,
+                        [0x87, 0xff, 0x1a, 0xf3, 0x84, 0x5b, 0xe6, 0x53],
+                        1,
+                    ),
+                    extent: [0, 0, r.width, r.height],
+                    resource: r,
+                    kind,
+                    lifecycle: 2,
+                })
+                .collect::<Vec<_>>();
+            let mut inputs = vec![&viewport.base as *const Base];
+            inputs.extend(tags.iter_mut().map(|t| &t.base as *const Base));
+            unsafe {
+                check((self.api.evaluate)(
+                    0,
+                    token,
+                    inputs.as_ptr(),
+                    inputs.len() as u32,
+                    cmd,
+                ))
+            }
+        })?;
+        Ok(targets.output.create_view(&Default::default()))
+    }
+}
+
+impl Drop for SuperResolution {
+    fn drop(&mut self) {
+        // Native descriptor image views are invisible to wgpu's usage tracker.
+        // Keep them alive until all submitted DLSS work has completed.
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn sdk_layouts_match_msvc() {
+        use std::mem::size_of;
+        assert_eq!(size_of::<sl::Options>(), 88);
+        assert_eq!(size_of::<sl::Optimal>(), 64);
+        assert_eq!(size_of::<sl::Constants>(), 456);
+        assert_eq!(size_of::<sl::Resource>(), 112);
+        assert_eq!(size_of::<sl::Tag>(), 64);
+        assert_eq!(size_of::<sl::Viewport>(), 40);
+    }
+    #[test]
+    #[ignore = "requires the official SDK and an RTX Vulkan device"]
+    fn real_dlss_evaluates_frames_and_returns_pixels() {
+        let path = std::env::var_os("HORIZON_STREAMLINE_SDK").expect("SDK");
+        let mut runtime = Runtime::load(
+            std::path::Path::new(&path),
+            "00a6bdb2-6386-4e37-8ff9-dcda4642628a",
+        )
+        .unwrap();
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::VULKAN;
+        let instance = runtime.create_instance(&desc).unwrap();
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+        runtime.check_adapter(&adapter).unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        runtime.attach_device(&device).unwrap();
+        let runtime = Arc::new(Mutex::new(runtime));
+        let mut sr = SuperResolution::new(runtime.clone(), &device, &queue).unwrap();
+        let size = sr.configure(3, [640, 360]).unwrap();
+        let make = |format, usage| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: None,
+                    size: wgpu::Extent3d {
+                        width: size[0],
+                        height: size[1],
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC;
+        let color = make(wgpu::TextureFormat::Rgba8Unorm, usage);
+        let depth = make(wgpu::TextureFormat::Depth32Float, usage);
+        let motion = make(wgpu::TextureFormat::Rg16Float, usage);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        for (view, clear) in [
+            (
+                &color,
+                wgpu::Color {
+                    r: 0.25,
+                    g: 0.5,
+                    b: 0.75,
+                    a: 1.,
+                },
+            ),
+            (&motion, wgpu::Color::TRANSPARENT),
+        ] {
+            drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            }));
+        }
+        drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None,
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0.5),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        }));
+        queue.submit([encoder.finish()]);
+        let id = [
+            [1., 0., 0., 0.],
+            [0., 1., 0., 0.],
+            [0., 0., 1., 0.],
+            [0., 0., 0., 1.],
+        ];
+        for i in 0..3 {
+            let frame = FrameConstants {
+                projection: id,
+                inverse_projection: id,
+                reprojection: id,
+                inverse_reprojection: id,
+                jitter_pixels: [0.; 2],
+                camera: [[0.; 3], [0., 1., 0.], [1., 0., 0.], [0., 0., -1.]],
+                near: 0.05,
+                far: 1000.,
+                fov: 1.2,
+                aspect: 640. / 360.,
+                reset: i == 0,
+            };
+            let output = sr.evaluate(&color, &depth, &motion, frame).unwrap();
+            let read = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 256,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: output.texture(),
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 320,
+                        y: 180,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &read,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit([encoder.finish()]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            read.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                tx.send(r).unwrap();
+            });
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            rx.recv().unwrap().unwrap();
+            let pixels = read.slice(..).get_mapped_range().unwrap();
+            println!("Frame {i}: {:?}", &pixels[..8]);
+            for (n, expected) in [0x3400u16, 0x3800, 0x3a00, 0x3c00].into_iter().enumerate() {
+                let actual = u16::from_le_bytes([pixels[n * 2], pixels[n * 2 + 1]]);
+                assert!(
+                    actual.abs_diff(expected) < 32,
+                    "Unexpected DLSS pixel: {actual:x}"
+                );
+            }
+        }
+        drop(sr);
+        drop(runtime);
+    }
+}

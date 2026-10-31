@@ -17,11 +17,13 @@ pub fn eligible(vulkan: bool, vendor: u32, name: &str) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-#[allow(dead_code)] // Public ABI is consumed by the following integration changes.
 mod dlss_abi;
+#[cfg(target_os = "windows")]
+mod super_resolution;
+#[cfg(target_os = "windows")]
+pub use super_resolution::{FrameConstants, SuperResolution};
 
 #[cfg(target_os = "windows")]
-#[allow(dead_code)] // Native resource boundary, connected by the next change.
 mod evaluate;
 
 #[cfg(test)]
