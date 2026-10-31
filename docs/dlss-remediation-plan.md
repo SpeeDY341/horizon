@@ -636,6 +636,26 @@ swapchain получает hook; стресс-проверка не зависа
   diff/public-tree прошли. Новые SDK/game запуски не требовались; ограничения
   H по настоящему FG Present остаются открытыми. Нужен новый review H.
 
+### Исправление по review H2 (1 ноября 2026)
+
+- `review_h2` дал **FAIL** коду `112a84fdb18a2472be7b8b2697d289587b7cc5cc`:
+  ранняя readiness не учитывала `minWidthOrHeight`, хотя поздний record
+  приостанавливал FG в маленьком окне. Это снова повторяло reset fallback.
+- Renderer передаёт настоящий размер swapchain в Runtime readiness. Один
+  `dimensions_supported` проверяет обе стороны против SDK minimum и в раннем
+  reset gate, и в record. Pending сохраняется до допустимого размера.
+- Session test проверяет отдельно малую ширину/высоту, обе малые стороны и
+  точную границу. Real Post/Motion regression дополнен настоящими 16×16
+  targets/output с восстановлением до 32×32, для TAA/SR на Vulkan/DX12:
+  reset `1,0,0,0,1,0`. **21 ordinary passed, 6 ignored**, явный GPU test
+  **1 passed**; Clippy затронутых Streamline/render/client lib/bins/tests,
+  fmt, diff/public-tree прошли. SDK/game повторно не запускались.
+- Остальные ранние gates проверены: mode/load/fault/cap/Reflex/presentation и
+  контекст окна. Depth/motion/constants строятся позднее; отсутствие token
+  отмечается Reflex до ранней проверки. Checked surface suspend очищает старый
+  размер; ошибки поздних входов сохраняют reset/fault для следующего кадра.
+  Аппаратные ограничения H остаются открытыми. Нужен новый review H.
+
 ## 8. Выполнить итоговую проверку качества
 
 ### 8.1. Матрица сценариев

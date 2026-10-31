@@ -645,9 +645,12 @@ impl Runtime {
     /// A pending reset that can be applied to a genuine FG attempt. Blocked
     /// sessions retain the request without repeatedly resetting fallback SR/TAA.
     /// Read before building common camera constants, including SR.
-    pub fn framegen_reset_pending(&self) -> bool {
-        self.framegen
-            .reset_ready(self.reflex.active(), self.presentation_ready().is_ok())
+    pub fn framegen_reset_pending(&self, output: [u32; 2]) -> bool {
+        self.framegen.reset_ready(
+            output,
+            self.reflex.active(),
+            self.presentation_ready().is_ok(),
+        )
     }
 
     /// Tag depth and motion, then set this present's options. The token is the

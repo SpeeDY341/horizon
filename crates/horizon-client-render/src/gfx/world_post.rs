@@ -699,13 +699,19 @@ mod tests {
             };
             let atlas = texture(1, wgpu::TextureUsages::TEXTURE_BINDING);
             let screen = texture(32, wgpu::TextureUsages::RENDER_ATTACHMENT);
+            let small_screen = texture(16, wgpu::TextureUsages::RENDER_ATTACHMENT);
             let indices = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size: 24,
                 usage: wgpu::BufferUsages::INDEX,
                 mapped_at_creation: false,
             });
-            for reason in ["latched SDK fault", "unconfirmed cap", "unavailable Reflex"] {
+            for reason in [
+                "latched SDK fault",
+                "unconfirmed cap",
+                "unavailable Reflex",
+                "below minimum output",
+            ] {
                 for sr_active in [false, true] {
                     let mut post = Post::new(&device, wgpu::TextureFormat::Rgba8Unorm);
                     post.taa = true;
@@ -715,6 +721,13 @@ mod tests {
                     // Session blocker. All retain pending but return false until
                     // recovery, so the renderer must preserve fallback history.
                     for (frame, expected) in [1., 0., 0., 0., 1., 0.].into_iter().enumerate() {
+                        // The minimum-size case uses actual smaller Post/Motion
+                        // targets until the output becomes eligible on recovery.
+                        let window = if reason == "below minimum output" && frame < 4 {
+                            [16; 2]
+                        } else {
+                            [32; 2]
+                        };
                         super::super::frame_gen::prepare_frame_history(
                             true,
                             frame == 4,
@@ -723,8 +736,8 @@ mod tests {
                             Some(&mut motion),
                         );
                         let camera = DVec3::new(frame as f64 * 0.1, 0., 0.);
-                        post.jitter([32; 2], true, Mat4::IDENTITY, camera);
-                        let (_, depth) = post.prepare(&device, [32; 2], true).unwrap();
+                        post.jitter(window, true, Mat4::IDENTITY, camera);
+                        let (_, depth) = post.prepare(&device, window, true).unwrap();
                         let constants = post.temporal_jitter().unwrap();
                         assert_eq!(
                             constants[2], expected,
@@ -744,14 +757,19 @@ mod tests {
                             Mat4::IDENTITY,
                             constants,
                             &depth,
-                            [32; 2],
+                            window,
                             &indices
                         ));
                         assert_eq!(motion.frame_reset(), expected != 0.);
                         if sr_active {
                             post.invalidate_history();
                         } else {
-                            post.finish(&queue, &mut encoder, &screen);
+                            let output = if window == [16; 2] {
+                                &small_screen
+                            } else {
+                                &screen
+                            };
+                            post.finish(&queue, &mut encoder, output);
                         }
                         assert_eq!(
                             post.temporal_jitter().unwrap(),

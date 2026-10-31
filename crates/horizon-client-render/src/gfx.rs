@@ -3969,7 +3969,7 @@ impl Renderer {
         if let Some(shared) = &self.streamline
             && let Ok(runtime) = shared.lock()
         {
-            return runtime.framegen_reset_pending();
+            return runtime.framegen_reset_pending([self.config.width, self.config.height]);
         }
         false
     }

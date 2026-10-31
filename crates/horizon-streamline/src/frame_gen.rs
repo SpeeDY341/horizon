@@ -184,14 +184,24 @@ impl Session {
 
     /// Keep the lifecycle request pending while generation is blocked. Only
     /// an attempt that can reach native On may reset shared SR/TAA history.
-    pub(crate) fn reset_ready(&self, reflex_active: bool, presentation_ready: bool) -> bool {
+    pub(crate) fn reset_ready(
+        &self,
+        output: [u32; 2],
+        reflex_active: bool,
+        presentation_ready: bool,
+    ) -> bool {
         self.loaded
             && self.wanted > 0
             && self.max_generated > 0
             && self.fault.is_none()
+            && self.dimensions_supported(output)
             && reflex_active
             && presentation_ready
             && self.reset_pending()
+    }
+
+    fn dimensions_supported(&self, output: [u32; 2]) -> bool {
+        output.into_iter().all(|side| side >= self.min_side)
     }
 
     pub(crate) fn invalidate_history(&mut self) {
@@ -327,7 +337,7 @@ impl Session {
             self.wanted.min(self.max_generated)
         };
         let inputs_ready = !resized
-            && input.color.into_iter().all(|side| side >= self.min_side)
+            && self.dimensions_supported(input.color)
             && input.depth.is_some()
             && input.motion.is_some()
             && input.constants.is_some()
@@ -1065,25 +1075,33 @@ mod tests {
         session.loaded = true;
         session.set_wanted(1);
         session.max_generated = 1;
-        assert!(session.reset_ready(true, true));
+        assert!(session.reset_ready([64; 2], true, true));
         session.note("mock SDK frame failure".into());
         for _ in 0..4 {
             assert!(session.reset_pending());
-            assert!(!session.reset_ready(true, true));
+            assert!(!session.reset_ready([64; 2], true, true));
         }
         session.set_wanted(0);
         session.set_wanted(1);
         session.max_generated = 0;
         assert!(session.reset_pending());
-        assert!(!session.reset_ready(true, true));
+        assert!(!session.reset_ready([64; 2], true, true));
         session.max_generated = 1;
-        assert!(!session.reset_ready(false, true));
-        assert!(!session.reset_ready(true, false));
+        assert!(!session.reset_ready([64; 2], false, true));
+        assert!(!session.reset_ready([64; 2], true, false));
         assert!(session.reset_pending());
-        assert!(session.reset_ready(true, true));
+        session.min_side = 32;
+        for output in [[31, 64], [64, 31], [31, 31]] {
+            assert!(!session.dimensions_supported(output));
+            assert!(!session.reset_ready(output, true, true));
+            assert!(session.reset_pending());
+        }
+        assert!(session.dimensions_supported([32; 2]));
+        assert!(session.reset_ready([32; 2], true, true));
+        assert!(session.reset_ready([64; 2], true, true));
         // Native On success consumes the pending request, not these queries.
         session.needs_reset = false;
-        assert!(!session.reset_ready(true, true));
+        assert!(!session.reset_ready([64; 2], true, true));
     }
 
     #[test]
