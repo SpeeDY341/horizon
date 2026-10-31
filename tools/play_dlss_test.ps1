@@ -44,6 +44,12 @@ try {
         '--world','DLSS-Test','--test-terrain','--creative','--render-distance','8',
         '--width','1280','--height','720')
     if ($Smoke) { $arguments += @('--world-frames','60','--smoke-report',(Join-Path $scratch 'report.json')) }
-    & $game @arguments *> (Join-Path $scratch 'game.log')
-    if ($LASTEXITCODE -ne 0) { throw ('Game exited with an error. Log: ' + (Join-Path $scratch 'game.log')) }
+    # Windows PowerShell 5.1 treats redirected native stderr as ErrorRecords.
+    # Keep normal game logging out of PowerShell's terminating-error pipeline.
+    # These arguments contain paths (which cannot contain quotes on Windows).
+    $quotedArguments = $arguments | ForEach-Object { '"' + $_ + '"' }
+    $gameProcess = Start-Process -FilePath $game -ArgumentList $quotedArguments -NoNewWindow `
+        -RedirectStandardOutput (Join-Path $scratch 'stdout.log') `
+        -RedirectStandardError (Join-Path $scratch 'game.log') -Wait -PassThru
+    if ($gameProcess.ExitCode -ne 0) { throw ('Game exited with an error. Log: ' + (Join-Path $scratch 'game.log')) }
 } finally { Pop-Location }
