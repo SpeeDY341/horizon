@@ -1234,6 +1234,7 @@ impl Game<'_> {
         let uv = [r.u0, r.v0, r.u1, r.v1];
         let partial = self.clock.fraction() as f32;
         for crystal in &self.crystals {
+            let motion_start = out.len();
             let feet = glam::DVec3::new(crystal.position.x, crystal.position.y, crystal.position.z);
             let rel = feet - camera;
             if rel.length_squared() > 256.0 * 256.0 {
@@ -1272,6 +1273,12 @@ impl Game<'_> {
                     + glam::DVec3::new(0.0, f64::from(horizon_client::end_crystal::y(age)), 0.0);
                 self.crystal_beam(from, delta, age, camera, out);
             }
+            self.mark_motion(
+                crystal.id,
+                super::MotionSource::Crystal,
+                motion_start,
+                out.len(),
+            );
         }
     }
 
@@ -1454,8 +1461,10 @@ impl Game<'_> {
             yaw.cos() * pitch.sin(),
         ) * 0.25;
         for eye in &self.end.eyes {
+            let motion_start = out.len();
             let p = eye.previous + (eye.position - eye.previous) * alpha - camera;
             out.extend(eye_quad(p.as_vec3(), right, up, r));
+            self.mark_motion(eye.id, super::MotionSource::Eye, motion_start, out.len());
         }
     }
 

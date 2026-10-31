@@ -194,6 +194,7 @@ impl Game<'_> {
         out: &mut Vec<Vertex>,
     ) {
         for s in &self.ominous_spawners {
+            let motion_start = out.len();
             let at = glam::DVec3::from_array(s.position);
             if at.distance_squared(camera) >= 64.0 * 64.0 {
                 continue;
@@ -222,6 +223,12 @@ impl Game<'_> {
             ) {
                 self.submit_item_world(&state, copy, vertex_light(0xFF), out);
             }
+            self.mark_motion(
+                s.id,
+                super::MotionSource::OminousSpawner,
+                motion_start,
+                out.len(),
+            );
         }
     }
 }

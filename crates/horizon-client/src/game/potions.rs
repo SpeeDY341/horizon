@@ -1165,6 +1165,7 @@ impl Game<'_> {
     ) {
         let orientation = glam::Mat4::from_quat(self.camera_orientation());
         for t in &self.potions.thrown {
+            let motion_start = out.len();
             let previous = glam::DVec3::new(t.previous.x, t.previous.y, t.previous.z);
             let position = glam::DVec3::new(t.position.x, t.position.y, t.position.z);
             // ThrowableProjectile.shouldRenderAtSqrDistance: hidden for its
@@ -1197,6 +1198,7 @@ impl Game<'_> {
                 p.z.floor() as i32,
             );
             self.submit_item_world(&state, pose, vertex_light(light), out);
+            self.mark_motion(t.id, super::MotionSource::Potion, motion_start, out.len());
         }
     }
     /// `HealOrHarmMobEffect.applyInstantaneousEffect` with a source (a

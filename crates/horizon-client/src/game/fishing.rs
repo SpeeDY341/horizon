@@ -737,10 +737,24 @@ impl Game<'_> {
     /// FishingHookRenderer: the bobbers (this player's and the others' a
     /// server tracks), camera-facing half-block quads centred on the hooks.
     pub(super) fn fishing_geometry(&self, camera: glam::DVec3, alpha: f64, out: &mut Vec<Vertex>) {
-        let hooks: Vec<glam::DVec3> = self
-            .hook_position(alpha)
+        let hooks: Vec<_> = self
+            .hook
+            .as_ref()
+            .zip(self.hook_position(alpha))
+            .map(|(h, p)| (h.id, p))
             .into_iter()
-            .chain(self.remote_hook_ends(alpha).into_iter().map(|(h, _)| h))
+            .chain(
+                self.remote_hooks
+                    .iter()
+                    .filter(|h| self.mobs.iter().any(|m| m.id == h.owner))
+                    .map(|h| {
+                        (
+                            h.id,
+                            super::entity_culling::at(h.previous)
+                                .lerp(super::entity_culling::at(h.position), alpha),
+                        )
+                    }),
+            )
             .collect();
         if hooks.is_empty() {
             return;
@@ -759,7 +773,8 @@ impl Game<'_> {
         let up = right.cross(forward).normalize_or_zero();
         let s = 0.25;
         let uv = [[r.u0, r.v1], [r.u1, r.v1], [r.u1, r.v0], [r.u0, r.v0]];
-        for p in hooks {
+        for (id, p) in hooks {
+            let motion_start = out.len();
             let light =
                 self.world
                     .light(p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32);
@@ -782,6 +797,12 @@ impl Game<'_> {
                     glint_uv: [0.0, 0.0],
                 });
             }
+            self.mark_motion(
+                id,
+                super::MotionSource::FishingHook,
+                motion_start,
+                out.len(),
+            );
         }
     }
     /// FishingHookRenderer: each line, 16 black `lines` segments sagging

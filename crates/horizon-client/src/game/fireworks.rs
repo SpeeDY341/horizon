@@ -603,6 +603,7 @@ impl Game<'_> {
             .iter()
             .filter(|r| !r.attached && r.attached_to.is_none())
         {
+            let motion_start = out.len();
             // FireworkRocketEntity.shouldRenderAtSqrDistance: within 64 blocks;
             // EntityRenderer.shouldRender: its 0.25 box in the view.
             if !self.standing_entity_in_view(
@@ -641,6 +642,7 @@ impl Game<'_> {
                 p.z.floor() as i32,
             );
             self.submit_item_world(&state, pose, vertex_light(light), out);
+            self.mark_motion(r.id, super::MotionSource::Rocket, motion_start, out.len());
         }
     }
 }

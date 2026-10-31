@@ -3,13 +3,81 @@ use super::Vertex;
 use glam::{DVec3, Vec3};
 use std::{collections::HashMap, ops::Range};
 
-/// A visible mob or dropped item in `Frame::entities`, before material sorting.
+/// Independent renderers may use the same entity ID or block position.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum Source {
+    Mob,
+    Item,
+    Player,
+    Guest,
+    Boat,
+    Cart,
+    FallingBlock,
+    Tnt,
+    ArmorStand,
+    Projectile,
+    Trident,
+    Rocket,
+    Potion,
+    Fangs,
+    Display,
+    Crystal,
+    Eye,
+    BlockEntity,
+    Piston,
+    Spawner,
+    Vault,
+    Brushable,
+    OminousSpawner,
+    Leash,
+    Frame,
+    FrameItem,
+    FrameMap,
+    FishingHook,
+    Apparition,
+    Painting,
+    Cushion,
+    DragonFireball,
+    MobBeam,
+    DragonBeam,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum Key {
+    /// The UUID distinguishes a network ID reused between rendered frames.
+    /// Locally allocated IDs are monotonic for the lifetime of a level.
+    Entity(Source, u32, Option<[i32; 4]>),
+    Block(Source, [i32; 3]),
+}
+
+/// Visible geometry in `Frame::entities`, before material sorting.
 #[derive(Clone, Debug)]
 pub struct Span {
-    pub id: u32,
-    /// Different namespaces prevent a replaced mob and item sharing history.
-    pub item: bool,
+    pub key: Key,
     pub vertices: Range<usize>,
+}
+
+impl Span {
+    /// The production entity registration path, also used by the GPU regression.
+    pub fn entity(
+        spans: &mut Vec<Self>,
+        source: Source,
+        id: u32,
+        uuid: Option<[i32; 4]>,
+        start: usize,
+        end: usize,
+    ) {
+        Self::record(spans, Key::Entity(source, id, uuid), start, end);
+    }
+
+    pub fn record(spans: &mut Vec<Self>, key: Key, start: usize, end: usize) {
+        if end > start {
+            spans.push(Self {
+                key,
+                vertices: start..end,
+            });
+        }
+    }
 }
 
 #[repr(C)]
@@ -28,7 +96,7 @@ struct Geometry {
 
 #[derive(Default)]
 pub struct History {
-    previous: HashMap<(bool, u32), Geometry>,
+    previous: HashMap<Key, Geometry>,
     camera: Option<DVec3>,
     pub vertices: Vec<MotionVertex>,
 }
@@ -54,7 +122,7 @@ impl History {
             if current.is_empty() || current.len() % 4 != 0 {
                 continue;
             }
-            let key = (span.item, span.id);
+            let key = span.key;
             let previous = self.previous.remove(&key);
             let previous = previous
                 .as_ref()
@@ -112,8 +180,7 @@ mod tests {
 
     fn span(id: u32, start: usize) -> Span {
         Span {
-            id,
-            item: false,
+            key: Key::Entity(Source::Mob, id, None),
             vertices: start..start + 4,
         }
     }
@@ -146,6 +213,42 @@ mod tests {
         assert_eq!(h.vertices[0].previous, h.vertices[0].current);
         h.update(&[span(1, 0)], &quad(5.0), DVec3::X * 2.0, true);
         assert_eq!(h.vertices[0].previous, h.vertices[0].current);
+    }
+
+    #[test]
+    fn renderer_namespaces_and_reused_network_ids_never_share_history() {
+        let mut h = History::default();
+        let mut spans = Vec::new();
+        Span::entity(&mut spans, Source::Boat, 7, Some([1; 4]), 0, 4);
+        Span::entity(&mut spans, Source::Player, 7, Some([1; 4]), 4, 8);
+        let mut first = quad(1.0);
+        first.extend(quad(10.0));
+        h.update(&spans, &first, DVec3::ZERO, false);
+        // Same IDs, reversed builders. The boat is a new network incarnation.
+        spans.clear();
+        Span::entity(&mut spans, Source::Player, 7, Some([1; 4]), 0, 4);
+        Span::entity(&mut spans, Source::Boat, 7, Some([2; 4]), 4, 8);
+        let mut next = quad(11.0);
+        next.extend(quad(2.0));
+        h.update(&spans, &next, DVec3::ZERO, false);
+        assert_eq!(h.vertices[0].previous, first[4].pos);
+        assert_eq!(h.vertices[4].previous, next[4].pos);
+    }
+
+    #[test]
+    fn changed_topology_and_disappearing_objects_fall_back_to_camera_motion() {
+        let mut h = History::default();
+        let mut geometry = quad(1.0);
+        geometry.extend(quad(2.0));
+        let mut s = span(1, 0);
+        s.vertices = 0..8;
+        h.update(&[s], &geometry, DVec3::ZERO, false);
+        h.update(&[span(1, 0)], &quad(3.0), DVec3::X, false);
+        assert_eq!(h.vertices[0].previous[0], 4.0);
+        h.update(&[], &[], DVec3::X, false);
+        assert!(h.vertices.is_empty());
+        h.update(&[span(1, 0)], &quad(4.0), DVec3::X * 2.0, false);
+        assert_eq!(h.vertices[0].previous[0], 5.0);
     }
 
     #[test]

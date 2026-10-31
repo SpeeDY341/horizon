@@ -2677,7 +2677,9 @@ impl Game<'_> {
             0xFFFF_FFFF
         };
         let overlay = u32::from(d.hurt_time > 0);
+        let start = out.len();
         horizon_client::mobs::render::draw(model, base, &poses, skin, color, light, overlay, out);
+        self.mark_motion(d.id, super::MotionSource::Mob, start, out.len());
         // RenderTypes.eyes: the glowing eyes, added on top.
         let mut eye_quads = Vec::new();
         horizon_client::mobs::render::draw(
@@ -2706,7 +2708,9 @@ impl Game<'_> {
         if let Some(c) = d.nearest_crystal.and_then(|i| self.crystals.get(i)) {
             let bob = f64::from(horizon_client::end_crystal::y(c.time as f32 + a));
             let to = glam::DVec3::new(c.position.x, c.position.y + bob, c.position.z);
+            let start = out.len();
             self.crystal_beam(pos, to - pos, self.ticks as f32 + a, camera, out);
+            self.mark_motion(d.id, super::MotionSource::DragonBeam, start, out.len());
         }
     }
     /// `EnderDragonRenderer.submitRays`: untextured, additive death rays.
@@ -2800,6 +2804,7 @@ impl Game<'_> {
         let right = forward.cross(glam::DVec3::Y).normalize_or_zero();
         let up = right.cross(forward).normalize_or_zero();
         for b in &self.dragon_fireballs {
+            let start = out.len();
             let p = glam::DVec3::new(
                 b.previous.x + (b.position.x - b.previous.x) * alpha,
                 b.previous.y + (b.position.y - b.previous.y) * alpha,
@@ -2824,6 +2829,7 @@ impl Game<'_> {
                     glint_uv: [0.0, 0.0],
                 });
             }
+            self.mark_motion(b.id, super::MotionSource::DragonFireball, start, out.len());
         }
     }
     pub(super) fn fight_ready(&mut self) -> bool {

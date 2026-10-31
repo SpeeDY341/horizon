@@ -670,6 +670,12 @@ impl Game<'_> {
             }
             self.mark_outline(&out[start..], color);
         }
+        self.mark_motion(
+            self.own_entity_id() as u32,
+            super::MotionSource::Player,
+            start,
+            out.len(),
+        );
     }
     /// `extractEntityInInventoryFollowsMouse`: the player in the box
     /// `[x0, x1) x [y0, y1)`, `size` pixels per block, turned toward the

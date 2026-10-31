@@ -2549,6 +2549,7 @@ impl Game<'_> {
             } else {
                 self.cull_entity_vertices(out, entity_start);
             }
+            self.mark_motion(m.id, super::MotionSource::Guest, entity_start, out.len());
         }
     }
 

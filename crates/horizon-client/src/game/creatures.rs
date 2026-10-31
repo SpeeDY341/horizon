@@ -5343,7 +5343,7 @@ impl Game<'_> {
             {
                 self.cull_entity_vertices(out, entity_start);
             }
-            self.mark_motion(mob.id, false, entity_start, out.len());
+            self.mark_motion(mob.id, super::MotionSource::Mob, entity_start, out.len());
             // GuardianRenderer: the laser to the locked target.
             if let Some((time, scale)) = horizon_client::mobs::guardian::beam(mob, alpha as f32)
                 && let Some(target) = self.beam_target(mob.ai.target, alpha)
@@ -5355,6 +5355,7 @@ impl Game<'_> {
                     mob.previous.y + (mob.position.y - mob.previous.y) * a + mob.eye_height(),
                     mob.previous.z + (mob.position.z - mob.previous.z) * a,
                 ) - camera;
+                let start = out.len();
                 horizon_client::mobs::guardian::beam_geometry(
                     eye.as_vec3(),
                     (target - camera).as_vec3(),
@@ -5363,6 +5364,7 @@ impl Game<'_> {
                     uv,
                     out,
                 );
+                self.mark_motion(mob.id, super::MotionSource::MobBeam, start, out.len());
             }
         }
         self.elder_apparition_geometry(alpha, out);
@@ -5384,7 +5386,12 @@ impl Game<'_> {
         });
         // A glowing projectile's outline: what it drew up to the next one.
         let mut glowing = None;
+        let mut motion = None;
         for (a, at) in live.chain(taken) {
+            if let Some((id, start)) = motion.take() {
+                self.mark_motion(id, super::MotionSource::Projectile, start, out.len());
+            }
+            motion = Some((a.id, out.len()));
             if let Some((start, rgb)) = glowing.take() {
                 self.mark_outline(&out[start..], rgb);
             }
@@ -5609,6 +5616,9 @@ impl Game<'_> {
                     glint_uv: [0.0, 0.0],
                 });
             }
+        }
+        if let Some((id, start)) = motion {
+            self.mark_motion(id, super::MotionSource::Projectile, start, out.len());
         }
         if let Some((start, rgb)) = glowing {
             self.mark_outline(&out[start..], rgb);

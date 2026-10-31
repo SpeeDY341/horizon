@@ -460,7 +460,7 @@ impl Game<'_> {
             } else {
                 self.cull_entity_vertices(out, entity_start);
             }
-            self.mark_motion(item.id, true, entity_start, out.len());
+            self.mark_motion(item.id, super::MotionSource::Item, entity_start, out.len());
         }
     }
 }

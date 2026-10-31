@@ -478,6 +478,7 @@ impl Game<'_> {
         let atlas = &self.gui.atlas;
         let lookup = |name: &str| atlas.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
         for (key, (_, mob)) in &self.spawners.displays {
+            let motion_start = out.len();
             let at = glam::DVec3::new(f64::from(key.0), f64::from(key.1), f64::from(key.2));
             if at.distance_squared(camera) >= 64.0 * 64.0 {
                 continue;
@@ -520,6 +521,12 @@ impl Game<'_> {
                 packed,
                 self.res.mob_data(),
                 out,
+            );
+            self.mark_block_motion(
+                super::MotionSource::Spawner,
+                [key.0, key.1, key.2],
+                motion_start,
+                out.len(),
             );
         }
     }

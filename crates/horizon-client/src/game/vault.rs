@@ -212,6 +212,7 @@ impl Game<'_> {
     /// shows one, turning above its floor.
     pub(super) fn vault_geometry(&self, camera: glam::DVec3, alpha: f64, out: &mut Vec<Vertex>) {
         for (key, entity) in &self.world.block_entities {
+            let motion_start = out.len();
             let BlockEntity::Vault(vault) = entity else {
                 continue;
             };
@@ -241,6 +242,12 @@ impl Game<'_> {
             ) {
                 self.submit_item_world(&state, copy, vertex_light(light), out);
             }
+            self.mark_block_motion(
+                super::MotionSource::Vault,
+                [key.0, key.1, key.2],
+                motion_start,
+                out.len(),
+            );
         }
     }
 }

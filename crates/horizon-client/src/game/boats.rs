@@ -1058,6 +1058,7 @@ impl Game<'_> {
                 );
             }
             self.cull_entity_vertices(out, entity_start);
+            self.mark_motion(b.id, super::MotionSource::Boat, entity_start, out.len());
         }
     }
 }

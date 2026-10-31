@@ -800,6 +800,12 @@ impl Game<'_> {
             let packed = (u32::from(light >> 4) * 16) | ((u32::from(light & 15) * 16) << 8);
             self.armor_stand_vertices(a, base, packed, out);
             self.cull_entity_vertices(out, entity_start);
+            self.mark_motion(
+                a.id,
+                super::MotionSource::ArmorStand,
+                entity_start,
+                out.len(),
+            );
         }
     }
     /// `ArmorStandRenderer.submit` for stand `a` under `base` (its

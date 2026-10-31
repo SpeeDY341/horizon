@@ -723,6 +723,7 @@ impl Game<'_> {
                 self.view_scale(),
             );
         for t in &self.tridents {
+            let motion_start = out.len();
             // EntityRenderer.shouldRender; ThrownTridentRenderer grows the box by 1.5.
             if !self.standing_entity_in_view(
                 camera,
@@ -761,6 +762,7 @@ impl Game<'_> {
                 0,
                 out,
             );
+            self.mark_motion(t.id, super::MotionSource::Trident, motion_start, out.len());
         }
     }
 }

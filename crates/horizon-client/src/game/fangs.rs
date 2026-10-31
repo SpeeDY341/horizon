@@ -179,6 +179,7 @@ impl Game<'_> {
         };
         let partial = alpha as f32;
         for f in &self.fangs.list {
+            let motion_start = out.len();
             if !f.started {
                 continue;
             }
@@ -226,6 +227,7 @@ impl Game<'_> {
                 0,
                 out,
             );
+            self.mark_motion(f.id, super::MotionSource::Fangs, motion_start, out.len());
         }
     }
 }

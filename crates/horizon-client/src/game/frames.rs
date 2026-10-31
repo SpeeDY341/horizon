@@ -372,7 +372,7 @@ impl Game<'_> {
     /// ItemFrameRenderer: the frame model, then the item half size on its face.
     pub(super) fn frame_geometry(&mut self, camera: glam::DVec3, out: &mut Vec<Vertex>) {
         let sprites = &self.gui.atlas.sprites;
-        let mut maps: Vec<(i32, glam::Mat4, u32)> = Vec::new();
+        let mut maps: Vec<(u32, i32, glam::Mat4, u32)> = Vec::new();
         let mut items: Vec<(ItemStack, u32, glam::Mat4, u8)> = Vec::new();
         // ItemFrame.shouldRenderAtSqrDistance: 1024 blocks at a view scale
         // of 1.
@@ -475,6 +475,7 @@ impl Game<'_> {
                 }
             }
             self.cull_entity_vertices(out, entity_start);
+            self.mark_motion(f.id, super::MotionSource::Frame, entity_start, out.len());
             if let Some(id) = map {
                 // ItemFrameRenderer: the map fills the face, in 90-degree steps.
                 let depth = if f.invisible { 0.5 } else { 0.4375 };
@@ -489,7 +490,7 @@ impl Game<'_> {
                     * glam::DMat4::from_rotation_z(std::f64::consts::PI)
                     * glam::DMat4::from_scale(glam::DVec3::splat(0.0078125))
                     * glam::DMat4::from_translation(glam::DVec3::new(-64.0, -64.0, -1.0));
-                maps.push((id, m.as_mat4(), item_light));
+                maps.push((f.id, id, m.as_mat4(), item_light));
                 continue;
             }
             let Some(stack) = f.item.clone() else {
@@ -521,11 +522,18 @@ impl Game<'_> {
                 out,
             );
             self.cull_entity_vertices(out, entity_start);
+            self.mark_motion(id, super::MotionSource::FrameItem, entity_start, out.len());
         }
-        for (id, m, light) in maps {
+        for (frame_id, id, m, light) in maps {
             let entity_start = out.len();
             self.map_vertices(id, true, m, light, out);
             self.cull_entity_vertices(out, entity_start);
+            self.mark_motion(
+                frame_id,
+                super::MotionSource::FrameMap,
+                entity_start,
+                out.len(),
+            );
         }
     }
 }

@@ -1533,6 +1533,7 @@ impl Game<'_> {
             let poses = Poses::new(model);
             horizon_client::mobs::render::draw(model, m, &poses, uv, 0xFFFF_FFFF, packed, 0, out);
             self.cull_entity_vertices(out, entity_start);
+            self.mark_motion(c.id, super::MotionSource::Cart, entity_start, out.len());
         }
     }
     /// The chest inside a chest minecart, drawn by the chest block-entity renderer.

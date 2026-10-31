@@ -112,6 +112,7 @@ impl Game<'_> {
             * glam::Mat4::from_scale(glam::Vec3::new(k, -k, -k))
             * glam::Mat4::from_translation(glam::Vec3::new(0.0, -0.56, 3.5));
         let poses = horizon_client::mobs::anim::Poses::new(&kind.model);
+        let start = out.len();
         render::draw(
             &kind.model,
             m,
@@ -122,6 +123,7 @@ impl Game<'_> {
             0,
             out,
         );
+        self.mark_motion(0, super::MotionSource::Apparition, start, out.len());
     }
     /// The ominous banner a raid captain wears on its head: the banner model
     /// with its eight pattern layers (`CustomHeadLayer`).

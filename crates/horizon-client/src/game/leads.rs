@@ -38,6 +38,7 @@ fn abgr(r: f32, g: f32, b: f32) -> u32 {
 }
 /// One leashed entity's rope, as `EntityRenderer.extractRenderState` reads it.
 struct Rope {
+    id: u32,
     holder: Holder,
     /// `getPosition(partialTicks)`.
     here: glam::DVec3,
@@ -378,6 +379,7 @@ impl Game<'_> {
         for m in &self.mobs {
             if let Some(holder) = m.extra.leash {
                 ropes.push(Rope {
+                    id: m.id,
                     holder,
                     here: lerp3(m.previous, m.position),
                     body: body_of(m.previous_body_yaw, m.body_yaw),
@@ -390,6 +392,7 @@ impl Game<'_> {
         for b in &self.boats {
             if let Some(holder) = b.leash {
                 ropes.push(Rope {
+                    id: b.id,
                     holder,
                     here: lerp3(b.previous, b.position),
                     // Entity.getPreciseBodyRotation: the boat's yaw.
@@ -400,7 +403,9 @@ impl Game<'_> {
             }
         }
         for rope in ropes {
+            let motion_start = out.len();
             let Rope {
+                id,
                 holder,
                 here,
                 body,
@@ -519,6 +524,7 @@ impl Game<'_> {
                     }
                 }
             }
+            self.mark_motion(id, super::MotionSource::Leash, motion_start, out.len());
         }
         // The knots: a 6 by 8 by 6 pixel block on the fence post.
         static KNOT: std::sync::OnceLock<Option<horizon_client::mobs::Part>> =

@@ -269,6 +269,7 @@ impl Game<'_> {
             };
             self.mark_entity(out.len(), kind);
             for (id, display) in displays.iter_mut().filter(|(_, d)| d.shows == shows) {
+                let motion_start = out.len();
                 display.last_progress = display.progress(partial as f32);
                 let d = display.shown.blend(&display.from, display.last_progress);
                 let position = display.previous.lerp(display.position, partial);
@@ -306,6 +307,12 @@ impl Game<'_> {
                     let pose = matrix * glam::Mat4::from_rotation_y(std::f32::consts::PI);
                     self.submit_item_world(&state, pose, light, out);
                 }
+                self.mark_motion(
+                    *id as u32,
+                    super::MotionSource::Display,
+                    motion_start,
+                    out.len(),
+                );
             }
         }
         self.mark_entity(out.len(), "");

@@ -537,6 +537,7 @@ impl Game<'_> {
                 out,
             );
             self.cull_entity_vertices(out, entity_start);
+            self.mark_motion(c.id, super::MotionSource::Cushion, entity_start, out.len());
         }
     }
 }

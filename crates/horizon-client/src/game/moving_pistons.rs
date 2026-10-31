@@ -29,6 +29,7 @@ impl Game<'_> {
             .map(|&(p, s)| (p, s, true));
         let states: Vec<_> = live.chain(finished).collect();
         for (p, piston, placed) in states {
+            let motion_start = out.len();
             let Some((block, base)) = self.moving_piston_blocks(piston, partial) else {
                 continue;
             };
@@ -53,6 +54,7 @@ impl Game<'_> {
             if let Some(base) = base {
                 self.moving_block_vertices(base, at, corner - camera, out);
             }
+            self.mark_block_motion(super::MotionSource::Piston, p, motion_start, out.len());
         }
     }
     /// The section holding the block at `p` (`SectionPos.blockToSection`).

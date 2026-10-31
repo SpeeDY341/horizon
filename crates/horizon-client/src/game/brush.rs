@@ -270,6 +270,7 @@ impl Game<'_> {
     pub(super) fn brushable_geometry(&self, camera: glam::DVec3, out: &mut Vec<Vertex>) {
         use horizon_assets::item_model::DisplayContext;
         for (key, entity) in &self.world.block_entities {
+            let motion_start = out.len();
             let BlockEntity::Brushable(b) = entity else {
                 continue;
             };
@@ -317,6 +318,12 @@ impl Game<'_> {
                 key.2 + adjacent[2],
             );
             self.submit_item_world(&item, pose, vertex_light(light), out);
+            self.mark_block_motion(
+                super::MotionSource::Brushable,
+                [key.0, key.1, key.2],
+                motion_start,
+                out.len(),
+            );
         }
     }
 

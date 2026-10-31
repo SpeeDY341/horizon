@@ -405,6 +405,7 @@ impl Game<'_> {
                 0.6,
             );
             self.cull_entity_vertices(out, entity_start);
+            self.mark_motion(p.id, super::MotionSource::Painting, entity_start, out.len());
         }
     }
 }

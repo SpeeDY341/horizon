@@ -277,6 +277,7 @@ mod wither;
 mod world_loading;
 mod zombie_reinforcements;
 mod zombie_villagers;
+use horizon_client::gfx::motion_history::{Key as MotionKey, Source as MotionSource};
 use horizon_client::{
     Result,
     assets::{Assets, RenderAssets},
@@ -9284,20 +9285,41 @@ impl Game<'_> {
     pub(super) fn camera_orientation(&self) -> glam::Quat {
         camera_rotation(self.camera_type, self.yaw, self.pitch)
     }
-    pub(super) fn mark_motion(&self, id: u32, item: bool, start: usize, end: usize) {
+    pub(super) fn mark_motion(&self, id: u32, source: MotionSource, start: usize, end: usize) {
         if end > start
             && self
                 .renderer
                 .as_ref()
                 .is_some_and(Renderer::motion_vectors_enabled)
         {
-            self.motion_spans
-                .borrow_mut()
-                .push(horizon_client::gfx::motion_history::Span {
-                    id,
-                    item,
-                    vertices: start..end,
-                });
+            horizon_client::gfx::motion_history::Span::entity(
+                &mut self.motion_spans.borrow_mut(),
+                source,
+                id,
+                self.persist.uuids.get(&id).copied(),
+                start,
+                end,
+            );
+        }
+    }
+    pub(super) fn mark_block_motion(
+        &self,
+        source: MotionSource,
+        pos: [i32; 3],
+        start: usize,
+        end: usize,
+    ) {
+        if self
+            .renderer
+            .as_ref()
+            .is_some_and(Renderer::motion_vectors_enabled)
+        {
+            horizon_client::gfx::motion_history::Span::record(
+                &mut self.motion_spans.borrow_mut(),
+                MotionKey::Block(source, pos),
+                start,
+                end,
+            );
         }
     }
     /// ItemEntityRenderer: items bob and spin; blocks render as small cubes.
@@ -9558,7 +9580,8 @@ impl Game<'_> {
                                 v.intersects(o - glam::Vec3::ONE, o + glam::Vec3::splat(2.0))
                             })
                     });
-            if self.entity_culler.is_some() || self.pack_ids.is_some() {
+            if self.entity_culler.is_some() || self.pack_ids.is_some() || r.motion_vectors_enabled()
+            {
                 for block in visible {
                     let start = out.len();
                     self.mark_block_entity(start, block.1);
@@ -9568,6 +9591,7 @@ impl Game<'_> {
                     if !off_screen(block.1) && self.entity_culler.is_some() {
                         self.cull_entity_vertices(&mut out, start);
                     }
+                    self.mark_block_motion(MotionSource::BlockEntity, block.0, start, out.len());
                 }
             } else {
                 self.res
@@ -9677,6 +9701,7 @@ impl Game<'_> {
             for vertex in &mut out[start..] {
                 vertex.color = horizon_client::hud_layout::multiply(vertex.color, tint);
             }
+            self.mark_motion(f.id, MotionSource::FallingBlock, start, out.len());
         }
         self.mark_entity(out.len(), "");
         self.moving_piston_geometry(camera, alpha, &mut out);
@@ -13616,10 +13641,8 @@ impl Game<'_> {
         };
         let mut additive = Vec::new();
         if !title && self.dim == Dim::End {
-            let mut dragon = Vec::new();
-            self.dragon_geometry(camera, alpha, &mut dragon, &mut additive);
-            self.dragon_fireball_geometry(camera, alpha, &mut dragon);
-            entities.extend(dragon);
+            self.dragon_geometry(camera, alpha, &mut entities, &mut additive);
+            self.dragon_fireball_geometry(camera, alpha, &mut entities);
         }
         let (celestial, stars) = if title {
             (Vec::new(), None)

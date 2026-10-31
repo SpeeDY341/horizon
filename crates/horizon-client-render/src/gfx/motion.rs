@@ -385,8 +385,11 @@ mod tests {
                 &mut encoder,
                 glam::DVec3::ZERO,
                 &[super::Span {
-                    id: 1,
-                    item: false,
+                    key: super::super::motion_history::Key::Entity(
+                        super::super::motion_history::Source::Mob,
+                        1,
+                        None,
+                    ),
                     vertices: 0..4,
                 }],
                 &vertices,

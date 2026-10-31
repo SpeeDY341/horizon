@@ -259,6 +259,7 @@ impl Game<'_> {
             self.view_scale(),
         );
         for t in &self.tnts {
+            let motion_start = out.len();
             // EntityRenderer.shouldRender.
             if !self.standing_entity_in_view(
                 camera,
@@ -341,6 +342,7 @@ impl Game<'_> {
                     });
                 }
             }
+            self.mark_motion(t.id, super::MotionSource::Tnt, motion_start, out.len());
         }
     }
 }
