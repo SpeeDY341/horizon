@@ -160,3 +160,11 @@ mod tests {
         assert_eq!(offset_of!(Requirements, features13), 168);
     }
 }
+
+#[repr(C)]
+pub struct FeatureVersion {
+    pub base: Base,
+    pub streamline: Version,
+    pub ngx: Version,
+}
+pub type GetFeatureVersion = unsafe extern "C" fn(u32, *mut FeatureVersion) -> i32;

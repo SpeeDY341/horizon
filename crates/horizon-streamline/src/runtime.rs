@@ -148,6 +148,38 @@ impl Runtime {
         })
     }
 
+    /// Versions reported by the initialized DLSS plugin, not file names.
+    pub fn dlss_versions(&self) -> Result<String, String> {
+        let mut versions = abi::FeatureVersion {
+            base: abi::Base::new(
+                0x6d5b51f0,
+                0x076b,
+                0x486d,
+                [0x99, 0x95, 0x5a, 0x56, 0x10, 0x43, 0xf5, 0xc1],
+                1,
+            ),
+            streamline: abi::Version::default(),
+            ngx: abi::Version::default(),
+        };
+        // Safety: initialized plugin, pinned public ABI and writable structure.
+        let code = unsafe {
+            let get = self
+                ._library
+                .get::<abi::GetFeatureVersion>(b"slGetFeatureVersion\0")
+                .map_err(|e| e.to_string())?;
+            get(0, &mut versions)
+        };
+        if code != 0 {
+            return Err(format!("DLSS version query failed ({code})"));
+        }
+        let v = |v: &abi::Version| format!("{}.{}.{}", v.major, v.minor, v.build);
+        Ok(format!(
+            "DLSS {} / SL {}",
+            v(&versions.ngx),
+            v(&versions.streamline)
+        ))
+    }
+
     /// Creates a Vulkan instance through Streamline's official interposer, so
     /// its Vulkan extensions, hooks and presentation bookkeeping are installed.
     /// Keep this runtime until GPU work is drained, then drop it before the instance.

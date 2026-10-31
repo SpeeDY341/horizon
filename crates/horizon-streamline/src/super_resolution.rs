@@ -80,7 +80,7 @@ pub struct SuperResolution {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pub(crate) targets: Option<super::evaluate::Targets>,
-    configuration: Option<(u32, [u32; 2])>,
+    configuration: Option<(u32, [u32; 2], u32)>,
     // Last: shutdown must run with the device and instance still retained by Runtime.
     _runtime: Arc<Mutex<Runtime>>,
 }
@@ -128,18 +128,30 @@ impl SuperResolution {
     /// Mode values are the SDK's Quality=3, Balanced=2, Performance=1,
     /// Ultra Performance=4, DLAA=6. Size is obtained from NVIDIA, never guessed.
     pub fn configure(&mut self, mode: u32, output: [u32; 2]) -> Result<[u32; 2], String> {
+        self.configure_with_preset(mode, output, 0)
+    }
+
+    /// A requested SDK preset. The SDK/driver can override legacy presets.
+    pub fn configure_with_preset(
+        &mut self,
+        mode: u32,
+        output: [u32; 2],
+        preset: u32,
+    ) -> Result<[u32; 2], String> {
         let _session = self._runtime.lock().map_err(|e| e.to_string())?;
-        if ![1, 2, 3, 4, 6].contains(&mode)
+        if ![0, 5, 6, 10, 11, 12, 13].contains(&preset)
+            || ![1, 2, 3, 4, 6].contains(&mode)
             || output.contains(&0)
             || output.iter().any(|n| *n > 8192)
         {
             return Err("Invalid DLSS mode or output size".into());
         }
-        if self.configuration == Some((mode, output)) {
+        if self.configuration == Some((mode, output, preset)) {
             return Ok(self.targets.as_ref().unwrap().size);
         }
         let viewport = sl::Viewport::new();
-        let options = sl::Options::new(mode, output);
+        let mut options = sl::Options::new(mode, output);
+        options.presets = [preset; 6];
         let mut optimal = sl::Optimal::new();
         // Safety: initialized DLSS on a registered Vulkan device and pinned ABI.
         unsafe {
@@ -164,7 +176,7 @@ impl SuperResolution {
             return Err(e.to_string());
         }
         self.targets = Some(targets);
-        self.configuration = Some((mode, output));
+        self.configuration = Some((mode, output, preset));
         Ok(size)
     }
 
@@ -298,6 +310,7 @@ mod tests {
         assert_eq!(size_of::<sl::Resource>(), 112);
         assert_eq!(size_of::<sl::Tag>(), 64);
         assert_eq!(size_of::<sl::Viewport>(), 40);
+        assert_eq!(size_of::<crate::abi::FeatureVersion>(), 56);
     }
     #[test]
     #[ignore = "requires the official SDK and an RTX Vulkan device"]
@@ -316,8 +329,18 @@ mod tests {
         let (device, queue) =
             pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         runtime.attach_device(&device).unwrap();
+        let versions = runtime.dlss_versions().unwrap();
+        println!("{versions}");
+        assert!(!versions.contains("DLSS 0.0.0"));
         let runtime = Arc::new(Mutex::new(runtime));
         let mut sr = SuperResolution::new(runtime.clone(), &device, &queue).unwrap();
+        for mode in [3, 2, 1, 4] {
+            let size = sr.configure_with_preset(mode, [640, 360], 11).unwrap();
+            println!(
+                "mode={mode} render={}x{} output=640x360 requested=K",
+                size[0], size[1]
+            );
+        }
         let size = sr.configure(3, [640, 360]).unwrap();
         let make = |format, usage| {
             device
