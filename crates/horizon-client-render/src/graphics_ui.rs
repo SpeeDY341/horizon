@@ -274,17 +274,17 @@ pub fn rows(level: Level) -> Vec<Row> {
             h(
                 H::Antialiasing,
                 Medium,
-                "Smooths jagged edges. FXAA: softer. TAA: smoothest, moving things may trail.",
-            ),
-            h(
-                H::Upscaling,
-                High,
-                "Renders the world smaller and rebuilds it with TAA. Faster, softer.",
+                "FXAA is softer, TAA is smoothest. Either one turns DLSS off.",
             ),
             h(
                 H::Dlss,
                 High,
-                "Replaces TAA upscaling. TAA is fallback only. First use: restart.",
+                "Standard or DLSS. DLSS turns AA off. The first switch needs a restart.",
+            ),
+            h(
+                H::Upscaling,
+                High,
+                "Native, Quality, Balanced, Performance, Ultra. Used by both upscalers.",
             ),
             h(H::DlssStatus, None, "Actual renderer and fallback reason."),
             h(
@@ -387,18 +387,10 @@ pub fn rows(level: Level) -> Vec<Row> {
 const UPLOAD_STEPS: [u32; 8] = [0, 256, 512, 1024, 2048, 4096, 8192, 16384];
 
 /// Horizon's graphics screens supplement the vanilla options on Video Settings.
-/// DLSS replaces the TAA controls; their stored values are only its fallback.
-fn extra_rows(level: Level, settings: &Settings) -> Vec<Row> {
+/// Anti-aliasing, the upscaler and quality stay visible together.
+fn extra_rows(level: Level, _settings: &Settings) -> Vec<Row> {
     let mut rows = rows(level);
     rows.retain(|row| !matches!(row, Row::Setting(s) if matches!(s.item, Item::Vanilla(_))));
-    if settings.horizon.dlss != Dlss::Off {
-        rows.retain(|row| {
-            !matches!(row, Row::Setting(s) if matches!(s.item,
-                Item::Horizon(H::Antialiasing | H::Upscaling)))
-        });
-    } else if !settings.horizon.taa {
-        rows.retain(|row| !matches!(row, Row::Setting(s) if s.item == Item::Horizon(H::Upscaling)));
-    }
     // Drop headings whose settings were all on the parent screens.
     let mut has_setting = false;
     rows.reverse();
@@ -496,14 +488,25 @@ impl H {
             H::ResolutionScale => labelled("Resolution Scale", format!("{}%", g.resolution_scale)),
             H::Antialiasing => labelled(
                 "Anti-aliasing",
-                match (g.fxaa, g.taa) {
-                    (_, true) => "TAA",
-                    (true, false) => "FXAA",
-                    (false, false) => "Off",
+                if g.dlss_upscaler() {
+                    "Off"
+                } else {
+                    match (g.fxaa, g.taa) {
+                        (_, true) => "TAA",
+                        (true, false) => "FXAA",
+                        (false, false) => "Off",
+                    }
                 },
             ),
-            H::Upscaling => labelled("Upscaling", g.upscaling.label()),
-            H::Dlss => labelled("DLSS", g.dlss.label()),
+            H::Upscaling => labelled("Quality", g.upscaling.label()),
+            H::Dlss => labelled(
+                "Upscaler",
+                if g.dlss_upscaler() {
+                    "DLSS"
+                } else {
+                    "Standard"
+                },
+            ),
             H::DlssStatus => labelled("DLSS Status", crate::graphics::dlss_status()),
             H::DlssPreset => labelled("DLSS Preset", g.dlss_preset.name()),
             H::DlssNetwork => labelled("Requested Network", g.dlss_preset.network()),
@@ -622,29 +625,28 @@ impl H {
             H::Weather => g.weather = !g.weather,
             H::AnimatedTextures => g.animated_textures = !g.animated_textures,
             H::PresentMode => g.present_mode = step(&PresentMode::ALL, g.present_mode, back),
-            // Off, FXAA, TAA.
+            // Off, FXAA, TAA. TAA and FXAA leave DLSS for the built-in upscaler.
             H::Antialiasing => {
-                g.dlss = Dlss::Off;
-                let i = if g.taa { 2 } else { usize::from(g.fxaa) };
+                let i = if g.dlss_upscaler() {
+                    0
+                } else if g.taa {
+                    2
+                } else {
+                    usize::from(g.fxaa)
+                };
                 let i = (i + if back { 2 } else { 1 }) % 3;
-                (g.fxaa, g.taa) = (i == 1, i == 2);
-                if !g.taa {
-                    g.upscaling = Upscaling::Native;
-                }
-            }
-            // Upscaling is TAA's: picking a ratio turns it on.
-            H::Upscaling => {
+                g.fxaa = i == 1;
+                g.taa = i == 2;
                 g.dlss = Dlss::Off;
-                g.upscaling = step(&Upscaling::ALL, g.upscaling, back);
-                if g.upscaling != Upscaling::Native {
-                    (g.fxaa, g.taa) = (false, true);
-                }
+            }
+            H::Upscaling => {
+                g.set_upscale_quality(step(&Upscaling::ALL, g.upscaling, back));
             }
             H::Dlss => {
-                g.dlss = step(&Dlss::ALL, g.dlss, back);
-                if g.dlss != Dlss::Off {
-                    g.taa = true;
-                    g.fxaa = false;
+                if g.dlss_upscaler() {
+                    g.select_standard_upscaler();
+                } else {
+                    g.select_dlss_upscaler();
                 }
             }
             H::DlssStatus
@@ -1359,27 +1361,48 @@ mod tests {
     #[test]
     fn dlss_is_opt_in_and_taa_controls_can_leave_it() {
         let mut s = Settings::default();
+        let upscaler = Item::Horizon(H::Dlss);
+        let quality = Item::Horizon(H::Upscaling);
+        let aa = Item::Horizon(H::Antialiasing);
         assert_eq!(s.horizon.dlss, Dlss::Off);
-        let button = Item::Horizon(H::Dlss);
-        for mode in Dlss::ALL.into_iter().skip(1) {
-            button.cycle(&mut s, false, [1280, 720]);
-            assert_eq!(s.horizon.dlss, mode);
-            assert!(s.horizon.taa);
-            assert!(!s.horizon.fxaa);
-            for level in [Level::Simple, Level::Advanced] {
-                assert!(!extra_rows(level, &s).iter().any(|row| {
-                    matches!(row, Row::Setting(r) if matches!(r.item,
-                        Item::Horizon(H::Antialiasing | H::Upscaling)))
-                }));
-            }
-            let loaded = crate::graphics::Graphics::parse(&s.horizon.serialize());
-            assert_eq!(loaded.dlss, mode);
+        assert_eq!(upscaler.label(&s).plain(), "Upscaler: Standard");
+
+        upscaler.cycle(&mut s, false, [1280, 720]);
+        assert_eq!(s.horizon.dlss, Dlss::Dlaa);
+        assert!(!s.horizon.taa);
+        assert!(!s.horizon.fxaa);
+        assert_eq!(aa.label(&s).plain(), "Anti-aliasing: Off");
+        assert_eq!(upscaler.label(&s).plain(), "Upscaler: DLSS");
+        assert_eq!(quality.label(&s).plain(), "Quality: Native");
+        let rows = extra_rows(Level::Advanced, &s);
+        for item in [aa, upscaler, quality] {
+            assert!(
+                rows.iter()
+                    .any(|row| matches!(row, Row::Setting(r) if r.item == item))
+            );
         }
-        Item::Horizon(H::Upscaling).cycle(&mut s, false, [1280, 720]);
+
+        quality.cycle(&mut s, false, [1280, 720]);
+        assert_eq!(s.horizon.upscaling, Upscaling::Quality);
+        assert_eq!(s.horizon.dlss, Dlss::Quality);
+        assert_eq!(aa.label(&s).plain(), "Anti-aliasing: Off");
+        let loaded = crate::graphics::Graphics::parse(&s.horizon.serialize());
+        assert_eq!(loaded.dlss, Dlss::Quality);
+        assert_eq!(loaded.upscaling, Upscaling::Quality);
+
+        aa.cycle(&mut s, false, [1280, 720]);
         assert_eq!(s.horizon.dlss, Dlss::Off);
-        button.cycle(&mut s, false, [1280, 720]);
-        Item::Horizon(H::Antialiasing).cycle(&mut s, false, [1280, 720]);
+        assert_eq!(aa.label(&s).plain(), "Anti-aliasing: FXAA");
+        assert_eq!(upscaler.label(&s).plain(), "Upscaler: Standard");
+        assert_eq!(s.horizon.upscaling, Upscaling::Quality);
+
+        upscaler.cycle(&mut s, false, [1280, 720]);
+        assert_eq!(s.horizon.dlss, Dlss::Quality);
+        assert_eq!(aa.label(&s).plain(), "Anti-aliasing: Off");
+        aa.cycle(&mut s, true, [1280, 720]);
         assert_eq!(s.horizon.dlss, Dlss::Off);
+        assert!(s.horizon.taa);
+        assert_eq!(aa.label(&s).plain(), "Anti-aliasing: TAA");
     }
 
     #[test]
@@ -1465,24 +1488,21 @@ mod tests {
         item.cycle(&mut s, true, [854, 480]);
         assert_eq!((s.horizon.fxaa, s.horizon.taa), (false, true));
 
-        // Upscaling needs TAA: a ratio turns it on, leaving TAA goes back to Native.
+        // Quality applies to the built-in upscaler by turning TAA on, and the row stays.
         s.horizon.taa = false;
-        let upscaling = Item::Horizon(H::Upscaling);
-        upscaling.cycle(&mut s, false, [854, 480]);
-        assert_eq!(upscaling.label(&s).plain(), "Upscaling: Quality");
+        let quality = Item::Horizon(H::Upscaling);
+        quality.cycle(&mut s, false, [854, 480]);
+        assert_eq!(quality.label(&s).plain(), "Quality: Quality");
         assert!(s.horizon.taa);
+        assert_eq!(s.horizon.dlss, Dlss::Off);
         item.cycle(&mut s, false, [854, 480]);
-        assert_eq!(s.horizon.upscaling, Upscaling::Native);
-
-        // The Upscaling row is only on the screen while TAA is on.
-        let shown = |s: &Settings| {
-            extra_rows(Level::Advanced, s)
+        assert_eq!(s.horizon.upscaling, Upscaling::Quality);
+        assert_eq!(item.label(&s).plain(), "Anti-aliasing: Off");
+        assert!(
+            extra_rows(Level::Advanced, &s)
                 .iter()
-                .any(|row| matches!(row, Row::Setting(r) if r.item == upscaling))
-        };
-        assert!(!shown(&s));
-        s.horizon.taa = true;
-        assert!(shown(&s));
+                .any(|row| matches!(row, Row::Setting(r) if r.item == quality))
+        );
     }
 
     #[test]

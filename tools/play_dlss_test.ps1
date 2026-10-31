@@ -18,8 +18,8 @@ if (!(Test-Path (Join-Path $resources 'horizon-resources.json'))) {
         } | Select-Object -First 1
 }
 if (!$resources) { throw 'Prepare Minecraft 26.3 once in the Horizon launcher, then run this test again.' }
-$scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('horizon-dlss-test-' + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory $scratch | Out-Null
+$scratch = Join-Path ([System.IO.Path]::GetTempPath()) 'horizon-dlss-test'
+New-Item -ItemType Directory -Force $scratch | Out-Null
 $env:HORIZON_HOME = Join-Path $scratch 'home'
 $env:HORIZON_LAUNCHER_HOME = Join-Path $scratch 'launcher'
 $env:XDG_DATA_HOME = Join-Path $scratch 'data'
@@ -31,12 +31,19 @@ $env:HORIZON_LAUNCHER_CLIPBOARD = Join-Path $scratch 'clipboard'
 $env:HORIZON_LAUNCHER_DESKTOP = Join-Path $scratch 'desktop'
 $env:HORIZON_STREAMLINE_SDK = $sdk
 Remove-Item Env:HORIZON_DLSS_FORCE_ERROR -ErrorAction SilentlyContinue
-"graphicsApi:vulkan`ndlss:quality`ntaa:true`nupscaling:quality`noverlay:fps`nhdr:false`n" |
-    Set-Content (Join-Path $scratch 'horizon-graphics.txt') -Encoding ASCII
-"renderDistance:8`nmaxFps:120`nguiScale:2`n" |
-    Set-Content (Join-Path $scratch 'options.txt') -Encoding ASCII
-Write-Host 'DLSS test: a new Creative world, Vulkan, Quality. Sound is disabled.'
-Write-Host 'Esc > Options > Horizon Settings > Advanced Graphics: DLSS and DLSS Status.'
+Remove-Item Env:HORIZON_GRAPHICS_API -ErrorAction SilentlyContinue
+$graphics = Join-Path $scratch 'horizon-graphics.txt'
+if (!(Test-Path $graphics)) {
+    "graphicsApi:vulkan`ndlss:quality`nfxaa:false`ntaa:false`nupscaling:quality`noverlay:fps`nhdr:false`n" |
+        Set-Content $graphics -Encoding ASCII
+}
+$options = Join-Path $scratch 'options.txt'
+if (!(Test-Path $options)) {
+    "renderDistance:8`nmaxFps:120`nguiScale:2`n" | Set-Content $options -Encoding ASCII
+}
+Write-Host 'DLSS test world. Sound is off. Settings in this folder are kept between launches.'
+Write-Host 'Esc, Options, Horizon Settings, Advanced Graphics: Anti-aliasing, Upscaler, Quality.'
+Write-Host 'Graphics API applies on the next launch. DLSS itself runs on Vulkan only.'
 Write-Host ('Test files and log: ' + $scratch)
 Push-Location $root
 try {
