@@ -1951,6 +1951,7 @@ struct Game<'a> {
     /// Runs of `entity_vertices` by entity, for a shader pack's per-entity draws; recorded only
     /// while `pack_ids` is set (game/shader_packs.rs).
     entity_spans: std::cell::RefCell<Vec<horizon_client::gfx::pack_draw::EntitySpan>>,
+    motion_spans: std::cell::RefCell<Vec<horizon_client::gfx::motion_history::Span>>,
     /// The glowing entities' silhouettes this frame (game/glowing.rs).
     glowing_vertices: std::cell::RefCell<Vec<Vertex>>,
     /// The shader pack's entity and block entity ids, while one draws entities.
@@ -9283,6 +9284,22 @@ impl Game<'_> {
     pub(super) fn camera_orientation(&self) -> glam::Quat {
         camera_rotation(self.camera_type, self.yaw, self.pitch)
     }
+    pub(super) fn mark_motion(&self, id: u32, item: bool, start: usize, end: usize) {
+        if end > start
+            && self
+                .renderer
+                .as_ref()
+                .is_some_and(Renderer::motion_vectors_enabled)
+        {
+            self.motion_spans
+                .borrow_mut()
+                .push(horizon_client::gfx::motion_history::Span {
+                    id,
+                    item,
+                    vertices: start..end,
+                });
+        }
+    }
     /// ItemEntityRenderer: items bob and spin; blocks render as small cubes.
     fn entity_geometry(
         &mut self,
@@ -9291,6 +9308,7 @@ impl Game<'_> {
         mut out: Vec<Vertex>,
     ) -> Vec<Vertex> {
         self.entity_spans.borrow_mut().clear();
+        self.motion_spans.borrow_mut().clear();
         // LevelExtractor.extract: the transient blocks queued since the last frame.
         self.drain_transient_block_queue();
         self.prepare_entity_culling(camera);
@@ -13662,6 +13680,7 @@ impl Game<'_> {
         // map_patches any earlier leaves them a frame behind.
         hud.patches.append(&mut self.map_patches);
         let entity_spans = std::mem::take(self.entity_spans.get_mut());
+        let motion_spans = std::mem::take(self.motion_spans.get_mut());
         let glowing = std::mem::take(self.glowing_vertices.get_mut());
         let frame = Frame {
             weather: &weather,
@@ -13729,6 +13748,7 @@ impl Game<'_> {
             }),
             entities: &entities,
             entity_spans: &entity_spans,
+            motion_spans: &motion_spans,
             glowing: &glowing,
             dynamic_lights: &self.dynamic_lights,
             lightning: horizon_client::gfx::lightning::Input {
@@ -13803,6 +13823,7 @@ impl Game<'_> {
         // Restore storage even when rendering fails (for example, a lost surface).
         self.entity_vertices = entities;
         *self.entity_spans.get_mut() = entity_spans;
+        *self.motion_spans.get_mut() = motion_spans;
         *self.glowing_vertices.get_mut() = glowing;
         self.see_through_vertices = see_through;
         result
@@ -15814,6 +15835,7 @@ impl<'a> Game<'a> {
             luminance: None,
             see_through_vertices: Vec::new(),
             entity_spans: Default::default(),
+            motion_spans: Default::default(),
             glowing_vertices: Default::default(),
             pack_ids: None,
             health_hud: hud_layout::HealthHud::default(),
@@ -17018,6 +17040,7 @@ fn loading_frame(hud: &HudBatch) -> Frame<'_> {
         nether_lighting: false,
         entities: &[],
         entity_spans: &[],
+        motion_spans: &[],
         glowing: &[],
         dynamic_lights: &[],
         clouds: None,

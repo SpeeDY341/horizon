@@ -5343,6 +5343,7 @@ impl Game<'_> {
             {
                 self.cull_entity_vertices(out, entity_start);
             }
+            self.mark_motion(mob.id, false, entity_start, out.len());
             // GuardianRenderer: the laser to the locked target.
             if let Some((time, scale)) = horizon_client::mobs::guardian::beam(mob, alpha as f32)
                 && let Some(target) = self.beam_target(mob.ai.target, alpha)

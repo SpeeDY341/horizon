@@ -37,6 +37,7 @@ fn entity_shader() -> String {
 mod crumbling_tests;
 mod entity_batch;
 mod entity_outline;
+pub mod motion_history;
 mod weather;
 use entity_batch::EntityBatch;
 pub use entity_batch::{
@@ -337,6 +338,8 @@ pub struct Frame<'a> {
     pub nether_lighting: bool,
     /// Camera-relative entity geometry textured from the shared atlas.
     pub entities: &'a [Vertex],
+    /// Stable visible entity ranges for temporal motion, before material sorting.
+    pub motion_spans: &'a [motion_history::Span],
     /// The glowing entities' silhouettes in their team colours (`OutlineBufferSource`),
     /// outlined through walls after the hand.
     pub glowing: &'a [Vertex],
@@ -3663,6 +3666,15 @@ impl Renderer {
         crate::graphics::report(now);
         true
     }
+    /// Experimental data preparation is opt-in and restricted to Vulkan RTX.
+    pub fn motion_vectors_enabled(&self) -> bool {
+        let info = self.adapter.get_info();
+        info.backend == wgpu::Backend::Vulkan
+            && info.vendor == 0x10de
+            && info.name.to_ascii_uppercase().contains("RTX")
+            && std::env::var("HORIZON_DLSS_MOTION").as_deref() == Ok("1")
+    }
+
     /// `upscale`: output pixels per rendered pixel, for TAA to rebuild (1: native).
     pub fn set_world_post(&mut self, scale: f32, antialias: bool, taa: bool, upscale: f32) {
         let taa = taa && self.world_post.supports_taa();
