@@ -2,12 +2,18 @@ use crate::abi;
 use std::{
     ffi::{CStr, CString},
     path::Path,
-    sync::{Mutex, MutexGuard},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 // Streamline is process-global. Initialization/shutdown must never overlap,
 // including two renderer startups or resource reloads.
-static SESSION: Mutex<()> = Mutex::new(());
+static SESSION: AtomicBool = AtomicBool::new(false);
+struct Lease;
+impl Drop for Lease {
+    fn drop(&mut self) {
+        SESSION.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Debug)]
 pub struct Requirements {
@@ -29,8 +35,8 @@ pub struct Runtime {
     device: Option<wgpu::Device>,
     instance: Option<wgpu::Instance>,
     directory: std::path::PathBuf,
-    _library: libloading::os::windows::Library,
-    _session: MutexGuard<'static, ()>,
+    pub(crate) _library: libloading::os::windows::Library,
+    _session: Lease,
 }
 
 impl Runtime {
@@ -55,9 +61,10 @@ impl Runtime {
             directory
         };
         let project_id = CString::new(project_id).map_err(|e| e.to_string())?;
-        let guard = SESSION
-            .try_lock()
+        SESSION
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| "Streamline is already in use")?;
+        let guard = Lease;
         let path = directory.join("sl.interposer.dll");
         // Safety: explicit library path, restricted dependency search, only the
         // pinned public ABI is called; library remains alive until shutdown.

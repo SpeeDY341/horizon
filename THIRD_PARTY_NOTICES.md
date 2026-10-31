@@ -62,7 +62,7 @@ and its logo are trademarks of the Microsoft group of companies; Horizon is not 
 
 ## NVIDIA Streamline public interface
 
-`crates/horizon-streamline/src/abi.rs` translates selected declarations from the
+`crates/horizon-streamline/src/{abi,dlss_abi}.rs` translate selected declarations from the
 MIT-licensed public headers of NVIDIA Streamline 2.14.16, commit
 [625db07d4bca5abc67d781c42af7e7fb0761f1b6](https://github.com/NVIDIA-RTX/Streamline/tree/625db07d4bca5abc67d781c42af7e7fb0761f1b6).
 Copyright (c) 2022-2024 NVIDIA CORPORATION. All rights reserved.

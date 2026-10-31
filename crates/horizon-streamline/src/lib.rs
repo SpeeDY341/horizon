@@ -16,6 +16,10 @@ pub fn eligible(vulkan: bool, vendor: u32, name: &str) -> bool {
         && name.to_ascii_uppercase().contains("RTX")
 }
 
+#[cfg(target_os = "windows")]
+#[allow(dead_code)] // Public ABI is consumed by the following integration changes.
+mod dlss_abi;
+
 #[cfg(test)]
 mod tests {
     #[test]

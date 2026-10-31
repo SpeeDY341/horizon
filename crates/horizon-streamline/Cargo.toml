@@ -9,9 +9,8 @@ description = "Isolated native NVIDIA Streamline integration for Vulkan"
 [target.'cfg(target_os = "windows")'.dependencies]
 libloading = "0.8.9"
 ash = { version = "0.38", default-features = false, features = ["loaded"] }
-wgpu = { version = "30.0.1", default-features = false, features = ["std", "vulkan"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "vulkan", "wgsl"] }
 
-[dev-dependencies]
 pollster = "0.4"
 
 [lints]
