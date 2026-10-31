@@ -36,7 +36,7 @@ use crate::{
     abi::Base,
     dlss_abi::{self as sl, GetFunction},
     evaluate::tagged_resource,
-    super_resolution::{self, FrameConstants},
+    super_resolution::FrameConstants,
 };
 use ash::vk::{self, Handle};
 use std::{
@@ -109,7 +109,6 @@ struct Api {
     options: SetOptions,
     state: GetState,
     tag: SetTag,
-    constants: sl::SetConstants,
 }
 
 pub struct Inputs<'a> {
@@ -179,11 +178,18 @@ impl Session {
         self.needs_reset
     }
 
+    pub(crate) fn invalidate_history(&mut self) {
+        self.needs_reset = true;
+    }
+
     fn frame_ready(&self, allow: bool, inputs_ready: bool, reset: bool) -> bool {
         allow && inputs_ready && self.wanted > 0 && (!self.needs_reset || reset)
     }
 
     pub(crate) fn set_wanted(&mut self, generated: u32) {
+        if self.wanted != generated {
+            self.needs_reset = true;
+        }
         self.wanted = generated;
         if generated == 0 {
             self.actual = 0;
@@ -253,9 +259,6 @@ impl Session {
                 tag: *library
                     .get::<SetTag>(b"slSetTagForFrame\0")
                     .map_err(|e| e.to_string())?,
-                constants: *library
-                    .get::<sl::SetConstants>(b"slSetConstants\0")
-                    .map_err(|e| e.to_string())?,
             }
         };
         self.api = Some(api);
@@ -297,18 +300,6 @@ impl Session {
         );
         self.actual = if interpolate { generate } else { 0 };
         self.paused = self.wanted > 0 && !interpolate;
-        if !token.is_null()
-            && let Some(constants) = &input.constants
-            && let Some(api) = &self.api
-        {
-            let constants = super_resolution::native_constants(constants);
-            let viewport = sl::Viewport::new();
-            // Safety: token is the open Reflex frame. The viewport outlives the call.
-            let code = unsafe { (api.constants)(&constants, token, &viewport) };
-            if code != 0 {
-                self.note(format!("Frame Generation constants failed ({code})"));
-            }
-        }
         if interpolate && let Err(error) = self.transition(encoder, &input) {
             self.actual = 0;
             self.paused = true;
@@ -388,7 +379,7 @@ impl Session {
         format!("Frame Gen: {}x · {shown} shown", self.actual + 1)
     }
 
-    fn note(&mut self, error: String) {
+    pub(crate) fn note(&mut self, error: String) {
         self.error = Some(error);
     }
 
@@ -429,6 +420,8 @@ impl Session {
         }
         if on {
             self.needs_reset = false;
+        } else if self.wanted > 0 {
+            self.needs_reset = true;
         }
         Ok(())
     }
@@ -840,13 +833,6 @@ mod tests {
     ) -> i32 {
         0
     }
-    unsafe extern "C" fn constants(
-        _: *const sl::Constants,
-        _: *const c_void,
-        _: *const sl::Viewport,
-    ) -> i32 {
-        0
-    }
 
     #[test]
     fn suspend_calls_sdk_even_after_failure_and_never_clears_the_request() {
@@ -855,7 +841,6 @@ mod tests {
             options,
             state,
             tag,
-            constants,
         });
         session.wanted = 3;
         session.actual = 3;
@@ -882,7 +867,6 @@ mod tests {
             options,
             state,
             tag,
-            constants,
         });
         session.wanted = 1;
         OPTIONS.with_borrow_mut(|state| *state = (Vec::new(), 0));

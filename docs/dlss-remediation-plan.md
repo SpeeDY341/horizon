@@ -2,8 +2,9 @@
 
 Дата: 31 октября 2026 года. Статус: **часть A прошла review; код части B реализован
 и проверен на Windows, проверки Linux/macOS открыты; код части C прошёл
-независимый review, аппаратная проверка открыта; код части D реализован и
-проверен локально, новый review и аппаратная проверка открыты; E–I не начаты**.
+независимый review, аппаратная проверка открыта; код части D прошёл review_d2;
+код E реализован и проверен локально, независимый review E и аппаратные
+проверки D/E открыты; F–I не начаты**.
 
 Основание: review 30 коммитов `763528025..35123b73f` личного форка
 `SpeeDY341/horizon`, ветка `codex/dlss-stages-0-2`.
@@ -358,21 +359,71 @@ swapchain получает hook; стресс-проверка не зависа
 
 ### 6.1. Один token и один набор common constants
 
-- [ ] Определить владельца состояния одного показываемого кадра и явные этапы
+- [x] Определить владельца состояния одного показываемого кадра и явные этапы
   begin, подготовка входов, submit, present, завершение либо отмена.
-- [ ] Использовать один frame token для Reflex, SR и FG одного настоящего кадра.
-- [ ] Строить common constants один раз после определения размеров и reset;
+- [x] Использовать один frame token для Reflex, SR и FG одного настоящего кадра.
+- [x] Строить common constants один раз после определения размеров и reset;
   после передачи в SDK не изменять их в рамках этого кадра.
-- [ ] Убрать самостоятельную повторную сборку constants внутри FG.
-- [ ] Хранить валидность запасной истории TAA отдельно от reset текущего кадра.
-- [ ] Определить reset для первого кадра, camera cut/teleport, смены мира,
+- [x] Убрать самостоятельную повторную сборку constants внутри FG.
+- [x] Хранить валидность запасной истории TAA отдельно от reset текущего кадра.
+- [x] Определить reset для первого кадра, camera cut/teleport, смены мира,
   размера, режима и возврата после приостановки.
-- [ ] Проверить ранние выходы: не полученная surface texture, пропуск рендера,
+- [x] Проверить ранние выходы в коде: не полученная surface texture, пропуск рендера,
   SDK error, surface loss и завершение приложения.
-- [ ] Ошибка передачи constants исключает генерацию этого кадра; повторная
+- [x] Ошибка передачи constants исключает генерацию этого кадра; повторная
   попытка следует явной политике восстановления без бесконечного спама логов.
-- [ ] Проверить расстановку маркеров Reflex относительно ввода, подготовки
+- [x] Проверить расстановку маркеров Reflex в коде относительно ввода, подготовки
   кадра, всех относящихся к нему submit и Present, включая отдельный server thread.
+
+### Результат кода E (31 октября 2026)
+
+- База E: `45e631a73e533be69d0fbb96d5b2fee6b7d71117`. Независимый
+  `review_d2` дал **PASS коду D** на этой базе; аппаратная проверка D открыта.
+  Public-tree для D повторно проверен основным агентом с точным путём Python.
+- Runtime владеет одним rendered-frame token и immutable common constants.
+  Renderer открывает кадр после Reflex begin и замораживает камеру/jitter/reset
+  после motion, до SR. FG получает тот же snapshot и больше не вызывает
+  slSetConstants самостоятельно. При Reflex Off token выделяется один раз
+  лениво; первый потребитель отправляет constants, следующие только сверяют их.
+  Сверка по полям, без padding; non-finite floats отклоняются до SDK.
+- Render wrapper закрывает кадр на всех возвратах draw, включая acquire
+  timeout/occlusion/loss, ошибки encode и пропуск из-за pending resize.
+  Отменённый кадр не имеет Present, сбрасывает историю следующего eligible
+  кадра и не вызывает дополнительный Off, обходящий backoff части C.
+  Смена мира через clear_sections и смена AA/scale сбрасывают temporal history;
+  camera cut/teleport берёт reset из motion. Pending C/D и readiness hook
+  сохраняются. Изменения сохранения depth и tagging flag оставлены F/G.
+- Успешный SR инвалидирует только запасные TAA textures. Current-frame jitter
+  остаётся неизменным. При возврате fallback его первый resolve получает reset,
+  следующий уже использует историю. Ошибка SR запрещает FG этого кадра.
+  Ошибка constants/tag/options сначала проверенно выключает FG; ошибка Off
+  возвращается из render без Present. Constants можно повторить в следующем
+  кадре с reset; три последовательных неудачных кадра отключают FG до restart.
+  Sticky SR fallback по ошибке сохраняется до смены выбора пользователем.
+- Reflex SubmitStart перенесён перед первым world/SR submit, SubmitEnd остаётся
+  после финального submit. Повторный Start подавляется; abandon закрывает
+  открытые simulation/submit markers и token. Server-thread claim остаётся
+  привязан к тому же открытому Reflex token.
+- Production RenderFrame regression: пять кадров SR+FG, один SDK constants
+  call и один token на кадр, reset `true,false,false,true,false`; ошибка SDK,
+  изменение constants, non-finite input и закрытый кадр блокируют потребителя.
+  Настоящий wgpu Post regression: четыре SR кадра дают shared reset `1,0,0,0`,
+  инвалидирование fallback его не меняет; TAA fallback reset `1,0,0`, затем
+  проверены abandon/reset и смена AA.
+- Windows: Streamline **14 passed, 3 ignored**; world_post **5 passed**,
+  lifecycle C/D **6 passed**, surface recovery **4 passed**, dlss **3 passed**,
+  motion **2 passed**. Clippy Streamline/renderer/client lib/bins/tests с
+  `-D warnings`, fmt, diff check и public-tree проходят.
+- Официальный SDK 2.14.16: **3 ignored tests passed serially** (requirements,
+  настоящий SR DX12 и Vulkan с проверкой пикселей). SR tests дополнены shared
+  begin/common-constants/end и повторными запросами того же token после SR.
+  Sandbox SDK requirements завис на CPU; тестовый процесс остановлен, повтор
+  вне sandbox успешно завершён. SDK отклонил подпись NvLowLatencyVk.dll,
+  поэтому этот прогон не доказывает Vulkan Reflex.
+- **Независимый review E ещё требуется.** Настоящий FG Present, визуальное
+  качество, latency, stress focus/loss/resize и Linux/macOS не проверялись.
+  Флаг frame-based tagging пока не включён; аппаратную готовность FG этот
+  результат не заявляет. Полный pr_ready и parity не запускались.
 
 ### 6.2. Depth и motion должны доживать до потребителя
 
@@ -496,8 +547,10 @@ swapchain получает hook; стресс-проверка не зависа
 - [ ] Часть C: код отключения FG до изменения swapchain и regression tests
   прошёл review_c4 PASS; аппаратная проверка открыта.
 - [ ] Часть D: код восстановления DX12 proxy при замене surface реализован;
-  targeted tests прошли, независимый review и аппаратная проверка открыты.
-- [ ] Часть E: общий frame token/constants и отдельная валидность TAA history.
+  targeted tests прошли, review_d2 дал PASS коду; аппаратная проверка открыта.
+- [ ] Часть E: общий frame token/constants и отдельная валидность TAA history
+  реализованы, targeted/SDK SR tests прошли; независимый review и аппаратная
+  проверка открыты.
 - [ ] Часть F: сохранение depth/motion и GPU-регрессии.
 - [ ] Часть G: frame-based tagging и аппаратная проверка FG 2×.
 - [ ] Часть H: обработка ошибок, подтверждённые множители и диагностические статусы.

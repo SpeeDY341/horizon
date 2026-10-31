@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrameConstants {
     /// Row-vector, row-major matrices, without jitter.
     pub projection: [[f32; 4]; 4],
@@ -20,12 +20,24 @@ pub struct FrameConstants {
     pub aspect: f32,
     pub reset: bool,
 }
+impl FrameConstants {
+    pub(crate) fn finite(&self) -> bool {
+        self.projection
+            .iter()
+            .flatten()
+            .chain(self.inverse_projection.iter().flatten())
+            .chain(self.reprojection.iter().flatten())
+            .chain(self.inverse_reprojection.iter().flatten())
+            .chain(self.jitter_pixels.iter())
+            .chain(self.camera.iter().flatten())
+            .chain([self.near, self.far, self.fov, self.aspect].iter())
+            .all(|v| v.is_finite())
+    }
+}
 
 struct Api {
     optimal: sl::GetOptimal,
     options: sl::SetOptions,
-    token: sl::NewToken,
-    constants: sl::SetConstants,
     evaluate: sl::Evaluate,
 }
 impl Api {
@@ -51,14 +63,6 @@ impl Api {
                 options: std::mem::transmute::<*mut c_void, sl::SetOptions>(function(
                     c"slDLSSSetOptions",
                 )?),
-                token: *runtime
-                    ._library
-                    .get::<sl::NewToken>(b"slGetNewFrameToken\0")
-                    .map_err(|e| e.to_string())?,
-                constants: *runtime
-                    ._library
-                    .get::<sl::SetConstants>(b"slSetConstants\0")
-                    .map_err(|e| e.to_string())?,
                 evaluate: *runtime
                     ._library
                     .get::<sl::Evaluate>(b"slEvaluateFeature\0")
@@ -295,16 +299,35 @@ impl SuperResolution {
         motion: &wgpu::TextureView,
         frame: FrameConstants,
     ) -> Result<wgpu::TextureView, String> {
+        // Standalone probes have no renderer lifecycle. Each evaluate is one
+        // complete frame there; the game opens a shared SR/FG frame explicitly.
+        let standalone = {
+            let mut runtime = self._runtime.lock().map_err(|e| e.to_string())?;
+            let standalone = !runtime.render_frame_active();
+            if standalone {
+                runtime.begin_render_frame();
+            }
+            standalone
+        };
         let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let internal = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
         let memory = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let started = std::time::Instant::now();
-        let result = self.evaluate_frame(color, depth, motion, frame);
+        let mut result = self.evaluate_frame(color, depth, motion, frame);
         let memory = pollster::block_on(memory.pop());
         let internal = pollster::block_on(internal.pop());
         let validation = pollster::block_on(validation.pop());
         if let Some(e) = memory.or(internal).or(validation) {
-            return Err(e.to_string());
+            result = Err(e.to_string());
+        }
+        {
+            let mut runtime = self._runtime.lock().map_err(|e| e.to_string())?;
+            if result.is_err() {
+                runtime.fail_render_frame();
+            }
+            if standalone {
+                runtime.end_render_frame(result.is_ok());
+            }
         }
         self.performance.cpu_total_ms = started.elapsed().as_secs_f32() * 1000.0;
         result
@@ -317,7 +340,7 @@ impl SuperResolution {
         motion: &wgpu::TextureView,
         frame: FrameConstants,
     ) -> Result<wgpu::TextureView, String> {
-        let _session = self._runtime.lock().map_err(|e| e.to_string())?;
+        let mut _session = self._runtime.lock().map_err(|e| e.to_string())?;
         _session.presentation_ready()?;
         let viewport = sl::Viewport::new();
         let targets = self.targets.as_ref().ok_or("DLSS is not configured")?;
@@ -333,22 +356,7 @@ impl SuperResolution {
         }
         self.performance.cpu_copy_ms = started.elapsed().as_secs_f32() * 1000.0;
         let started = std::time::Instant::now();
-        let constants = native_constants(&frame);
-        // Reflex, when it is marking this presented frame, already owns the
-        // token. A second token would make Super Resolution and the present
-        // disagree. With Reflex off, this is null and DLSS allocates its own.
-        let mut token = _session.frame_token();
-        if token.is_null() {
-            unsafe {
-                check((self.api.token)(&mut token, std::ptr::null()))?;
-            }
-        }
-        if token.is_null() {
-            return Err("DLSS returned no frame token".into());
-        }
-        unsafe {
-            check((self.api.constants)(&constants, token, &viewport))?;
-        }
+        let token = _session.common_constants(frame)?;
         let result =
             targets.evaluate_native(&self.device, &self.queue, timing, |cmd, resources| {
                 let mut tags = resources
@@ -556,7 +564,16 @@ mod tests {
                 aspect: 640. / 360.,
                 reset: i == 0,
             };
+            runtime.lock().unwrap().begin_render_frame();
             let output = sr.evaluate(&color, &depth, &motion, frame).unwrap();
+            // FG requests the same snapshot after SR; this exercises the real
+            // SDK-backed common path without claiming generated Present.
+            let mut owner = runtime.lock().unwrap();
+            let token = owner.common_constants(frame).unwrap();
+            assert!(!token.is_null());
+            assert_eq!(owner.common_constants(frame).unwrap(), token);
+            owner.end_render_frame(true);
+            drop(owner);
             println!("timing {:?}", sr.performance());
             let read = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
@@ -721,7 +738,14 @@ mod tests {
                 aspect: 640. / 360.,
                 reset: i == 0,
             };
+            runtime.lock().unwrap().begin_render_frame();
             let output = sr.evaluate(&color, &depth, &motion, frame).unwrap();
+            let mut owner = runtime.lock().unwrap();
+            let token = owner.common_constants(frame).unwrap();
+            assert!(!token.is_null());
+            assert_eq!(owner.common_constants(frame).unwrap(), token);
+            owner.end_render_frame(true);
+            drop(owner);
             let read = device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size: 256,

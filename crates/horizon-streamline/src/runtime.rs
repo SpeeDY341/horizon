@@ -32,6 +32,58 @@ pub struct Requirements {
     pub graphics_queues: u32,
 }
 
+/// One rendered frame/viewport. SR and FG can request the same constants, but
+/// only the first consumer sends them to the SDK. Failure lasts until begin.
+#[derive(Default)]
+struct RenderFrame {
+    active: bool,
+    token: usize,
+    constants: Option<crate::FrameConstants>,
+    failed: bool,
+}
+impl RenderFrame {
+    fn begin(&mut self, token: usize) {
+        *self = Self {
+            active: true,
+            token,
+            ..Default::default()
+        };
+    }
+
+    fn constants(
+        &mut self,
+        frame: crate::FrameConstants,
+        allocate: impl FnOnce() -> Result<usize, String>,
+        send: impl FnOnce(usize, &crate::FrameConstants) -> Result<(), String>,
+    ) -> Result<usize, String> {
+        if !self.active || self.failed {
+            return Err("Streamline rendered frame is unavailable".into());
+        }
+        let result = (|| {
+            if !frame.finite() {
+                return Err("Streamline common constants are non-finite".into());
+            }
+            if let Some(previous) = self.constants {
+                if previous != frame {
+                    return Err("Streamline common constants changed within a frame".into());
+                }
+                return Ok(self.token);
+            }
+            if self.token == 0 {
+                self.token = allocate()?;
+            }
+            if self.token == 0 {
+                return Err("Streamline returned no frame token".into());
+            }
+            send(self.token, &frame)?;
+            self.constants = Some(frame);
+            Ok(self.token)
+        })();
+        self.failed |= result.is_err();
+        result
+    }
+}
+
 /// Initialized SDK, owned by the render thread. Must remain loaded while its
 /// device or a DirectX 12 swapchain proxy is in use, and be shut down after
 /// draining GPU work and releasing that proxy, before device destruction.
@@ -46,6 +98,8 @@ pub struct Runtime {
     instance: Option<wgpu::Instance>,
     /// A failed presentation hook disables consumers without unloading SDK objects.
     presentation: Presentation,
+    frame: RenderFrame,
+    constants_failures: u8,
     directory: std::path::PathBuf,
     reflex: crate::reflex::Session,
     framegen: crate::frame_gen::Session,
@@ -239,6 +293,8 @@ impl Runtime {
             device: None,
             instance: None,
             presentation: Presentation::default(),
+            frame: RenderFrame::default(),
+            constants_failures: 0,
             directory,
             reflex: crate::reflex::Session::new(reflex),
             framegen: crate::frame_gen::Session::new(framegen_listed, framegen_ready),
@@ -293,10 +349,86 @@ impl Runtime {
         self.reflex.abandon_if_open();
     }
 
-    /// The token of the frame on screen, or null when Reflex is not marking it.
-    /// DLSS must reuse this token instead of allocating another one.
-    pub(crate) fn frame_token(&self) -> *mut std::ffi::c_void {
-        self.reflex.token()
+    /// Open once after Reflex's simulation begin, before any SR/FG work.
+    pub fn begin_render_frame(&mut self) {
+        self.frame.begin(self.reflex.token() as usize);
+    }
+
+    pub(crate) fn render_frame_active(&self) -> bool {
+        self.frame.active
+    }
+
+    /// Errors invalidate generation for this frame; the next eligible frame
+    /// resets both temporal consumers before building common constants.
+    pub fn fail_render_frame(&mut self) {
+        self.frame.failed = true;
+        self.framegen.invalidate_history();
+    }
+
+    /// Retire acquire/encode early exits without Present and reset the next
+    /// eligible frame. Surface recovery alone owns Off retries and backoff.
+    pub fn end_render_frame(&mut self, rendered: bool) {
+        self.frame = RenderFrame::default();
+        if !rendered {
+            self.reflex.abandon_if_open();
+            self.framegen.invalidate_history();
+        }
+    }
+
+    pub(crate) fn common_constants(
+        &mut self,
+        frame: crate::FrameConstants,
+    ) -> Result<*mut std::ffi::c_void, String> {
+        self.presentation_ready()?;
+        // Safety: the runtime owns these pinned public ABI symbols and remains
+        // loaded through all consumers of the returned token.
+        let (allocate, set) = unsafe {
+            (
+                *self
+                    ._library
+                    .get::<crate::dlss_abi::NewToken>(b"slGetNewFrameToken\0")
+                    .map_err(|e| e.to_string())?,
+                *self
+                    ._library
+                    .get::<crate::dlss_abi::SetConstants>(b"slSetConstants\0")
+                    .map_err(|e| e.to_string())?,
+            )
+        };
+        let already_failed = self.frame.failed;
+        let result = self
+            .frame
+            .constants(
+                frame,
+                || {
+                    let mut token = std::ptr::null_mut();
+                    let code = unsafe { allocate(&mut token, std::ptr::null()) };
+                    if code != 0 || token.is_null() {
+                        return Err(format!("Streamline frame token failed ({code})"));
+                    }
+                    Ok(token as usize)
+                },
+                |token, frame| {
+                    let constants = crate::super_resolution::native_constants(frame);
+                    let viewport = crate::dlss_abi::Viewport::new();
+                    let code = unsafe { set(&constants, token as *mut _, &viewport) };
+                    if code == 0 {
+                        Ok(())
+                    } else {
+                        Err(format!("Streamline common constants failed ({code})"))
+                    }
+                },
+            )
+            .map(|token| token as *mut _);
+        if result.is_ok() {
+            self.constants_failures = 0;
+        } else if !already_failed {
+            self.constants_failures = self.constants_failures.saturating_add(1);
+            if self.constants_failures == 3 {
+                self.framegen
+                    .fail("Common constants failed for three frames; restart required".into());
+            }
+        }
+        result
     }
 
     pub fn reflex_line(&self) -> String {
@@ -494,17 +626,41 @@ impl Runtime {
     pub fn framegen_record(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
-        input: crate::frame_gen::Inputs<'_>,
+        mut input: crate::frame_gen::Inputs<'_>,
     ) -> Result<Option<wgpu::CommandBuffer>, String> {
-        if self.presentation_ready().is_err() {
+        if self.presentation_ready().is_err() || !self.framegen.loaded() {
             return Ok(None);
         }
         let Some(device) = self.device.clone() else {
             return Err("Frame Generation has no graphics device".into());
         };
         let dx12 = self.api == Api::Dx12;
-        let token = self.frame_token();
-        self.framegen.record(dx12, token, &device, encoder, input)
+        input.allow &= !self.frame.failed;
+        let token = if input.allow {
+            if let Some(constants) = input.constants {
+                match self.common_constants(constants) {
+                    Ok(token) => token,
+                    Err(error) => {
+                        self.fail_render_frame();
+                        self.framegen.suspend()?;
+                        self.framegen.note(error);
+                        return Ok(None);
+                    }
+                }
+            } else {
+                std::ptr::null_mut()
+            }
+        } else {
+            self.frame.token as *mut _
+        };
+        let result = self.framegen.record(dx12, token, &device, encoder, input);
+        if let Err(error) = result {
+            self.fail_render_frame();
+            self.framegen.suspend()?;
+            self.framegen.note(error);
+            return Ok(None);
+        }
+        result
     }
 
     pub fn framegen_sample(&mut self) {
@@ -719,6 +875,120 @@ impl Drop for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn constants(reset: bool) -> crate::FrameConstants {
+        crate::FrameConstants {
+            projection: [[0.; 4]; 4],
+            inverse_projection: [[0.; 4]; 4],
+            reprojection: [[0.; 4]; 4],
+            inverse_reprojection: [[0.; 4]; 4],
+            jitter_pixels: [0.; 2],
+            camera: [[0.; 3]; 4],
+            near: 0.05,
+            far: 1000.,
+            fov: 1.2,
+            aspect: 1.,
+            reset,
+        }
+    }
+
+    #[test]
+    fn sr_and_fg_share_one_submission_and_token_across_normal_and_reset_frames() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let mut frame = RenderFrame::default();
+        for (index, reset) in [true, false, false, true, false].into_iter().enumerate() {
+            // Reflex token if present; SR-only frames allocate lazily instead.
+            let token = index + 10;
+            frame.begin(if index % 2 == 0 { token } else { 0 });
+            let value = constants(reset);
+            let sr = frame
+                .constants(
+                    value,
+                    || Ok(token),
+                    |t, c| {
+                        calls.borrow_mut().push((t, c.reset));
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            let fg = frame
+                .constants(
+                    value,
+                    || panic!("second token"),
+                    |_, _| panic!("second constants submission"),
+                )
+                .unwrap();
+            assert_eq!((sr, fg), (token, token));
+        }
+        assert_eq!(
+            *calls.borrow(),
+            [
+                (10, true),
+                (11, false),
+                (12, false),
+                (13, true),
+                (14, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_sr_constants_and_changed_constants_block_fg_until_a_new_frame() {
+        let mut frame = RenderFrame::default();
+        frame.begin(42);
+        assert!(
+            frame
+                .constants(
+                    constants(false),
+                    || panic!(),
+                    |_, _| Err("SDK error".into())
+                )
+                .is_err()
+        );
+        assert!(
+            frame
+                .constants(
+                    constants(false),
+                    || panic!(),
+                    |_, _| panic!("FG after SR error")
+                )
+                .is_err()
+        );
+        frame.begin(43);
+        frame
+            .constants(constants(false), || panic!(), |_, _| Ok(()))
+            .unwrap();
+        assert!(
+            frame
+                .constants(
+                    constants(true),
+                    || panic!(),
+                    |_, _| panic!("mutated reset reached SDK")
+                )
+                .is_err()
+        );
+        frame.begin(44);
+        assert_eq!(
+            frame
+                .constants(constants(true), || panic!(), |_, _| Ok(()))
+                .unwrap(),
+            44
+        );
+        frame = RenderFrame::default(); // end / skipped frame
+        assert!(
+            frame
+                .constants(constants(false), || panic!(), |_, _| panic!())
+                .is_err()
+        );
+        frame.begin(45);
+        let mut invalid = constants(false);
+        invalid.far = f32::NAN;
+        assert!(
+            frame
+                .constants(invalid, || panic!(), |_, _| panic!("NaN reached SDK"))
+                .is_err()
+        );
+    }
 
     unsafe extern "C" fn mock_upgrade(ptr: *mut *mut std::ffi::c_void) -> i32 {
         match unsafe { *ptr } as usize {

@@ -117,6 +117,7 @@ pub struct Session {
     /// 0 none, 1 window, 2 server, 3 ended.
     sim: u8,
     open: bool,
+    submitting: bool,
     error: Option<String>,
     reported: bool,
     latency_us: u64,
@@ -141,6 +142,7 @@ impl Session {
             pending: 0,
             sim: 0,
             open: false,
+            submitting: false,
             error: None,
             reported: false,
             latency_us: 0,
@@ -272,8 +274,9 @@ impl Session {
     }
 
     pub fn submit(&mut self, start: bool) {
-        if self.open {
+        if self.open && self.submitting != start {
             self.mark(if start { SUBMIT_START } else { SUBMIT_END });
+            self.submitting = start;
         }
     }
 
@@ -334,12 +337,15 @@ impl Session {
     }
 
     fn abandon(&mut self) {
+        self.end_simulation();
+        self.submit(false);
         if self.current != 0 {
             self.index = self.index.wrapping_add(1);
         }
         self.current = 0;
         self.sim = 0;
         self.open = false;
+        self.submitting = false;
     }
 
     fn allocate(&mut self) -> Result<usize, String> {
@@ -586,7 +592,10 @@ mod tests {
         let mut session = Session::new(true);
         session.current = 4;
         session.open = true;
+        session.submit(true);
+        assert!(session.submitting);
         session.abandon_presentation();
+        assert!(!session.submitting);
         assert_eq!(session.token(), std::ptr::null_mut());
         assert!(!session.is_open());
         assert_eq!(session.index, 1);

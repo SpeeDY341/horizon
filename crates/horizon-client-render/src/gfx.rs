@@ -3624,6 +3624,8 @@ impl Renderer {
     }
     /// Drops every section, for a level whose chunks hold `layout`.
     pub fn clear_sections(&mut self, layout: crate::chunk::ColumnLayout) {
+        self.world_post.reset_history();
+        self.dlss.invalidate_history();
         if let Some(motion) = &mut self.motion {
             motion.reset();
         }
@@ -4020,7 +4022,7 @@ impl Renderer {
     }
 
     #[cfg(target_os = "windows")]
-    fn reflex_with(&mut self, body: impl FnOnce(&mut horizon_streamline::Runtime)) {
+    fn reflex_with(&self, body: impl FnOnce(&mut horizon_streamline::Runtime)) {
         let Some(shared) = &self.streamline else {
             return;
         };
@@ -4062,14 +4064,14 @@ impl Renderer {
         }
     }
 
-    fn reflex_end_simulation(&mut self) {
+    fn reflex_end_simulation(&self) {
         #[cfg(target_os = "windows")]
         if self.reflex_loaded {
             self.reflex_with(|runtime| runtime.reflex_end_simulation());
         }
     }
 
-    fn reflex_submit(&mut self, start: bool) {
+    fn reflex_submit(&self, start: bool) {
         #[cfg(target_os = "windows")]
         if self.reflex_loaded {
             self.reflex_with(|runtime| runtime.reflex_submit(start));
@@ -4154,76 +4156,84 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         frame: &Frame<'_>,
         pack_reads_world: bool,
-        pose: Mat4,
-        views: &ViewSet,
+        constants: Option<dlss::Constants>,
         presenting: bool,
-    ) -> Option<wgpu::CommandBuffer> {
+    ) -> Result<Option<wgpu::CommandBuffer>> {
         #[cfg(target_os = "windows")]
         {
             if !self.framegen_loaded {
-                return None;
+                return Ok(None);
             }
             let depth = self.world_post.depth_inputs();
-            let mut jitter = self
-                .world_post
-                .temporal_jitter()
-                .unwrap_or([0.0, 0.0, 1.0, 0.0]);
             let motion = self
                 .world_post
                 .temporal_jitter()
                 .and_then(|_| self.motion.as_ref().and_then(motion::Motion::tagged));
-            if self.motion.as_ref().is_some_and(|m| m.frame_reset()) {
-                jitter[2] = 1.0;
-            }
             let depth_size = self
                 .world_post
                 .size()
                 .unwrap_or([self.config.width, self.config.height]);
-            let primary = views.primary();
-            let constants = dlss::frame_constants(
-                primary.projection * pose,
-                self.world_post.reprojection(),
-                jitter,
-                depth_size,
-                frame.depth_far,
-                frame.fov_degrees.to_radians(),
-                primary.aspect,
-                primary.view,
-                frame.camera,
-                jitter[2] != 0.0,
-            );
             let allow = self.framegen_frame_allowed(frame, presenting, pack_reads_world)
                 && depth.is_some()
                 && motion.is_some();
             let color = [self.config.width, self.config.height];
             let color_format = self.config.format;
             let Some(shared) = &self.streamline else {
-                return None;
+                return Ok(None);
             };
-            let Ok(mut runtime) = shared.lock() else {
-                return None;
-            };
+            let mut runtime = shared.lock().map_err(|_| "Streamline lock poisoned")?;
             let input = horizon_streamline::Inputs {
                 depth: depth.as_ref().map(|(texture, view)| (texture, view)),
                 motion: motion.as_ref().map(|(texture, view)| (texture, view)),
-                constants: Some(constants),
+                constants,
                 color,
                 depth_size,
                 color_format,
                 allow,
             };
             let recorded = runtime.framegen_record(encoder, input);
-            if let Err(error) = &recorded {
-                log::warn!("Frame Generation: {error}");
-            }
             if let Some(error) = runtime.take_framegen_error() {
                 log::warn!("Frame Generation: {error}");
             }
-            recorded.ok().flatten()
+            Ok(recorded?)
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (encoder, frame, pack_reads_world, pose, views, presenting);
+            let _ = (encoder, frame, pack_reads_world, constants, presenting);
+            Ok(None)
+        }
+    }
+
+    /// Freeze after motion has determined camera cuts and before either SR or
+    /// FG consumes the frame. Fallback TAA may change its own history later.
+    fn temporal_constants(
+        &self,
+        frame: &Frame<'_>,
+        pose: Mat4,
+        views: &ViewSet,
+    ) -> Option<dlss::Constants> {
+        #[cfg(target_os = "windows")]
+        {
+            let jitter = self.world_post.temporal_jitter()?;
+            let primary = views.primary();
+            Some(dlss::frame_constants(
+                primary.projection * pose,
+                self.world_post.reprojection(),
+                jitter,
+                self.world_post.size()?,
+                frame.depth_far,
+                frame.fov_degrees.to_radians(),
+                primary.aspect,
+                primary.view,
+                frame.camera,
+                self.dlss.reset_pending() && self.dlss.requested != crate::graphics::Dlss::Off
+                    || jitter[2] != 0.0
+                    || self.motion.as_ref().is_some_and(|m| m.frame_reset()),
+            ))
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (frame, pose, views);
             None
         }
     }
@@ -4251,6 +4261,23 @@ impl Renderer {
     /// `upscale`: output pixels per rendered pixel, for TAA to rebuild (1: native).
     pub fn set_world_post(&mut self, scale: f32, antialias: bool, taa: bool, upscale: f32) {
         let taa = taa && self.world_post.supports_taa();
+        if (
+            self.world_post.scale,
+            self.world_post.antialias,
+            self.world_post.taa,
+            self.world_post.upscale,
+        ) != (
+            scale.clamp(0.25, 2.0),
+            antialias && !taa,
+            taa,
+            if taa { upscale.clamp(1.0, 4.0) } else { 1.0 },
+        ) {
+            self.world_post.reset_history();
+            self.dlss.invalidate_history();
+            if let Some(motion) = &mut self.motion {
+                motion.reset();
+            }
+        }
         self.world_post.scale = scale.clamp(0.25, 2.0);
         self.world_post.antialias = antialias && !taa;
         self.world_post.taa = taa;
@@ -4585,6 +4612,8 @@ impl Renderer {
         // A loading frame has no earlier begin. Mark an empty simulation so
         // the presented frame still has the markers Reflex expects.
         self.reflex_ensure();
+        #[cfg(target_os = "windows")]
+        self.reflex_with(|runtime| runtime.begin_render_frame());
         let rendered = self.draw_frame(frame);
         // A frame that was not drawn still submits the section copies.
         // That copy is not the frame Reflex is timing.
@@ -4592,6 +4621,21 @@ impl Renderer {
             self.queue.submit([copies]);
         }
         self.reflex_close_if_open();
+        let complete = matches!(rendered, Ok(true));
+        if !complete {
+            self.world_post.reset_history();
+            self.dlss.invalidate_history();
+            if let Some(motion) = &mut self.motion {
+                motion.reset();
+            }
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(shared) = &self.streamline {
+            shared
+                .lock()
+                .map_err(|_| "Streamline lock poisoned")?
+                .end_render_frame(complete);
+        }
         rendered
     }
     fn draw_frame(&mut self, frame: &Frame) -> Result<bool> {
@@ -6343,6 +6387,8 @@ impl Renderer {
                 );
             }
         }
+        let mut temporal_constants = None;
+        let mut submit_started = false;
         if let Some((color, depth)) = &scaled
             && pack_post
             && let Some((dimension, Some(mut post))) = self.pack_post.take()
@@ -6472,9 +6518,14 @@ impl Renderer {
             }
             self.dlss.motion_cpu_ms =
                 motion_started.map_or(0.0, |t| t.elapsed().as_secs_f32() * 1000.0);
+            if dlss_size.is_some() || self.framegen_rendering() {
+                temporal_constants = self.temporal_constants(frame, pose, &views);
+            }
             let dlss_result = if dlss_size.is_some() {
                 let motion = self.motion.as_ref().and_then(|m| m.view());
-                if let Some(motion) = motion {
+                if let Some(motion) = motion
+                    && let Some(constants) = temporal_constants
+                {
                     // Submit the world's complete color/depth/motion before native DLSS.
                     // Its own command buffers run next, then hand/HUD in a fresh encoder.
                     self.uploads.finish(&encoder);
@@ -6486,24 +6537,16 @@ impl Renderer {
                         self.device.create_command_encoder(&Default::default()),
                     )
                     .finish();
+                    self.reflex_end_simulation();
+                    self.reflex_submit(true);
+                    submit_started = true;
                     self.queue.submit([world_commands]);
-                    let mut temporal_jitter = self.world_post.temporal_jitter().unwrap();
-                    if self.motion.as_ref().is_some_and(|m| m.frame_reset()) {
-                        temporal_jitter[2] = 1.0;
-                    }
                     self.dlss.resolve(
                         world_view,
                         world_depth,
                         &motion,
-                        views.primary().projection * pose,
-                        self.world_post.reprojection(),
-                        temporal_jitter,
+                        constants,
                         self.world_post.size().unwrap(),
-                        frame.depth_far,
-                        frame.fov_degrees.to_radians(),
-                        views.primary().aspect,
-                        views.primary().view,
-                        frame.camera,
                     )
                 } else {
                     None
@@ -6520,6 +6563,8 @@ impl Renderer {
             } else {
                 if dlss_size.is_some() {
                     self.world_post.invalidate_history();
+                    #[cfg(target_os = "windows")]
+                    self.reflex_with(|runtime| runtime.fail_render_frame());
                 }
                 self.world_post
                     .finish(&self.queue, &mut encoder, &view_target);
@@ -6735,18 +6780,19 @@ impl Renderer {
             &mut encoder,
             frame,
             pack_reads_world,
-            pose,
-            &views,
+            temporal_constants,
             surface_frame.is_some(),
-        );
+        )?;
         let commands = crate::spans::time("encode", || encoder.finish());
         let first_frame = self.first_frame == FirstFrame::Submit;
         if first_frame {
             startup_step(format_args!("submitting the first frame"));
             self.first_frame = FirstFrame::Drawn;
         }
-        self.reflex_end_simulation();
-        self.reflex_submit(true);
+        if !submit_started {
+            self.reflex_end_simulation();
+            self.reflex_submit(true);
+        }
         // The tag copy is its own list. It runs after this frame's draws and
         // before Present. wgpu rejects that copy on the list that already drew.
         let submission = crate::spans::time("submit", || {

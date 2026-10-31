@@ -1,10 +1,15 @@
 //! Safe renderer-side control; all native handles remain in horizon-streamline.
 use crate::graphics::{self, Dlss, DlssPreset, DlssReport};
+#[cfg(target_os = "windows")]
 use glam::Mat4;
 #[cfg(target_os = "windows")]
 pub(super) type Shared = std::sync::Arc<std::sync::Mutex<horizon_streamline::Runtime>>;
 #[cfg(not(target_os = "windows"))]
 pub(super) type Shared = ();
+#[cfg(target_os = "windows")]
+pub(super) type Constants = horizon_streamline::FrameConstants;
+#[cfg(not(target_os = "windows"))]
+pub(super) type Constants = ();
 
 pub(super) fn presentation_ready(shared: &Option<Shared>) -> bool {
     #[cfg(target_os = "windows")]
@@ -160,6 +165,10 @@ pub(super) struct State {
     samples: u32,
 }
 impl State {
+    #[cfg(target_os = "windows")]
+    pub(super) fn reset_pending(&self) -> bool {
+        self.reset && self.failure.is_none() && self.configuration.is_some()
+    }
     pub(super) fn invalidate_history(&mut self) {
         self.reset = true;
     }
@@ -374,31 +383,12 @@ impl State {
         color: &wgpu::TextureView,
         depth: &wgpu::TextureView,
         motion: &wgpu::TextureView,
-        projection: Mat4,
-        reproject: Mat4,
-        jitter: [f32; 4],
+        frame: Constants,
         size: [u32; 2],
-        far: f32,
-        fov: f32,
-        aspect: f32,
-        view: Mat4,
-        camera: glam::DVec3,
     ) -> Option<wgpu::TextureView> {
         #[cfg(target_os = "windows")]
         {
             let engine = self.engine.as_mut()?;
-            let frame = frame_constants(
-                projection,
-                reproject,
-                jitter,
-                size,
-                far,
-                fov,
-                aspect,
-                view,
-                camera,
-                self.reset || jitter[2] != 0.0,
-            );
             let result = if std::env::var_os("HORIZON_DLSS_FORCE_ERROR").is_some() {
                 Err("Forced diagnostic failure".into())
             } else {
@@ -426,10 +416,7 @@ impl State {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (
-                color, depth, motion, projection, reproject, jitter, size, far, fov, aspect, view,
-                camera,
-            );
+            let _ = (color, depth, motion, frame, size);
             None
         }
     }

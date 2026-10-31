@@ -78,6 +78,7 @@ pub struct Post {
     /// The last TAA frame's unjittered `view_proj` and camera, `None` once a frame ran without it.
     taa_previous: Option<(DMat4, DVec3)>,
     taa_this_frame: TaaUniform,
+    taa_history_valid: bool,
 }
 
 impl Post {
@@ -256,6 +257,7 @@ impl Post {
             taa_frame: 0,
             taa_previous: None,
             taa_this_frame: bytemuck::Zeroable::zeroed(),
+            taa_history_valid: false,
         }
     }
 
@@ -283,7 +285,7 @@ impl Post {
         }
     }
     pub fn invalidate_history(&mut self) {
-        self.taa_this_frame.jitter[2] = 1.0;
+        self.taa_history_valid = false;
     }
     /// A lifecycle reset must survive the next call to jitter, even if the
     /// surface keeps its dimensions (fullscreen, HDR or present-mode change).
@@ -299,7 +301,11 @@ impl Post {
     /// world's projection (identity while `on` is false); `view_proj` is the unjittered
     /// projection, relative to `camera`. Call it before `prepare`, once per frame.
     pub fn jitter(&mut self, window: [u32; 2], on: bool, view_proj: Mat4, camera: DVec3) -> Mat4 {
-        self.taa_on = on && self.taa && self.taa_resources.is_some();
+        let taa_on = on && self.taa && self.taa_resources.is_some();
+        if self.taa_on != taa_on {
+            self.reset_history();
+        }
+        self.taa_on = taa_on;
         let track = self.track_camera && !self.taa_on;
         if !self.taa_on && !track {
             self.taa_previous = None;
@@ -442,6 +448,7 @@ impl Post {
             });
             // New textures: no history yet.
             self.taa_this_frame.jitter[2] = 1.0;
+            self.invalidate_history();
             self.target = Some(WorldTarget {
                 size,
                 color,
@@ -459,6 +466,14 @@ impl Post {
     /// Exactly the jitter used for this frame's world, including target rebuild resets.
     pub fn temporal_jitter(&self) -> Option<[f32; 4]> {
         (self.taa_on || self.track_camera).then_some(self.taa_this_frame.jitter)
+    }
+
+    fn taa_uniform(&self) -> TaaUniform {
+        let mut uniform = self.taa_this_frame;
+        if !self.taa_history_valid {
+            uniform.jitter[2] = 1.0;
+        }
+        uniform
     }
 
     /// The size of the world's own target, when it has one.
@@ -493,7 +508,7 @@ impl Post {
 
     /// Draw the scaled world onto `screen`, through TAA when this frame's `jitter` had it on.
     pub fn finish(
-        &self,
+        &mut self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         screen: &wgpu::TextureView,
@@ -508,7 +523,8 @@ impl Post {
             return;
         };
         let i = (self.taa_frame % 2) as usize;
-        queue.write_buffer(&res.uniform, 0, bytemuck::bytes_of(&self.taa_this_frame));
+        let uniform = self.taa_uniform();
+        queue.write_buffer(&res.uniform, 0, bytemuck::bytes_of(&uniform));
         let attachments = [Some(wgpu::RenderPassColorAttachment {
             view: &taa.history[i],
             resolve_target: None,
@@ -528,6 +544,7 @@ impl Post {
         pass.draw(0..3, 0..1);
         drop(pass);
         self.finish_with(encoder, screen, &taa.show[i]);
+        self.taa_history_valid = true;
     }
 
     /// Draw what `group` binds (`bind`) onto `screen`.
@@ -642,5 +659,58 @@ mod tests {
         let post = Post::new(&device, wgpu::TextureFormat::Rgba8Unorm);
         // Copy and FXAA pipelines always compile; TAA compiles if supported by backend.
         let _ = post.supports_taa();
+    }
+
+    #[test]
+    fn sr_skips_taa_history_without_resetting_common_constants_and_fallback_resets_once() {
+        let (device, queue) = test_device().expect("GPU regression needs a device");
+        let mut post = Post::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        assert!(post.supports_taa());
+        post.taa = true;
+        post.track_camera = true;
+        let window = [32, 32];
+        // SR owns these frames. Common constants must be stable even though
+        // the fallback's ping-pong textures are never updated.
+        for expected in [1.0, 0.0, 0.0, 0.0] {
+            post.jitter(window, true, Mat4::IDENTITY, DVec3::ZERO);
+            post.prepare(&device, window, true).unwrap();
+            let jitter = post.temporal_jitter().unwrap();
+            assert_eq!(jitter[2], expected);
+            post.invalidate_history();
+            assert_eq!(post.temporal_jitter().unwrap(), jitter);
+        }
+        let screen = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("TAA fallback regression"),
+                size: wgpu::Extent3d {
+                    width: 32,
+                    height: 32,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        for expected in [1.0, 0.0, 0.0] {
+            post.jitter(window, true, Mat4::IDENTITY, DVec3::ZERO);
+            post.prepare(&device, window, true).unwrap();
+            assert_eq!(post.taa_uniform().jitter[2], expected);
+            let mut encoder = device.create_command_encoder(&Default::default());
+            post.finish(&queue, &mut encoder, &screen);
+            queue.submit([encoder.finish()]);
+        }
+        // Abandon/camera reset and an AA mode change reset the shared camera
+        // as well as fallback history, unlike successful SR frames above.
+        post.reset_history();
+        post.jitter(window, true, Mat4::IDENTITY, DVec3::ZERO);
+        assert_eq!(post.temporal_jitter().unwrap()[2], 1.0);
+        post.jitter(window, false, Mat4::IDENTITY, DVec3::ZERO);
+        post.jitter(window, true, Mat4::IDENTITY, DVec3::ZERO);
+        assert_eq!(post.temporal_jitter().unwrap()[2], 1.0);
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     }
 }
