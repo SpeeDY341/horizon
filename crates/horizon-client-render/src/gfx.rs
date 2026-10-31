@@ -1105,7 +1105,7 @@ async fn open_with_retry(
     let first = open_backend(backends, window, offscreen, false, layers, enable_dlss).await;
     let first = match first {
         Err(NoDevice::Failed(e) | NoDevice::NoAdapter(e)) if enable_dlss => {
-            crate::graphics::report_dlss(format!("TAA: {e}"));
+            crate::graphics::report_dlss("TAA: startup");
             log::warn!("DLSS startup failed, retrying ordinary Vulkan: {e}");
             open_backend(backends, window, offscreen, false, layers, false).await
         }
@@ -2846,7 +2846,7 @@ impl Renderer {
             ));
         }
         Ok(Self {
-            dlss: dlss::State::new(streamline.clone(), enable_dlss),
+            dlss: dlss::State::new(streamline.clone(), enable_dlss, &info),
             streamline,
             display: DisplayWatch::default(),
             display_fresh: false,
@@ -5960,20 +5960,26 @@ impl Renderer {
                     // Submit the world's complete color/depth/motion before native DLSS.
                     // Its own command buffers run next, then hand/HUD in a fresh encoder.
                     self.uploads.finish(&encoder);
-                    if has_section_copies { self.section_uploads.finish(&encoder); }
+                    if has_section_copies {
+                        self.section_uploads.finish(&encoder);
+                    }
                     let world_commands = std::mem::replace(
                         &mut encoder,
                         self.device.create_command_encoder(&Default::default()),
                     )
                     .finish();
                     self.queue.submit([world_commands]);
+                    let mut temporal_jitter = self.world_post.temporal_jitter().unwrap();
+                    if self.motion.as_ref().is_some_and(|m| m.frame_reset()) {
+                        temporal_jitter[2] = 1.0;
+                    }
                     self.dlss.resolve(
                         world_view,
                         world_depth,
                         &motion,
                         views.primary().projection * pose,
                         self.world_post.reprojection(),
-                        self.world_post.temporal_jitter().unwrap(),
+                        temporal_jitter,
                         self.world_post.size().unwrap(),
                         frame.depth_far,
                         frame.fov_degrees.to_radians(),

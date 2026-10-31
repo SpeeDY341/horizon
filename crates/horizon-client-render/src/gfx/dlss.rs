@@ -27,7 +27,7 @@ pub(super) fn load(enabled: bool, backend: wgpu::Backends) -> Option<Shared> {
         match result {
             Ok(runtime) => Some(std::sync::Arc::new(std::sync::Mutex::new(runtime))),
             Err(e) => {
-                graphics::report_dlss(format!("TAA: {e}"));
+                graphics::report_dlss("TAA: SDK error");
                 log::warn!("DLSS unavailable: {e}");
                 None
             }
@@ -35,7 +35,7 @@ pub(super) fn load(enabled: bool, backend: wgpu::Backends) -> Option<Shared> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        graphics::report_dlss("TAA: Streamline requires Windows");
+        graphics::report_dlss("TAA: Windows");
         None
     }
 }
@@ -51,16 +51,25 @@ pub(super) struct State {
     reset: bool,
 }
 impl State {
-    pub fn new(shared: Option<Shared>, requested: bool) -> Self {
+    pub fn new(shared: Option<Shared>, requested: bool, info: &wgpu::AdapterInfo) -> Self {
         Self {
             requested: Dlss::Off,
             shared,
             #[cfg(target_os = "windows")]
             engine: None,
             failure: None,
-            startup_failure: requested
-                .then(graphics::dlss_status)
-                .filter(|s| s.starts_with("TAA:")),
+            startup_failure: if !cfg!(target_os = "windows") {
+                Some("TAA: Windows".into())
+            } else if info.backend != wgpu::Backend::Vulkan
+                || info.vendor != 0x10de
+                || !info.name.to_ascii_uppercase().contains("RTX")
+            {
+                Some("TAA: Vulkan RTX".into())
+            } else {
+                requested
+                    .then(graphics::dlss_status)
+                    .filter(|s| s.starts_with("TAA:"))
+            },
             configuration: None,
             reset: true,
         }
@@ -76,7 +85,7 @@ impl State {
     #[cfg(target_os = "windows")]
     fn fail(&mut self, e: String) {
         log::warn!("DLSS disabled, using TAA: {e}");
-        graphics::report_dlss(format!("TAA: {e}"));
+        graphics::report_dlss("TAA: DLSS error");
         self.failure = Some(e);
         self.reset = true;
     }
@@ -93,17 +102,17 @@ impl State {
             self.reset = true;
             return None;
         }
-        if let Some(e) = &self.failure {
-            graphics::report_dlss(format!("TAA: {e}"));
+        if self.failure.is_some() {
+            graphics::report_dlss("TAA: DLSS error");
             return None;
         }
         if hdr {
-            graphics::report_dlss("TAA: HDR enabled");
+            graphics::report_dlss("TAA: HDR");
             self.reset = true;
             return None;
         }
         if !allowed {
-            graphics::report_dlss("Paused: menu or shader pack");
+            graphics::report_dlss("Suspended");
             self.reset = true;
             return None;
         }
@@ -113,7 +122,7 @@ impl State {
                 graphics::report_dlss(
                     self.startup_failure
                         .clone()
-                        .unwrap_or_else(|| "TAA: restart required".into()),
+                        .unwrap_or_else(|| "TAA: restart".into()),
                 );
                 return None;
             };
@@ -147,8 +156,8 @@ impl State {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (device, queue, output, &self.shared);
-            graphics::report_dlss("TAA: Streamline requires Windows");
+            let _ = (device, queue, output, &self.shared, &self.startup_failure);
+            graphics::report_dlss("TAA: Windows");
             None
         }
     }
@@ -202,7 +211,7 @@ impl State {
                         log::info!("DLSS Super Resolution active: {}", self.requested.label());
                     }
                     self.reset = false;
-                    graphics::report_dlss(format!("Active: {}", self.requested.label()));
+                    graphics::report_dlss("Active");
                     Some(view)
                 }
                 Err(e) => {
@@ -214,9 +223,50 @@ impl State {
         #[cfg(not(target_os = "windows"))]
         {
             let _ = (
-                color, depth, motion, projection, reproject, jitter, size, far, fov, aspect,
+                color, depth, motion, projection, reproject, jitter, size, far, fov, aspect, view,
+                camera,
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn adapter(backend: wgpu::Backend, vendor: u32, name: &str) -> wgpu::AdapterInfo {
+        let mut info = wgpu::AdapterInfo::new(wgpu::DeviceType::DiscreteGpu, backend);
+        info.name = name.into();
+        info.vendor = vendor;
+        info
+    }
+    #[test]
+    fn unsupported_adapters_keep_an_accurate_fallback_reason() {
+        for info in [
+            adapter(wgpu::Backend::Dx12, 0x10de, "RTX 5090"),
+            adapter(wgpu::Backend::Vulkan, 0x1002, "Radeon"),
+        ] {
+            let mut state = State::new(None, true, &info);
+            state.set(Dlss::Quality);
+            assert!(state.startup_failure.as_ref().unwrap().starts_with("TAA:"));
+            assert!(state.configuration.is_none());
+        }
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn an_error_stays_on_taa_until_the_user_changes_the_selection() {
+        let mut state = State::new(
+            None,
+            false,
+            &adapter(wgpu::Backend::Vulkan, 0x10de, "RTX 5090"),
+        );
+        state.set(Dlss::Quality);
+        state.fail("diagnostic failure".into());
+        state.set(Dlss::Quality);
+        assert!(state.failure.is_some());
+        state.set(Dlss::Off);
+        state.set(Dlss::Quality);
+        assert!(state.failure.is_none());
+        assert!(state.reset);
     }
 }

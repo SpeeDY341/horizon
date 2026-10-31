@@ -25,6 +25,7 @@ pub(super) struct Motion {
     target: Option<wgpu::Texture>,
     history: History,
     previous: Option<(Mat4, DVec3)>,
+    frame_reset: bool,
 }
 
 impl Motion {
@@ -126,6 +127,7 @@ impl Motion {
             target: None,
             history: History::default(),
             previous: None,
+            frame_reset: true,
         }
     }
 
@@ -134,7 +136,12 @@ impl Motion {
             .as_ref()
             .map(|t| t.create_view(&Default::default()))
     }
+    pub fn frame_reset(&self) -> bool {
+        self.frame_reset
+    }
+
     pub fn reset(&mut self) {
+        self.frame_reset = true;
         self.history.clear();
         self.previous = None;
     }
@@ -183,6 +190,7 @@ impl Motion {
         if reset {
             self.reset();
         }
+        self.frame_reset = reset;
         let (previous, camera) = self.previous.unwrap_or((current, camera_position));
         let reproject = previous.as_dmat4()
             * DMat4::from_translation(camera_position - camera)

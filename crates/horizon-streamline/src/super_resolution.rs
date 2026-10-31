@@ -100,6 +100,15 @@ impl SuperResolution {
             let q = queue
                 .as_hal::<wgpu::hal::api::Vulkan>()
                 .ok_or("Vulkan queue missing")?;
+            let registered = owner
+                .registered_device()
+                .ok_or("DLSS device is not registered")?;
+            let registered = registered
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .ok_or("Registered Vulkan device missing")?;
+            if d.raw_device().handle() != registered.raw_device().handle() {
+                return Err("DLSS runtime/device mismatch".into());
+            }
             if d.raw_device().handle() != q.raw_device().handle() {
                 return Err("DLSS queue/device mismatch".into());
             }
@@ -119,6 +128,7 @@ impl SuperResolution {
     /// Mode values are the SDK's Quality=3, Balanced=2, Performance=1,
     /// Ultra Performance=4, DLAA=6. Size is obtained from NVIDIA, never guessed.
     pub fn configure(&mut self, mode: u32, output: [u32; 2]) -> Result<[u32; 2], String> {
+        let _session = self._runtime.lock().map_err(|e| e.to_string())?;
         if ![1, 2, 3, 4, 6].contains(&mode)
             || output.contains(&0)
             || output.iter().any(|n| *n > 8192)
@@ -143,7 +153,17 @@ impl SuperResolution {
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| e.to_string())?;
-        self.targets = Some(super::evaluate::Targets::new(&self.device, size, output));
+        let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let internal = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let memory = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let targets = super::evaluate::Targets::new(&self.device, size, output);
+        let memory = pollster::block_on(memory.pop());
+        let internal = pollster::block_on(internal.pop());
+        let validation = pollster::block_on(validation.pop());
+        if let Some(e) = memory.or(internal).or(validation) {
+            return Err(e.to_string());
+        }
+        self.targets = Some(targets);
         self.configuration = Some((mode, output));
         Ok(size)
     }
@@ -157,6 +177,27 @@ impl SuperResolution {
         motion: &wgpu::TextureView,
         frame: FrameConstants,
     ) -> Result<wgpu::TextureView, String> {
+        let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let internal = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let memory = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let result = self.evaluate_frame(color, depth, motion, frame);
+        let memory = pollster::block_on(memory.pop());
+        let internal = pollster::block_on(internal.pop());
+        let validation = pollster::block_on(validation.pop());
+        if let Some(e) = memory.or(internal).or(validation) {
+            return Err(e.to_string());
+        }
+        result
+    }
+
+    fn evaluate_frame(
+        &mut self,
+        color: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        motion: &wgpu::TextureView,
+        frame: FrameConstants,
+    ) -> Result<wgpu::TextureView, String> {
+        let _session = self._runtime.lock().map_err(|e| e.to_string())?;
         let viewport = sl::Viewport::new();
         let targets = self.targets.as_ref().ok_or("DLSS is not configured")?;
         targets.copy_inputs(&self.device, &self.queue, color, depth, motion)?;

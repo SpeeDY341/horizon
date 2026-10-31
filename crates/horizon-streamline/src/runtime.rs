@@ -210,6 +210,10 @@ impl Runtime {
         Ok(())
     }
 
+    pub(crate) fn registered_device(&self) -> Option<&wgpu::Device> {
+        self.device.as_ref()
+    }
+
     /// Checks the actual physical adapter before device creation. A successful
     /// result still requires a correctly created Vulkan device and DLSS setup.
     pub fn check_adapter(&self, adapter: &wgpu::Adapter) -> Result<(), String> {
