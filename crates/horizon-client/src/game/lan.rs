@@ -93,6 +93,9 @@ pub(super) struct LanHost {
     pub commands: Vec<super::lan_actions::GuestCommand>,
     /// Mods' quiet commands waiting to run a few a tick (game/lan_quiet.rs).
     pub quiet: std::collections::VecDeque<super::lan_quiet::QuietBatch>,
+    /// Far terrain sampled for Horizon clients (game/lan_far.rs); None when
+    /// `horizon-lod-distance` is 0.
+    pub far: Option<horizon_client::lod_net::Service>,
     /// Native mods' commands and the level each needs, once asked
     /// (game/native_server.rs).
     pub native_commands: Option<HashMap<String, u8>>,
@@ -1252,6 +1255,8 @@ impl Game<'_> {
                 .get_or_init(|| Arc::new(horizon_client::save::SaveTables::new(&self.pack.assets)))
                 .clone(),
         );
+        let far = (net.lod_distance > 0)
+            .then(|| horizon_client::lod_net::Service::new(net.lod_distance, biome_names.clone()));
         let lan = Lan::start_with(sync.clone(), net)?;
         if let Some(uuid) = host {
             lan.reserve(uuid);
@@ -1284,6 +1289,7 @@ impl Game<'_> {
             border_sent: None,
             commands: Vec::new(),
             quiet: std::collections::VecDeque::new(),
+            far,
             native_commands: None,
             states: Default::default(),
         });

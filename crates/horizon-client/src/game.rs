@@ -136,6 +136,7 @@ mod lan_camera;
 mod lan_chat;
 mod lan_crafting;
 mod lan_entities;
+mod lan_far;
 mod lan_mobs;
 mod lan_mount_menu;
 mod lan_particles;
