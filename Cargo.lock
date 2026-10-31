@@ -1422,6 +1422,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-streamline"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "horizon-telemetry"
 version = "0.1.0"
 dependencies = [

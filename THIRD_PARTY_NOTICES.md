@@ -59,3 +59,12 @@ with Microsoft accounts
 The four-square Microsoft symbol in `launcher/src/microsoft.rs` reproduces the squares, positions and
 colours of Microsoft's official `ms-symbollockup_mssymbol_19.svg` from that page, unmodified. Microsoft
 and its logo are trademarks of the Microsoft group of companies; Horizon is not endorsed by Microsoft.
+
+## NVIDIA Streamline public interface
+
+`crates/horizon-streamline/src/abi.rs` translates selected declarations from the
+MIT-licensed public headers of NVIDIA Streamline 2.14.16, commit
+[625db07d4bca5abc67d781c42af7e7fb0761f1b6](https://github.com/NVIDIA-RTX/Streamline/tree/625db07d4bca5abc67d781c42af7e7fb0761f1b6).
+Copyright (c) 2022-2024 NVIDIA CORPORATION. All rights reserved.
+The MIT notice is preserved at the top of that file. No Nsight Perf or NGX source
+was read or copied, and no NVIDIA runtime binaries are included.
