@@ -276,7 +276,7 @@ pub fn rows(level: Level) -> Vec<Row> {
             h(
                 H::Dlss,
                 High,
-                "NVIDIA SR on Vulkan RTX. Restart after first enabling. Falls back to TAA.",
+                "Replaces TAA upscaling. TAA is fallback only. First use: restart.",
             ),
             h(H::DlssStatus, None, "Actual renderer and fallback reason."),
             h(
@@ -349,11 +349,16 @@ pub fn rows(level: Level) -> Vec<Row> {
 const UPLOAD_STEPS: [u32; 8] = [0, 256, 512, 1024, 2048, 4096, 8192, 16384];
 
 /// Horizon's graphics screens supplement the vanilla options on Video Settings.
-/// Upscaling is only there while TAA is, which does it.
+/// DLSS replaces the TAA controls; their stored values are only its fallback.
 fn extra_rows(level: Level, settings: &Settings) -> Vec<Row> {
     let mut rows = rows(level);
     rows.retain(|row| !matches!(row, Row::Setting(s) if matches!(s.item, Item::Vanilla(_))));
-    if !settings.horizon.taa {
+    if settings.horizon.dlss != Dlss::Off {
+        rows.retain(|row| {
+            !matches!(row, Row::Setting(s) if matches!(s.item,
+                Item::Horizon(H::Antialiasing | H::Upscaling)))
+        });
+    } else if !settings.horizon.taa {
         rows.retain(|row| !matches!(row, Row::Setting(s) if s.item == Item::Horizon(H::Upscaling)));
     }
     // Drop headings whose settings were all on the parent screens.
@@ -1288,6 +1293,12 @@ mod tests {
             assert_eq!(s.horizon.dlss, mode);
             assert!(s.horizon.taa);
             assert!(!s.horizon.fxaa);
+            for level in [Level::Simple, Level::Advanced] {
+                assert!(!extra_rows(level, &s).iter().any(|row| {
+                    matches!(row, Row::Setting(r) if matches!(r.item,
+                        Item::Horizon(H::Antialiasing | H::Upscaling)))
+                }));
+            }
             let loaded = crate::graphics::Graphics::parse(&s.horizon.serialize());
             assert_eq!(loaded.dlss, mode);
         }
