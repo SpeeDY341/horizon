@@ -2,7 +2,7 @@
 //! they show, in what groups, with what description and cost, and their
 //! input. How they look comes from `graphics_style`.
 use crate::{
-    graphics::{FarDetail, GraphicsApi, Overlay, Pacing, PresentMode, Preset, Upscaling},
+    graphics::{Dlss, FarDetail, GraphicsApi, Overlay, Pacing, PresentMode, Preset, Upscaling},
     graphics_style::{Cost, STYLE},
     hud::{HudAtlas, HudBatch},
     lang,
@@ -40,6 +40,8 @@ pub enum H {
     ResolutionScale,
     Antialiasing,
     Upscaling,
+    Dlss,
+    DlssStatus,
     Hdr,
     /// Opens `Level::Hdr`.
     HdrSettings,
@@ -272,6 +274,12 @@ pub fn rows(level: Level) -> Vec<Row> {
                 "Renders the world smaller and rebuilds it with TAA. Faster, softer.",
             ),
             h(
+                H::Dlss,
+                High,
+                "NVIDIA SR on Vulkan RTX. Restart after first enabling. Falls back to TAA.",
+            ),
+            h(H::DlssStatus, None, "Actual renderer and fallback reason."),
+            h(
                 H::HdrSettings,
                 None,
                 "HDR output on an HDR display: lava, fire and sunlight shine brighter.",
@@ -452,6 +460,8 @@ impl H {
                 },
             ),
             H::Upscaling => labelled("Upscaling", g.upscaling.label()),
+            H::Dlss => labelled("DLSS", g.dlss.label()),
+            H::DlssStatus => labelled("DLSS Status", crate::graphics::dlss_status()),
             H::Hdr => labelled("HDR", on_off(g.hdr)),
             H::HdrSettings => Text::literal(lang::get("HDR Settings...")),
             H::HdrPaperWhite => match g.hdr_paper_white {
@@ -547,6 +557,7 @@ impl H {
             H::PresentMode => g.present_mode = step(&PresentMode::ALL, g.present_mode, back),
             // Off, FXAA, TAA.
             H::Antialiasing => {
+                g.dlss = Dlss::Off;
                 let i = if g.taa { 2 } else { usize::from(g.fxaa) };
                 let i = (i + if back { 2 } else { 1 }) % 3;
                 (g.fxaa, g.taa) = (i == 1, i == 2);
@@ -556,11 +567,20 @@ impl H {
             }
             // Upscaling is TAA's: picking a ratio turns it on.
             H::Upscaling => {
+                g.dlss = Dlss::Off;
                 g.upscaling = step(&Upscaling::ALL, g.upscaling, back);
                 if g.upscaling != Upscaling::Native {
                     (g.fxaa, g.taa) = (false, true);
                 }
             }
+            H::Dlss => {
+                g.dlss = step(&Dlss::ALL, g.dlss, back);
+                if g.dlss != Dlss::Off {
+                    g.taa = true;
+                    g.fxaa = false;
+                }
+            }
+            H::DlssStatus => {}
             H::Hdr => g.hdr = !g.hdr,
             H::BatteryMode => g.battery = !g.battery,
             H::GraphicsApi => g.api = step(GraphicsApi::choices(), g.api, back),
@@ -681,6 +701,7 @@ impl Item {
                     | H::Workers
                     | H::BatteryMode
                     | H::GraphicsApi
+                    | H::DlssStatus
             ) | Item::Vanilla(
                 Opt::GuiScale
                     | Opt::Fullscreen
@@ -1255,6 +1276,26 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn dlss_is_opt_in_and_taa_controls_can_leave_it() {
+        let mut s = Settings::default();
+        assert_eq!(s.horizon.dlss, Dlss::Off);
+        let button = Item::Horizon(H::Dlss);
+        for mode in Dlss::ALL.into_iter().skip(1) {
+            button.cycle(&mut s, false, [1280, 720]);
+            assert_eq!(s.horizon.dlss, mode);
+            assert!(s.horizon.taa);
+            assert!(!s.horizon.fxaa);
+            let loaded = crate::graphics::Graphics::parse(&s.horizon.serialize());
+            assert_eq!(loaded.dlss, mode);
+        }
+        Item::Horizon(H::Upscaling).cycle(&mut s, false, [1280, 720]);
+        assert_eq!(s.horizon.dlss, Dlss::Off);
+        button.cycle(&mut s, false, [1280, 720]);
+        Item::Horizon(H::Antialiasing).cycle(&mut s, false, [1280, 720]);
+        assert_eq!(s.horizon.dlss, Dlss::Off);
     }
 
     #[test]

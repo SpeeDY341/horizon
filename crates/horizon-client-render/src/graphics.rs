@@ -301,6 +301,71 @@ impl Upscaling {
     }
 }
 
+/// Optional NVIDIA Super Resolution; TAA remains the fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Dlss {
+    #[default]
+    Off,
+    Quality,
+    Balanced,
+    Performance,
+    UltraPerformance,
+}
+impl Dlss {
+    pub const ALL: [Self; 5] = [
+        Self::Off,
+        Self::Quality,
+        Self::Balanced,
+        Self::Performance,
+        Self::UltraPerformance,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Quality => "quality",
+            Self::Balanced => "balanced",
+            Self::Performance => "performance",
+            Self::UltraPerformance => "ultraPerformance",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Quality => "Quality",
+            Self::Balanced => "Balanced",
+            Self::Performance => "Performance",
+            Self::UltraPerformance => "Ultra Performance",
+        }
+    }
+    pub fn mode(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Quality => 3,
+            Self::Balanced => 2,
+            Self::Performance => 1,
+            Self::UltraPerformance => 4,
+        }
+    }
+    fn parse(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|v| v.name() == s)
+            .unwrap_or_default()
+    }
+}
+static DLSS_STATUS: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+pub fn report_dlss(status: impl Into<String>) {
+    *DLSS_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = status.into();
+}
+pub fn dlss_status() -> String {
+    let s = DLSS_STATUS.lock().unwrap_or_else(|e| e.into_inner());
+    if s.is_empty() {
+        "Off".into()
+    } else {
+        s.clone()
+    }
+}
+
 static REDUCED_SUGGESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Whether the settings suggest Reduced far detail: set when the renderer
 /// starts, on the GPUs `lod_capped` names (far terrain slows them most).
@@ -379,6 +444,7 @@ pub struct Graphics {
     pub taa: bool,
     /// TAA upscaling; anything but `Native` comes with `taa` on.
     pub upscaling: Upscaling,
+    pub dlss: Dlss,
     /// HDR output (HDR10, or scRGB), where the display path offers it.
     pub hdr: bool,
     /// HDR paper white (where SDR white sits), in nits; 0 is Auto: the desktop's SDR
@@ -428,6 +494,7 @@ impl Default for Graphics {
             fxaa: false,
             taa: false,
             upscaling: Upscaling::Native,
+            dlss: Dlss::Off,
             hdr: false,
             hdr_paper_white: 0,
             hdr_peak: 0,
@@ -495,6 +562,7 @@ impl Graphics {
                 "fxaa" => g.fxaa = flag(g.fxaa),
                 "taa" => g.taa = flag(g.taa),
                 "upscaling" => g.upscaling = Upscaling::parse(value),
+                "dlss" => g.dlss = Dlss::parse(value),
                 "hdr" => g.hdr = flag(g.hdr),
                 "hdrPaperWhite" => {
                     g.hdr_paper_white = match number(g.hdr_paper_white) {
@@ -530,7 +598,7 @@ impl Graphics {
     }
     pub fn serialize(&self) -> String {
         format!(
-            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrKey:{}\nbatteryMode:{}\ngraphicsApi:{}\npickedShaderPack:{}\n",
+            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\ndlss:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrKey:{}\nbatteryMode:{}\ngraphicsApi:{}\npickedShaderPack:{}\n",
             self.preset.name(),
             self.lod_distance,
             self.far_detail.name(),
@@ -557,6 +625,7 @@ impl Graphics {
             bool_text(self.fxaa),
             bool_text(self.taa),
             self.upscaling.name(),
+            self.dlss.name(),
             bool_text(self.hdr),
             self.hdr_paper_white,
             self.hdr_peak,
@@ -701,6 +770,7 @@ mod tests {
             fxaa: true,
             taa: true,
             upscaling: Upscaling::Balanced,
+            dlss: Dlss::Quality,
             hdr: true,
             hdr_paper_white: 240,
             hdr_peak: 1400,
