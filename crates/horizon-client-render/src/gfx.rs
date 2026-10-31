@@ -105,6 +105,7 @@ mod readback;
 mod resident;
 mod stars;
 mod sunrise_fan;
+mod surface_lifecycle;
 mod timing;
 pub mod translucency;
 pub(crate) mod upload;
@@ -678,7 +679,7 @@ pub struct Renderer {
     readback: readback::Readback,
     pub info: wgpu::AdapterInfo,
     pub suspended: bool,
-    surface_change_failed: bool,
+    pending_surface_changes: surface_lifecycle::Pending,
     /// Consecutive frames whose surface acquisition failed validation. The
     /// first gets the swapchain a fresh configuration; later ones reattach
     /// the window, as a lost surface does.
@@ -3106,7 +3107,7 @@ impl Renderer {
             readback: readback::Readback::default(),
             info,
             suspended: !drawable_size(size.width, size.height, max_side),
-            surface_change_failed: false,
+            pending_surface_changes: surface_lifecycle::Pending::default(),
             acquire_validation_failures: 0,
             drawn_sections: 0,
             section_draws: 0,
@@ -3175,22 +3176,78 @@ impl Renderer {
         })
     }
     /// Also used before asking the window system to change fullscreen state.
-    /// On failure drawing stops; no surface mutation is safe until a retry
-    /// succeeds. Zero-size resize takes this path too, without another frame.
+    /// The caller must propagate failure or retain its request for a retry.
+    /// Zero-size resize takes this path too, without another presented frame.
     pub fn prepare_surface_change(&mut self) -> Result<()> {
         self.world_post.reset_history();
         self.dlss.invalidate_history();
         if let Some(motion) = &mut self.motion {
             motion.reset();
         }
-        let result = frame_gen::prepare_presentation(&self.streamline, &self.device);
-        self.surface_change_failed = result.is_err();
+        frame_gen::prepare_presentation(&self.streamline, &self.device).map_err(Into::into)
+    }
+
+    fn queue_surface_change(&mut self, change: surface_lifecycle::Change) {
+        self.pending_surface_changes.push(change);
+        // A failed immediate attempt is retained; render retries or reports a
+        // terminal error. Setters never discard the requested configuration.
+        let _ = self.apply_pending_surface_changes();
+    }
+
+    fn apply_pending_surface_changes(&mut self) -> Result<bool> {
+        let mut pending = std::mem::take(&mut self.pending_surface_changes);
+        let result = pending.poll(Instant::now(), |change| {
+            let changes_swapchain = match change {
+                surface_lifecycle::Change::PresentMode(mode) => self.config.present_mode != *mode,
+                surface_lifecycle::Change::Hdr(on, ..) => {
+                    self.hdr_output
+                        .filter(|_| *on && self.surface.is_some())
+                        .is_some()
+                        != self.hdr.is_some()
+                }
+                _ => true,
+            };
+            if changes_swapchain {
+                self.prepare_surface_change().map_err(|e| e.to_string())?;
+            }
+            match change {
+                surface_lifecycle::Change::Resize(w, h) => self.apply_resize(*w, *h),
+                surface_lifecycle::Change::PresentMode(mode) => {
+                    self.config.present_mode = *mode;
+                    if changes_swapchain && let Some(surface) = &self.surface {
+                        Self::configure(
+                            &self.device,
+                            surface,
+                            &self.surface_config(),
+                            self.hdr.as_ref(),
+                        );
+                    }
+                }
+                surface_lifecycle::Change::Hdr(on, values, marker) => {
+                    self.apply_hdr(*on, values[0], values[1], values[2], values[3], marker);
+                }
+                surface_lifecycle::Change::Fullscreen(request) => {
+                    self.window.set_fullscreen(request.clone())
+                }
+            }
+            Ok(())
+        });
+        self.pending_surface_changes = pending;
         result.map_err(Into::into)
+    }
+
+    /// Ownership of this request transfers to the renderer until checked Off
+    /// succeeds. Input must not independently mutate the window afterward.
+    pub fn request_fullscreen(&mut self, request: Option<winit::window::Fullscreen>) {
+        self.queue_surface_change(surface_lifecycle::Change::Fullscreen(request));
     }
 
     /// Hand the window surface to the renderer replacing this one on the same
     /// device. A failed Off leaves ownership and all GPU resources here.
     pub fn release_surface(&mut self) -> Result<()> {
+        if !self.apply_pending_surface_changes()? {
+            return Err("Surface change recovery is pending; resource reload deferred".into());
+        }
         self.prepare_surface_change()?;
         *self
             .spare_surface
@@ -3276,27 +3333,17 @@ impl Renderer {
             Some(PresentMode::Immediate) => wgpu::PresentMode::Immediate,
             _ => wgpu::PresentMode::Fifo,
         };
-        if self.config.present_mode != mode && self.surface.is_some() {
-            if let Err(error) = self.prepare_surface_change() {
-                log::warn!("Present mode unchanged: {error}");
-                return;
-            }
-            self.config.present_mode = mode;
-            Self::configure(
-                &self.device,
-                self.surface.as_ref().unwrap(),
-                &self.surface_config(),
-                self.hdr.as_ref(),
-            );
+        if self.surface.is_some() {
+            self.queue_surface_change(surface_lifecycle::Change::PresentMode(mode));
         }
     }
     /// Follows the window to `width` x `height`. A size the swapchain can't take
     /// ([`drawable_size`]) keeps the last one and draws nothing until the next.
     pub fn resize(&mut self, width: u32, height: u32) {
-        if let Err(error) = self.prepare_surface_change() {
-            log::warn!("Resize skipped: {error}");
-            return;
-        }
+        self.queue_surface_change(surface_lifecycle::Change::Resize(width, height));
+    }
+
+    fn apply_resize(&mut self, width: u32, height: u32) {
         let max = self.device.limits().max_texture_dimension_2d;
         self.suspended = !drawable_size(width, height, max);
         if self.suspended {
@@ -3806,12 +3853,24 @@ impl Renderer {
         ui: f32,
         marker: &std::path::Path,
     ) {
+        self.queue_surface_change(surface_lifecycle::Change::Hdr(
+            on,
+            [paper_white, peak, black, ui],
+            marker.to_owned(),
+        ));
+    }
+
+    fn apply_hdr(
+        &mut self,
+        on: bool,
+        paper_white: f32,
+        peak: f32,
+        black: f32,
+        ui: f32,
+        marker: &std::path::Path,
+    ) {
         let output = self.hdr_output.filter(|_| on && self.surface.is_some());
         if output.is_some() != self.hdr.is_some() {
-            if let Err(error) = self.prepare_surface_change() {
-                log::warn!("HDR unchanged: {error}");
-                return;
-            }
             // If the game dies before HDR output shows a frame, the marker is still there at
             // the next start, which then comes up with HDR off.
             if output.is_some() {
@@ -4553,7 +4612,7 @@ impl Renderer {
         if let Some(flat) = &mut self.flat {
             flat.trim(|page| self.arena.has_page(page));
         }
-        if self.suspended || self.surface_change_failed {
+        if !self.apply_pending_surface_changes()? || self.suspended {
             return Ok(false);
         }
         let started = Instant::now();

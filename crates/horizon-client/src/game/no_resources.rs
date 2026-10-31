@@ -71,7 +71,7 @@ impl Missing {
         match renderer.render(&loading_frame(&batch)) {
             Ok(true) => return,
             Ok(false) => {}
-            Err(e) => log::warn!("Horizon: frame failed: {e}"),
+            Err(e) => self.error = Some(e),
         }
         // The frame was not shown (the first one often isn't): the glyphs it
         // rasterized never reached the atlas, so draw them again next frame.

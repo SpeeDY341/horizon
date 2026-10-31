@@ -17456,7 +17456,10 @@ impl Loading {
                     self.menu.perf.title_shown()
                 }
                 Ok(_) => {}
-                Err(e) => log::warn!("Horizon: loading screen frame failed: {e}"),
+                Err(e) => {
+                    self.error = Some(e);
+                    return;
+                }
             }
         }
         if !self.shown {

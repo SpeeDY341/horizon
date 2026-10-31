@@ -328,12 +328,16 @@ impl FullscreenState {
             exclusive,
             preferred,
             in_video_screen,
-            || true,
+            |request| {
+                window.set_fullscreen(request);
+                true
+            },
         );
     }
 
-    /// Prepare the renderer before an actual window mutation. If preparation
-    /// fails, keep the request pending so applying settings can retry safely.
+    /// Transfer the window request to its executor. A false result preserves
+    /// input's pending request; true means the executor accepted ownership,
+    /// including responsibility for retries before an eventual mutation.
     pub fn apply_with(
         &mut self,
         window: &winit::window::Window,
@@ -341,17 +345,11 @@ impl FullscreenState {
         exclusive: bool,
         preferred: Option<VideoMode>,
         in_video_screen: bool,
-        prepare: impl FnOnce() -> bool,
+        apply: impl FnOnce(Option<winit::window::Fullscreen>) -> bool,
     ) {
-        match self.prepare_request(wanted, exclusive, preferred, in_video_screen, prepare) {
-            Some(false) => window.set_fullscreen(None),
-            Some(true) => window.set_fullscreen(Some(fullscreen_request(
-                window,
-                exclusive,
-                preferred.as_ref(),
-            ))),
-            None => {}
-        }
+        self.prepare_request(wanted, exclusive, preferred, in_video_screen, |enter| {
+            apply(enter.then(|| fullscreen_request(window, exclusive, preferred.as_ref())))
+        });
     }
 
     fn prepare_request(
@@ -360,7 +358,7 @@ impl FullscreenState {
         exclusive: bool,
         preferred: Option<VideoMode>,
         in_video_screen: bool,
-        prepare: impl FnOnce() -> bool,
+        prepare: impl FnOnce(bool) -> bool,
     ) -> Option<bool> {
         let previous = *self;
         let request = self.request(wanted);
@@ -370,7 +368,7 @@ impl FullscreenState {
         if request.is_none() && !reapply && !mode_change {
             return None;
         }
-        if !prepare() {
+        if !prepare(request.unwrap_or(true)) {
             *self = previous;
             return None;
         }
@@ -573,7 +571,7 @@ mod tests {
         let mut fullscreen = super::FullscreenState::new(false);
         let previous = fullscreen;
         let mut calls = Vec::new();
-        let change = fullscreen.prepare_request(true, false, None, false, || {
+        let change = fullscreen.prepare_request(true, false, None, false, |_| {
             calls.push("Off failed");
             false
         });
@@ -582,7 +580,7 @@ mod tests {
         }
         assert_eq!(fullscreen, previous);
         assert_eq!(calls, ["Off failed"]);
-        let change = fullscreen.prepare_request(true, false, None, false, || {
+        let change = fullscreen.prepare_request(true, false, None, false, |_| {
             calls.push("Off succeeded");
             true
         });
@@ -590,7 +588,7 @@ mod tests {
         calls.push("window mutation");
         assert_eq!(calls, ["Off failed", "Off succeeded", "window mutation"]);
         assert_eq!(
-            fullscreen.prepare_request(true, false, None, false, || panic!("no change")),
+            fullscreen.prepare_request(true, false, None, false, |_| panic!("no change")),
             None
         );
     }

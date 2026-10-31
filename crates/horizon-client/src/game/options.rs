@@ -361,17 +361,21 @@ impl Game<'_> {
                 .fullscreen_resolution
                 .as_deref()
                 .and_then(horizon_client::window::VideoMode::read);
-            self.fullscreen
-                .apply_with(&w, wanted, exclusive, preferred, in_video_screen, || {
-                    self.renderer.as_mut().is_none_or(|renderer| {
-                        renderer
-                            .prepare_surface_change()
-                            .inspect_err(|e| {
-                                log::warn!("Fullscreen unchanged: {e}");
-                            })
-                            .is_ok()
-                    })
-                });
+            self.fullscreen.apply_with(
+                &w,
+                wanted,
+                exclusive,
+                preferred,
+                in_video_screen,
+                |request| {
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        renderer.request_fullscreen(request);
+                    } else {
+                        w.set_fullscreen(request);
+                    }
+                    true
+                },
+            );
             self.settings.video_modes = modes;
         }
     }

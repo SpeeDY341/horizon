@@ -332,15 +332,13 @@ impl Loading {
                 self.settings.file.bool("exclusiveFullscreen"),
                 preferred,
                 false,
-                || {
-                    self.renderer.as_mut().is_none_or(|renderer| {
-                        renderer
-                            .prepare_surface_change()
-                            .inspect_err(|e| {
-                                log::warn!("Fullscreen unchanged: {e}");
-                            })
-                            .is_ok()
-                    })
+                |request| {
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        renderer.request_fullscreen(request);
+                    } else {
+                        window.set_fullscreen(request);
+                    }
+                    true
                 },
             );
             self.settings.video_modes = modes;
