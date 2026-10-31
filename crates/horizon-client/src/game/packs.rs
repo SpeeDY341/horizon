@@ -272,7 +272,7 @@ impl Game<'_> {
                     self.renderer.as_ref(),
                     Some(textures),
                     self.settings.horizon.api,
-                    self.settings.horizon.dlss != horizon_client::graphics::Dlss::Off,
+                    self.settings.horizon.dlss_mode() != horizon_client::graphics::Dlss::Off,
                     self.settings.horizon.reflex,
                 )
             })

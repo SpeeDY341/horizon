@@ -12371,7 +12371,7 @@ impl Game<'_> {
             self.renderer.as_ref(),
             None,
             self.settings.horizon.api,
-            self.settings.horizon.dlss != horizon_client::graphics::Dlss::Off,
+            self.settings.horizon.dlss_mode() != horizon_client::graphics::Dlss::Off,
             self.settings.horizon.reflex,
         )
     }
@@ -17342,7 +17342,7 @@ impl Loading {
             self.gui.as_ref(),
             None,
             self.settings.horizon.api,
-            self.settings.horizon.dlss != horizon_client::graphics::Dlss::Off,
+            self.settings.horizon.dlss_mode() != horizon_client::graphics::Dlss::Off,
             self.settings.horizon.reflex,
         ) {
             Ok(r) => self.renderer = Some(r),
@@ -17389,7 +17389,7 @@ impl Loading {
             self.gui.as_ref(),
             self.renderer.as_ref(),
             self.settings.horizon.api,
-            self.settings.horizon.dlss != horizon_client::graphics::Dlss::Off,
+            self.settings.horizon.dlss_mode() != horizon_client::graphics::Dlss::Off,
             self.settings.horizon.reflex,
         ) {
             Ok(r) => {
@@ -17479,7 +17479,7 @@ impl Loading {
             self.renderer.as_ref(),
             loaded.renderer_cpu,
             self.settings.horizon.api,
-            self.settings.horizon.dlss != horizon_client::graphics::Dlss::Off,
+            self.settings.horizon.dlss_mode() != horizon_client::graphics::Dlss::Off,
             self.settings.horizon.reflex,
         )?;
         log::info!(

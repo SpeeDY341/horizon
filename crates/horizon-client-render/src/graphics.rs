@@ -252,12 +252,10 @@ impl FarDetail {
     }
 }
 
-/// TAA upscaling: the world renders this much smaller than the resolution scale's size,
-/// and TAA builds the full-size picture from the jittered frames (FSR's and DLSS's ratios).
+/// Shared quality for Standard and DLSS. Native is 1×. There is no Off:
+/// turning the picture path off is [`Upscaler::Off`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Upscaling {
-    /// No upscaler. Full resolution, without DLSS and without a TAA rebuild.
-    Off,
     #[default]
     Native,
     Quality,
@@ -266,8 +264,7 @@ pub enum Upscaling {
     UltraPerformance,
 }
 impl Upscaling {
-    pub const ALL: [Upscaling; 6] = [
-        Upscaling::Off,
+    pub const ALL: [Upscaling; 5] = [
         Upscaling::Native,
         Upscaling::Quality,
         Upscaling::Balanced,
@@ -276,7 +273,6 @@ impl Upscaling {
     ];
     pub fn name(self) -> &'static str {
         match self {
-            Upscaling::Off => "off",
             Upscaling::Native => "native",
             Upscaling::Quality => "quality",
             Upscaling::Balanced => "balanced",
@@ -286,7 +282,6 @@ impl Upscaling {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Upscaling::Off => "Off",
             Upscaling::Native => "Native",
             Upscaling::Quality => "Quality",
             Upscaling::Balanced => "Balanced",
@@ -294,10 +289,10 @@ impl Upscaling {
             Upscaling::UltraPerformance => "Ultra Performance",
         }
     }
-    /// Output pixels per rendered pixel, along each axis. Off and Native are 1×.
+    /// Output pixels per rendered pixel, along each axis. Native is 1×.
     pub fn ratio(self) -> f32 {
         match self {
-            Upscaling::Off | Upscaling::Native => 1.0,
+            Upscaling::Native => 1.0,
             Upscaling::Quality => 1.5,
             Upscaling::Balanced => 1.7,
             Upscaling::Performance => 2.0,
@@ -306,13 +301,11 @@ impl Upscaling {
     }
     /// The built-in upscaler renders smaller and lets TAA rebuild the picture.
     pub fn scales(self) -> bool {
-        !matches!(self, Upscaling::Off | Upscaling::Native)
+        !matches!(self, Upscaling::Native)
     }
     /// The DLSS mode of the same quality. Native is full-resolution DLAA.
-    /// Off has no DLSS mode.
     pub fn as_dlss(self) -> Dlss {
         match self {
-            Upscaling::Off => Dlss::Off,
             Upscaling::Native => Dlss::Dlaa,
             Upscaling::Quality => Dlss::Quality,
             Upscaling::Balanced => Dlss::Balanced,
@@ -328,8 +321,46 @@ impl Upscaling {
     }
 }
 
-/// Optional NVIDIA Super Resolution. `Off` selects the built-in upscaler.
-/// Any other value selects DLSS; its quality is [`Upscaling`].
+/// Which picture path runs. Off is full resolution with no upscaler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Upscaler {
+    /// Full resolution. No built-in upscaler and no DLSS.
+    Off,
+    /// The built-in upscaler. A quality below Native turns TAA on.
+    #[default]
+    Standard,
+    /// Full-resolution DLSS anti-aliasing.
+    Dlaa,
+    /// DLSS Super Resolution at [`Upscaling`].
+    Dlss,
+}
+impl Upscaler {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Standard, Self::Dlaa, Self::Dlss];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Standard => "standard",
+            Self::Dlaa => "dlaa",
+            Self::Dlss => "dlss",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Standard => "Standard",
+            Self::Dlaa => "DLAA",
+            Self::Dlss => "DLSS",
+        }
+    }
+    fn parse(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|v| v.name() == s)
+            .unwrap_or_default()
+    }
+}
+
+/// NVIDIA mode stored for older files. The menu choice is [`Upscaler`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Dlss {
     #[default]
@@ -542,8 +573,11 @@ pub struct Graphics {
     pub fxaa: bool,
     /// TAA over the world (FXAA is off while it is on).
     pub taa: bool,
-    /// TAA upscaling; anything but `Native` comes with `taa` on.
+    /// Quality shared by Standard and DLSS. Native is 1×. Off is not a quality.
     pub upscaling: Upscaling,
+    /// Off, Standard, DLAA or DLSS. Off renders at full resolution.
+    pub upscaler: Upscaler,
+    /// Effective NVIDIA mode. Off unless the upscaler is DLAA or DLSS.
     pub dlss: Dlss,
     pub dlss_preset: DlssPreset,
     pub dlss_monitor: bool,
@@ -598,6 +632,7 @@ impl Default for Graphics {
             fxaa: false,
             taa: false,
             upscaling: Upscaling::Native,
+            upscaler: Upscaler::Standard,
             dlss: Dlss::Off,
             dlss_preset: DlssPreset::Auto,
             dlss_monitor: false,
@@ -633,9 +668,10 @@ impl Graphics {
     }
     pub fn parse(text: &str) -> Self {
         let mut g = Self::default();
-        // `upscaling:off` is explicit. An older file stored the DLSS quality
-        // separately and must still win, but it must not turn Off back into DLAA.
-        let mut upscaling_off = false;
+        // `upscaling:off` is the old quality row. It means the upscaler is Off,
+        // and it must not be read as Native. An explicit `upscaler` wins.
+        let mut saw_upscaler = false;
+        let mut legacy_off = false;
         for line in text.lines() {
             let Some((key, value)) = line.split_once(':') else {
                 continue;
@@ -672,8 +708,14 @@ impl Graphics {
                 "fxaa" => g.fxaa = flag(g.fxaa),
                 "taa" => g.taa = flag(g.taa),
                 "upscaling" => {
-                    g.upscaling = Upscaling::parse(value);
-                    upscaling_off = g.upscaling == Upscaling::Off;
+                    legacy_off = value == "off";
+                    if !legacy_off {
+                        g.upscaling = Upscaling::parse(value);
+                    }
+                }
+                "upscaler" => {
+                    g.upscaler = Upscaler::parse(value);
+                    saw_upscaler = true;
                 }
                 "dlss" => g.dlss = Dlss::parse(value),
                 "dlssPreset" => g.dlss_preset = DlssPreset::parse(value),
@@ -710,71 +752,87 @@ impl Graphics {
                 _ => {}
             }
         }
-        // Older menus stored the DLSS quality separately and could hide the
-        // shared quality. The DLSS value was the one on screen, so it wins.
-        if !upscaling_off && let Some(quality) = g.dlss.quality() {
-            g.upscaling = quality;
-            g.fxaa = false;
-            g.taa = false;
+        // Older menus stored the DLSS quality separately. That value was the
+        // one on screen, unless the quality row itself said Off.
+        if !saw_upscaler {
+            if legacy_off {
+                g.upscaler = Upscaler::Off;
+                if let Some(quality) = g.dlss.quality() {
+                    g.upscaling = quality;
+                }
+            } else if let Some(quality) = g.dlss.quality() {
+                g.upscaling = quality;
+                g.fxaa = false;
+                g.taa = false;
+                g.upscaler = if g.dlss == Dlss::Dlaa {
+                    Upscaler::Dlaa
+                } else {
+                    Upscaler::Dlss
+                };
+            } else {
+                g.upscaler = Upscaler::Standard;
+            }
         }
+        g.dlss = g.dlss_mode();
         g
     }
-    /// DLSS is the selected upscaler. Anti-aliasing is then off.
-    pub fn dlss_upscaler(&self) -> bool {
-        self.dlss != Dlss::Off
+    /// DLAA or DLSS is selected, so FXAA and TAA stay off.
+    pub fn dlss_selected(&self) -> bool {
+        matches!(self.upscaler, Upscaler::Dlaa | Upscaler::Dlss)
     }
-    /// Mode sent to DLSS. While DLSS is selected, quality comes from `upscaling`.
-    /// Off runs neither DLSS nor DLAA.
+    /// Mode sent to DLSS. Off and Standard send nothing. DLAA is always 1×.
+    /// DLSS uses [`Upscaling`], and Native there is full-resolution DLAA.
     pub fn dlss_mode(&self) -> Dlss {
-        if self.upscaling == Upscaling::Off || !self.dlss_upscaler() {
-            Dlss::Off
-        } else {
-            self.upscaling.as_dlss()
+        match self.upscaler {
+            Upscaler::Off | Upscaler::Standard => Dlss::Off,
+            Upscaler::Dlaa => Dlss::Dlaa,
+            Upscaler::Dlss => self.upscaling.as_dlss(),
         }
     }
-    /// Leave DLSS for the built-in upscaler. A reduced quality needs TAA.
-    pub fn select_standard_upscaler(&mut self) {
-        self.dlss = Dlss::Off;
-        if self.upscaling.scales() {
-            self.fxaa = false;
-            self.taa = true;
+    /// Rendered-size ratio. Off and DLAA stay at 1×. Standard uses the quality
+    /// only while TAA is rebuilding the picture. DLSS always uses the quality.
+    pub fn render_scale(&self) -> f32 {
+        match self.upscaler {
+            Upscaler::Dlss => self.upscaling.ratio(),
+            Upscaler::Standard if self.taa && self.upscaling.scales() => self.upscaling.ratio(),
+            _ => 1.0,
         }
     }
-    /// Select DLSS at the shared quality and clear TAA and FXAA.
-    /// Off keeps DLSS selected without running it.
-    pub fn select_dlss_upscaler(&mut self) {
-        self.fxaa = false;
-        self.taa = false;
-        self.dlss = if self.upscaling == Upscaling::Off {
-            Dlss::Dlaa
-        } else {
-            self.upscaling.as_dlss()
-        };
-    }
-    /// One quality for whichever upscaler is selected.
-    pub fn set_upscale_quality(&mut self, quality: Upscaling) {
-        let previous = self.upscaling;
-        self.upscaling = quality;
-        if quality == Upscaling::Off {
-            // TAA that only rebuilt a smaller frame is the upscaler. Turn that off.
-            // A chosen anti-aliasing mode at Native stays.
-            if previous.scales() && !self.dlss_upscaler() {
-                self.taa = false;
-            }
-            return;
+    /// Pick the upscaler. DLAA and DLSS clear anti-aliasing. Standard turns TAA
+    /// on when the quality renders a smaller picture. Off drops that TAA.
+    pub fn set_upscaler(&mut self, upscaler: Upscaler) {
+        let previous = self.upscaler;
+        self.upscaler = upscaler;
+        if upscaler == Upscaler::Off && previous == Upscaler::Standard && self.upscaling.scales() {
+            self.taa = false;
         }
-        if self.dlss_upscaler() {
+        if matches!(upscaler, Upscaler::Dlaa | Upscaler::Dlss) {
             self.fxaa = false;
             self.taa = false;
-            self.dlss = quality.as_dlss();
-        } else if quality.scales() {
+        }
+        if upscaler == Upscaler::Standard && self.upscaling.scales() {
             self.fxaa = false;
             self.taa = true;
         }
+        self.dlss = self.dlss_mode();
+    }
+    /// One quality for Standard and DLSS. DLAA stays 1× and remembers it.
+    /// Off remembers it too, and still renders at full resolution.
+    pub fn set_upscale_quality(&mut self, quality: Upscaling) {
+        self.upscaling = quality;
+        if self.upscaler == Upscaler::Standard && quality.scales() {
+            self.fxaa = false;
+            self.taa = true;
+        }
+        if self.dlss_selected() {
+            self.fxaa = false;
+            self.taa = false;
+        }
+        self.dlss = self.dlss_mode();
     }
     pub fn serialize(&self) -> String {
         format!(
-            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\ndlss:{}\ndlssPreset:{}\ndlssMonitor:{}\nreflex:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrKey:{}\nbatteryMode:{}\ngraphicsApi:{}\npickedShaderPack:{}\n",
+            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nupscaler:{}\ndlss:{}\ndlssPreset:{}\ndlssMonitor:{}\nreflex:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrKey:{}\nbatteryMode:{}\ngraphicsApi:{}\npickedShaderPack:{}\n",
             self.preset.name(),
             self.lod_distance,
             self.far_detail.name(),
@@ -801,6 +859,7 @@ impl Graphics {
             bool_text(self.fxaa),
             bool_text(self.taa),
             self.upscaling.name(),
+            self.upscaler.name(),
             self.dlss.name(),
             self.dlss_preset.name(),
             bool_text(self.dlss_monitor),
@@ -949,6 +1008,7 @@ mod tests {
             fxaa: false,
             taa: false,
             upscaling: Upscaling::Quality,
+            upscaler: Upscaler::Dlss,
             dlss: Dlss::Quality,
             dlss_preset: DlssPreset::M,
             dlss_monitor: true,
@@ -967,31 +1027,49 @@ mod tests {
         assert_eq!(Graphics::parse(""), Graphics::default());
         // A file from the old split controls keeps the DLSS quality that was shown.
         let old = Graphics::parse("dlss:performance\nupscaling:native\ntaa:true\nfxaa:true\n");
+        assert_eq!(old.upscaler, Upscaler::Dlss);
         assert_eq!(old.dlss, Dlss::Performance);
         assert_eq!(old.upscaling, Upscaling::Performance);
         assert!(!old.taa);
         assert!(!old.fxaa);
-        // Off is explicit and is not the fallback for an unknown quality.
+        // The old quality Off is the upscaler Off. Quality is remembered, and
+        // an unknown quality name stays Native.
         let off = Graphics::parse("upscaling:off\ndlss:quality\ntaa:true\n");
-        assert_eq!(off.upscaling, Upscaling::Off);
-        assert_eq!(off.dlss, Dlss::Quality);
+        assert_eq!(off.upscaler, Upscaler::Off);
+        assert_eq!(off.upscaling, Upscaling::Quality);
+        assert_eq!(off.dlss, Dlss::Off);
         assert_eq!(off.dlss_mode(), Dlss::Off);
+        assert_eq!(off.render_scale(), 1.0);
         assert!(off.taa);
+        let dlaa = Graphics::parse("upscaler:dlaa\nupscaling:quality\n");
+        assert_eq!(dlaa.upscaler, Upscaler::Dlaa);
+        assert_eq!(dlaa.upscaling, Upscaling::Quality);
+        assert_eq!(dlaa.dlss_mode(), Dlss::Dlaa);
+        assert_eq!(dlaa.render_scale(), 1.0);
         assert_eq!(
             Graphics::parse("upscaling:nope\n").upscaling,
             Upscaling::Native
+        );
+        assert_eq!(
+            Graphics::parse("upscaler:nope\n").upscaler,
+            Upscaler::Standard
         );
         assert_eq!(Graphics::parse("reflex:boost\n").reflex, Reflex::Boost);
         assert_eq!(Graphics::parse("reflex:on\n").reflex, Reflex::On);
         assert_eq!(Graphics::parse("reflex:nope\n").reflex, Reflex::Off);
         let mut chosen = Graphics::default();
-        chosen.select_dlss_upscaler();
-        chosen.set_upscale_quality(Upscaling::Off);
-        assert!(chosen.dlss_upscaler());
-        assert_eq!(chosen.dlss_mode(), Dlss::Off);
-        assert!(!chosen.taa);
+        chosen.set_upscaler(Upscaler::Off);
         chosen.set_upscale_quality(Upscaling::Quality);
+        assert_eq!(chosen.upscaler, Upscaler::Off);
+        assert_eq!(chosen.dlss_mode(), Dlss::Off);
+        assert_eq!(chosen.render_scale(), 1.0);
+        chosen.set_upscaler(Upscaler::Dlss);
         assert_eq!(chosen.dlss_mode(), Dlss::Quality);
+        assert_eq!(chosen.render_scale(), 1.5);
+        chosen.set_upscaler(Upscaler::Dlaa);
+        assert_eq!(chosen.dlss_mode(), Dlss::Dlaa);
+        assert_eq!(chosen.render_scale(), 1.0);
+        assert_eq!(chosen.upscaling, Upscaling::Quality);
         // 0 is Auto; anything else is a peak the slider reaches.
         assert_eq!(Graphics::parse("hdrPeak:0\n").hdr_peak, 0);
         assert_eq!(Graphics::parse("hdrPeak:50\n").hdr_peak, 200);
