@@ -586,6 +586,19 @@ impl super::Instance {
         .map_err(|err| {
             crate::InstanceError::with_source(String::from("missing Vulkan entry points"), err)
         })?;
+        unsafe { Self::init_with_entry(desc, entry, callback) }
+    }
+
+    /// Initialize using an application-selected Vulkan loader (e.g. Streamline).
+    ///
+    /// # Safety
+    /// `entry` must implement the Vulkan loader ABI. All instance/device entry
+    /// points must come from this same loader; `init_with_callback` rules apply.
+    pub unsafe fn init_with_entry(
+        desc: &crate::InstanceDescriptor<'_>,
+        entry: ash::Entry,
+        callback: Option<Box<super::CreateInstanceCallback>>,
+    ) -> Result<Self, crate::InstanceError> {
         let version = {
             profiling::scope!("vkEnumerateInstanceVersion");
             unsafe { entry.try_enumerate_instance_version() }

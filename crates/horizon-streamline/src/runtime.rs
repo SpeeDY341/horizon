@@ -25,6 +25,10 @@ pub struct Requirements {
 pub struct Runtime {
     shutdown: abi::Shutdown,
     requirements: abi::GetRequirements,
+    supported: abi::IsSupported,
+    device: Option<wgpu::Device>,
+    instance: Option<wgpu::Instance>,
+    directory: std::path::PathBuf,
     _library: libloading::os::windows::Library,
     _session: MutexGuard<'static, ()>,
 }
@@ -40,6 +44,16 @@ impl Runtime {
             return Err("Streamline requires a project UUID".into());
         }
         let directory = directory.canonicalize().map_err(|e| e.to_string())?;
+        // NVIDIA's signature verifier rejects extended-length paths even when
+        // WinVerifyTrust accepts them. Use ordinary absolute paths for the SDK.
+        let text = directory.to_string_lossy();
+        let directory = if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+            std::path::PathBuf::from(format!(r"\\{unc}"))
+        } else if let Some(local) = text.strip_prefix(r"\\?\") {
+            std::path::PathBuf::from(local)
+        } else {
+            directory
+        };
         let project_id = CString::new(project_id).map_err(|e| e.to_string())?;
         let guard = SESSION
             .try_lock()
@@ -53,7 +67,7 @@ impl Runtime {
         .map_err(|e| e.to_string())?;
         // Resolve every required symbol before initialization, so a partial
         // incompatible DLL never leaves an initialized process-global SDK.
-        let (init, shutdown, requirements) = unsafe {
+        let (init, shutdown, requirements, loaded, supported) = unsafe {
             (
                 *library
                     .get::<abi::Init>(b"slInit\0")
@@ -63,6 +77,12 @@ impl Runtime {
                     .map_err(|e| e.to_string())?,
                 *library
                     .get::<abi::GetRequirements>(b"slGetFeatureRequirements\0")
+                    .map_err(|e| e.to_string())?,
+                *library
+                    .get::<abi::IsLoaded>(b"slIsFeatureLoaded\0")
+                    .map_err(|e| e.to_string())?,
+                *library
+                    .get::<abi::IsSupported>(b"slIsFeatureSupported\0")
                     .map_err(|e| e.to_string())?,
             )
         };
@@ -100,12 +120,123 @@ impl Runtime {
         if result != 0 {
             return Err(format!("Streamline initialization failed ({result})"));
         }
+        let mut dlss_loaded = false;
+        // Safety: initialized SDK, valid writable bool and loaded function ABI.
+        let result = unsafe { loaded(0, &mut dlss_loaded) };
+        if result != 0 || !dlss_loaded {
+            unsafe {
+                shutdown();
+            }
+            return Err(format!("Streamline did not load DLSS ({result})"));
+        }
         Ok(Self {
             shutdown,
             requirements,
+            supported,
+            device: None,
+            instance: None,
+            directory,
             _library: library,
             _session: guard,
         })
+    }
+
+    /// Creates a Vulkan instance through Streamline's official interposer, so
+    /// its Vulkan extensions, hooks and presentation bookkeeping are installed.
+    /// Keep this runtime until GPU work is drained, then drop it before the instance.
+    pub fn create_instance(
+        &mut self,
+        desc: &wgpu::InstanceDescriptor,
+    ) -> Result<wgpu::Instance, String> {
+        if self.instance.is_some() {
+            return Err("Streamline instance already created".into());
+        }
+        if desc.backends != wgpu::Backends::VULKAN {
+            return Err("Streamline instance must use Vulkan exclusively".into());
+        }
+        // Safety: same explicitly loaded, official Vulkan interposer as slInit.
+        let entry = unsafe { ash::Entry::load_from(self.directory.join("sl.interposer.dll")) }
+            .map_err(|e| e.to_string())?;
+        let descriptor = wgpu::hal::InstanceDescriptor {
+            name: "Horizon",
+            flags: desc.flags,
+            memory_budget_thresholds: desc.memory_budget_thresholds,
+            backend_options: desc.backend_options.clone(),
+            telemetry: None,
+            display: None,
+        };
+        // Safety: interposer implements Vulkan loader ABI, and wgpu owns all
+        // instance/device handles. Streamline initialization preceded this call.
+        let native =
+            unsafe { wgpu::hal::vulkan::Instance::init_with_entry(&descriptor, entry, None) }
+                .map_err(|e| e.to_string())?;
+        let instance = unsafe { wgpu::Instance::from_hal::<wgpu::hal::api::Vulkan>(native) };
+        self.instance = Some(instance.clone());
+        Ok(instance)
+    }
+
+    /// Register a live device created through the interposed instance.
+    pub fn attach_device(&mut self, device: &wgpu::Device) -> Result<(), String> {
+        if self.device.is_some() {
+            return Err("Streamline device already registered".into());
+        }
+        let instance = self
+            .instance
+            .as_ref()
+            .ok_or("Streamline instance missing")?;
+        // Safety: read-only guards keep all native handles alive.
+        let (native, expected) = unsafe {
+            (
+                device.as_hal::<wgpu::hal::api::Vulkan>(),
+                instance.as_hal::<wgpu::hal::api::Vulkan>(),
+            )
+        };
+        let native = native.ok_or("Vulkan device missing")?;
+        let expected = expected.ok_or("Vulkan instance missing")?;
+        let instance = native.shared_instance().raw_instance().handle();
+        if instance != expected.shared_instance().raw_instance().handle() {
+            return Err("Device belongs to another Vulkan instance".into());
+        }
+        // vkCreateDevice came from the interposer: it already registered and
+        // initialized the device. slSetVulkanInfo is for manual hooking only.
+        self.device = Some(device.clone());
+        Ok(())
+    }
+
+    /// Checks the actual physical adapter before device creation. A successful
+    /// result still requires a correctly created Vulkan device and DLSS setup.
+    pub fn check_adapter(&self, adapter: &wgpu::Adapter) -> Result<(), String> {
+        use ash::vk::Handle;
+        let info = adapter.get_info();
+        if !crate::eligible(
+            info.backend == wgpu::Backend::Vulkan,
+            info.vendor,
+            &info.name,
+        ) {
+            return Err("DLSS requires Vulkan on an NVIDIA RTX adapter".into());
+        }
+        // Safety: read-only native access; the guard and adapter keep it alive.
+        let native = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }
+            .ok_or("Vulkan adapter unavailable")?;
+        let info = abi::AdapterInfo {
+            base: abi::Base::new(
+                0x0677315f,
+                0xa746,
+                0x4492,
+                [0x9f, 0x42, 0xcb, 0x61, 0x42, 0xc9, 0xc3, 0xd4],
+                1,
+            ),
+            luid: std::ptr::null(),
+            luid_size: 0,
+            physical_device: native.raw_physical_device().as_raw() as *mut std::ffi::c_void,
+        };
+        // Safety: matching SDK ABI, live physical device and initialized SDK.
+        let result = unsafe { (self.supported)(0, &info) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(format!("DLSS unsupported on this adapter ({result})"))
+        }
     }
 
     pub fn requirements(&self) -> Result<Requirements, String> {
@@ -158,6 +289,9 @@ fn names(values: *const *const std::ffi::c_char, count: u32) -> Result<Vec<Strin
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        if let Some(device) = &self.device {
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        }
         // Safety: exclusive process-global owner, library still loaded.
         unsafe {
             (self.shutdown)();
@@ -179,5 +313,36 @@ mod tests {
         assert!(Runtime::load(&directory, "invalid").is_err());
         assert!(Runtime::load(&directory, "00a6bdb2-6386-4e37-8ff9-dcda4642628a").is_err());
         assert!(valid_project_id("00a6bdb2-6386-4e37-8ff9-dcda4642628a"));
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly selected official NVIDIA SDK directory"]
+    fn official_sdk_reports_requirements() {
+        let path = std::env::var_os("HORIZON_STREAMLINE_SDK").expect("SDK path");
+        let mut runtime = Runtime::load(Path::new(&path), "00a6bdb2-6386-4e37-8ff9-dcda4642628a")
+            .expect("Streamline startup");
+        let requirements = runtime.requirements().expect("DLSS requirements");
+        println!("{requirements:?}");
+        assert!(!requirements.device_extensions.is_empty());
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::VULKAN;
+        let instance = runtime
+            .create_instance(&desc)
+            .expect("Streamline Vulkan instance");
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
+            .expect("Vulkan adapter");
+        println!("Adapter: {}", adapter.get_info().name);
+        runtime
+            .check_adapter(&adapter)
+            .expect("DLSS physical-adapter support");
+        let (device, _) = pollster::block_on(adapter.request_device(&Default::default()))
+            .expect("Interposed Vulkan device");
+        runtime
+            .attach_device(&device)
+            .expect("Streamline device registration");
+        runtime
+            .check_adapter(&adapter)
+            .expect("DLSS support after device registration");
+        drop(runtime);
     }
 }

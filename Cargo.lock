@@ -1425,7 +1425,10 @@ dependencies = [
 name = "horizon-streamline"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "libloading",
+ "pollster",
+ "wgpu",
 ]
 
 [[package]]

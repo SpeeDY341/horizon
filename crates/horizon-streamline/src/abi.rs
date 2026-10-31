@@ -131,6 +131,15 @@ impl Requirements {
 }
 pub type Init = unsafe extern "C" fn(*const Preferences, u64) -> i32;
 pub type Shutdown = unsafe extern "C" fn() -> i32;
+pub type IsLoaded = unsafe extern "C" fn(u32, *mut bool) -> i32;
+#[repr(C)]
+pub struct AdapterInfo {
+    pub base: Base,
+    pub luid: *const u8,
+    pub luid_size: u32,
+    pub physical_device: *mut c_void,
+}
+pub type IsSupported = unsafe extern "C" fn(u32, *const AdapterInfo) -> i32;
 pub type GetRequirements = unsafe extern "C" fn(u32, *mut Requirements) -> i32;
 pub const SDK_VERSION: u64 = (2u64 << 48) | (14u64 << 32) | (16u64 << 16) | 0xfedc;
 
