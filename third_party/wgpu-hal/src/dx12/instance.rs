@@ -123,6 +123,7 @@ impl crate::Instance for super::Instance {
             compiler_container: Arc::new(compiler_container),
             options: desc.backend_options.dx12.clone(),
             telemetry: desc.telemetry,
+            creation_hook: None,
         })
     }
 
@@ -154,6 +155,7 @@ impl crate::Instance for super::Instance {
                     supports_allow_tearing: self.supports_allow_tearing,
                     swap_chain: RwLock::new(None),
                     options: self.options.clone(),
+                    creation_hook: self.creation_hook.clone(),
                     hdr_source: Some(auxil::dxgi::hdr::DxgiHdrSource::new(handle)),
                 })
             }
@@ -182,6 +184,7 @@ impl crate::Instance for super::Instance {
                     self.compiler_container.clone(),
                     self.options.clone(),
                     self.telemetry,
+                    self.creation_hook.clone(),
                 )
             })
             .collect()

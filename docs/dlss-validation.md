@@ -5,6 +5,10 @@ compared with the original fork base `763528025d89cf575d7335e2a78d7fc48397d449`.
 This record distinguishes implemented behavior, automated evidence and hardware
 acceptance. The complete integration is **not yet accepted for release**.
 
+The repeat full review of `8b33c7954` found F1–F5. F1 now has a DX12
+creation integration and a native SDK regression; its fresh independent review
+is pending. Earlier per-part PASS results do not close the repeat review.
+
 ## Implementation and independent review
 
 Each author change was followed by a fresh reviewer. Failures were fixed by the
@@ -31,6 +35,28 @@ isolation evidence. R9 is addressed by the updated plan, graphics guide and this
 record, subject to the final independent review.
 
 ## Reproducing isolated Windows checks
+
+F1's explicit regression command is:
+
+```powershell
+cargo test --locked -p horizon-streamline --lib official_sdk_dx12_creation -- --ignored --test-threads=1 --nocapture
+```
+
+On the hardware below this passed two newly created chains, each resized
+800→960→800. It verifies real factory/queue/chain proxies using
+`slGetNativeInterface`, acquired HAL textures matching proxy GetBuffer and
+differing from native GetBuffer, clear/submit/Present, and complete teardown
+after dropping Runtime before the native owners. It runs with FG Off in a
+hidden native window: focused FG 2× and additional displayed frames remain
+unproven. No focus or signature guard was bypassed.
+
+The same F1 code passed 21 ordinary Streamline tests (7 explicitly ignored),
+4 explicit SDK tests including this creation regression and both APIs'
+support checks, 4 renderer lifecycle tests, targeted Windows check and
+renderer/Streamline lib/tests Clippy with warnings denied. Full pr_ready and
+Linux/macOS builds were not repeated for this change. Both real SR pixel
+readback tests also passed. DX12 Queue retains its native creating device for
+identity checks, since an SDK queue's GetDevice returns its proxy device.
 
 Use a current Rust toolchain, Python 3.10+ and official, compatible NVIDIA
 Streamline binaries. The locally tested combination was RTX 5090, driver 621.01,

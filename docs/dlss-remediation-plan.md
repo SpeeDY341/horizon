@@ -6,6 +6,11 @@ review после исправлений, включая review_g2 и review_h3 
 полная аппаратная lifecycle/визуальная приёмка и сборки Linux/macOS открыты.**
 Итоговые результаты и команды: [dlss-validation.md](dlss-validation.md).
 
+Повторный полный review `8b33c7954` открыл F1–F5. Для F1 добавлен
+creation path DX12 и настоящий SDK-тест буферов/resize/recreate; свежий
+независимый review исправления ещё требуется. Прежние PASS не означают
+полной приёмки интеграции; активная FG 2× остаётся недоказанной.
+
 Основание: review 30 коммитов `763528025..35123b73f` личного форка
 `SpeeDY341/horizon`, ветка `codex/dlss-stages-0-2`.
 Полный локальный отчёт находится в `.local/fork-review-2026-10-31.md`,
@@ -374,6 +379,36 @@ swapchain получает hook; стресс-проверка не зависа
   попытка следует явной политике восстановления без бесконечного спама логов.
 - [x] Проверить расстановку маркеров Reflex в коде относительно ввода, подготовки
   кадра, всех относящихся к нему submit и Present, включая отдельный server thread.
+
+### Повторное исправление F1 (1 ноября 2026, review pending)
+
+- Поздний `slUpgradeInterface(swapchain)` заменён instance-scoped HAL
+  интеграцией: factory proxy существует до создания surface, выбранный native
+  device регистрируется и получает proxy до CreateCommandQueue. Все поддержанные
+  CreateSwapChainForHwnd/Composition, GetBuffer, ResizeBuffers и Present проходят
+  через полученные proxy. IDXGIFactoryMedia surface handles явно отклоняются
+  при Streamline, поскольку SDK не предоставляет для них creation hook.
+- HAL сохраняет создающий proxy device: SDK command queue заимствует его
+  без AddRef. COM cast запрашивает точную версию интерфейса и освобождает
+  переданную SDK owned reference. При teardown SDK lease удерживает native
+  и proxy device до slShutdown, затем освобождает COM, DLL и global lease;
+  HAL также удерживает d3d12.dll. Цикла Runtime → device → Runtime нет.
+  Порядок shutdown Vulkan, Off/wait/reset/error guards и NVIDIA Off сохранены.
+- Новый явный `official_sdk_dx12_creation_buffers_resize_and_recreate`
+  прошёл на RTX 5090 / 621.01 / SDK 2.14.16.0: factory, queue и chain
+  подтверждены через slGetNativeInterface; acquired textures HAL равны
+  proxy GetBuffer и отличаются от native GetBuffer. Проверены два новых chain,
+  каждый 800→960→800, clear/submit/Present и полное освобождение SDK lease
+  после раннего drop Runtime. Это настоящий creation/Present тест с FG Off,
+  а не проверка focused FG 2× или дополнительного показанного кадра.
+- Windows: Streamline ordinary 21 passed / 7 ignored; explicit official SDK
+  4 passed; real SR pixel tests Vulkan/DX12 2 passed;
+  renderer surface_lifecycle 4 passed; targeted check и Clippy
+  renderer/Streamline lib/tests с `-D warnings` прошли. Full pr_ready,
+  Linux/macOS и активная оконная FG не выполнялись для F1.
+- MIT license и заголовки закреплённого SDK проверены до чтения источников;
+  перечень прочитанного добавлен в THIRD_PARTY_NOTICES.md. SDK, подготовленные
+  ресурсы и локальные логи не включаются в commit. F2–F5 этим этапом не закрыты.
 
 ### Результат кода E (31 октября 2026)
 

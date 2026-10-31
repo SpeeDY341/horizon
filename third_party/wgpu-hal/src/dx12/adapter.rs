@@ -72,6 +72,7 @@ impl super::Adapter {
         compiler_container: Arc<shader_compilation::CompilerContainer>,
         backend_options: wgt::Dx12BackendOptions,
         telemetry: Option<crate::Telemetry>,
+        creation_hook: Option<super::CreationHook>,
     ) -> Option<crate::ExposedAdapter<super::Api>> {
         let desc = unsafe { adapter.GetDesc2() }.unwrap();
         let driver_version = unsafe { adapter.CheckInterfaceSupport(&Dxgi::IDXGIDevice::IID) };
@@ -881,6 +882,7 @@ impl super::Adapter {
                 memory_budget_thresholds,
                 compiler_container,
                 options: backend_options,
+                creation_hook,
             },
             info,
             features,
@@ -1061,21 +1063,29 @@ impl crate::Adapter for super::Adapter {
         limits: &wgt::Limits,
         memory_hints: &wgt::MemoryHints,
     ) -> Result<crate::OpenDevice<super::Api>, crate::DeviceError> {
+        // Only the selected device is registered, before queue hooks initialize FG.
+        let queue_device = match &self.creation_hook {
+            Some(hook) => unsafe { hook.upgrade(&self.device, super::CreationInterface::Device) }
+                .map_err(|error| {
+                log::error!("Interposed device: {error}");
+                crate::DeviceError::Unexpected
+            })?,
+            None => self.device.clone(),
+        };
         let queue: Direct3D12::ID3D12CommandQueue = {
             profiling::scope!("ID3D12Device::CreateCommandQueue");
             unsafe {
-                self.device
-                    .CreateCommandQueue(&Direct3D12::D3D12_COMMAND_QUEUE_DESC {
-                        Type: Direct3D12::D3D12_COMMAND_LIST_TYPE_DIRECT,
-                        Priority: Direct3D12::D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
-                        Flags: Direct3D12::D3D12_COMMAND_QUEUE_FLAG_NONE,
-                        NodeMask: 0,
-                    })
+                queue_device.CreateCommandQueue(&Direct3D12::D3D12_COMMAND_QUEUE_DESC {
+                    Type: Direct3D12::D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    Priority: Direct3D12::D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
+                    Flags: Direct3D12::D3D12_COMMAND_QUEUE_FLAG_NONE,
+                    NodeMask: 0,
+                })
             }
             .into_device_result("Queue creation")?
         };
 
-        let device = super::Device::new(
+        let mut device = super::Device::new(
             self.raw.clone(),
             self.device.clone(),
             queue.clone(),
@@ -1089,6 +1099,8 @@ impl crate::Adapter for super::Adapter {
             self.compiler_container.clone(),
             self.options.clone(),
         )?;
+        device._queue_device = self.creation_hook.as_ref().map(|_| queue_device.clone());
+        device.creation_hook = self.creation_hook.clone();
         let idle_fence: Direct3D12::ID3D12Fence = unsafe {
             self.device
                 .CreateFence(0, Direct3D12::D3D12_FENCE_FLAG_NONE)
@@ -1099,6 +1111,9 @@ impl crate::Adapter for super::Adapter {
         Ok(crate::OpenDevice {
             device,
             queue: super::Queue {
+                native_device: self.device.clone(),
+                _queue_device: self.creation_hook.as_ref().map(|_| queue_device.clone()),
+                _creation_hook: self.creation_hook.clone(),
                 raw: queue,
                 temp_lists: Mutex::new(Vec::new()),
                 idle_fence,

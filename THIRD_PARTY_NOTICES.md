@@ -76,3 +76,10 @@ The original MIT notices are preserved at the top of each adapted file. No Nsigh
 was read or copied, and no NVIDIA runtime binaries are included.
 The named preference flag values in `abi.rs` follow
 [`include/sl_core_types.h`](https://github.com/NVIDIA-RTX/Streamline/blob/625db07d4bca5abc67d781c42af7e7fb0761f1b6/include/sl_core_types.h).
+
+The DX12 creation integration also consulted that commit's MIT-licensed
+`docs/ProgrammingGuideManualHooking.md`, `source/core/sl.api/sl.cpp`, and
+`source/core/sl.interposer/{dxgi/dxgiFactory.cpp,dxgi/dxgiSwapchain.cpp,d3d12/d3d12Device.cpp,d3d12/d3d12CommandQueue.cpp}`.
+Their license and file notices were checked before reading; no implementation
+code was copied. Factory/device proxy creation and native lifetime management
+in Horizon are original Rust integration code.

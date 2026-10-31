@@ -1,4 +1,7 @@
 use crate::abi;
+#[cfg(test)]
+#[path = "dx12_creation_tests.rs"]
+mod creation_tests;
 use std::{
     ffi::{CStr, CString},
     path::Path,
@@ -7,6 +10,35 @@ use std::{
 
 // Streamline is process-global. Initialization/shutdown must never overlap,
 // including two renderer startups or resource reloads.
+// HAL proxies may outlive Runtime during surface/device teardown. Shutdown and
+// unloading belong to the last native owner, never to Runtime alone.
+struct SdkLifetime {
+    shutdown: abi::Shutdown,
+    shutdown_pending: AtomicBool,
+    // slShutdown must precede destruction of the native D3D device, even when
+    // the last HAL owner is a proxy whose Release drops its own device ref.
+    native_device: std::sync::Mutex<Option<windows::Win32::Graphics::Direct3D12::ID3D12Device>>,
+    proxy_device: std::sync::Mutex<Option<windows::Win32::Graphics::Direct3D12::ID3D12Device>>,
+    // Drop native references before unloading proxy code; release the global
+    // lease last so a second SDK session cannot overlap final COM Release.
+    _library: std::sync::Arc<libloading::os::windows::Library>,
+    _lease: Lease,
+}
+impl SdkLifetime {
+    fn shutdown(&self) {
+        if self.shutdown_pending.swap(false, Ordering::AcqRel) {
+            unsafe {
+                (self.shutdown)();
+            }
+        }
+    }
+}
+impl Drop for SdkLifetime {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 static SESSION: AtomicBool = AtomicBool::new(false);
 struct Lease;
 impl Drop for Lease {
@@ -89,7 +121,6 @@ impl RenderFrame {
 /// draining GPU work and releasing that proxy, before device destruction.
 pub struct Runtime {
     api: Api,
-    shutdown: abi::Shutdown,
     requirements: abi::GetRequirements,
     supported: abi::IsSupported,
     set_d3d_device: abi::SetD3DDevice,
@@ -104,8 +135,8 @@ pub struct Runtime {
     reflex: crate::reflex::Session,
     framegen: crate::frame_gen::Session,
     dlss_requested: bool,
-    pub(crate) _library: libloading::os::windows::Library,
-    _session: Lease,
+    pub(crate) _library: std::sync::Arc<libloading::os::windows::Library>,
+    _session: std::sync::Arc<SdkLifetime>,
 }
 
 impl Runtime {
@@ -283,9 +314,17 @@ impl Runtime {
             let code = unsafe { loaded(1000, &mut loaded_fg) };
             framegen_ready = code == 0 && loaded_fg;
         }
+        let library = std::sync::Arc::new(library);
+        let session = std::sync::Arc::new(SdkLifetime {
+            shutdown,
+            shutdown_pending: AtomicBool::new(true),
+            _library: library.clone(),
+            _lease: guard,
+            native_device: Default::default(),
+            proxy_device: Default::default(),
+        });
         Ok(Self {
             api,
-            shutdown,
             requirements,
             supported,
             set_d3d_device,
@@ -300,7 +339,7 @@ impl Runtime {
             framegen: crate::frame_gen::Session::new(framegen_listed, framegen_ready),
             dlss_requested: dlss,
             _library: library,
-            _session: guard,
+            _session: session,
         })
     }
 
@@ -526,15 +565,64 @@ impl Runtime {
                     "Streamline DirectX 12 instance must use DirectX 12 exclusively".into(),
                 );
             }
-            // DirectX 12 does not use the display handle. wgpu creates the
-            // device itself; Streamline sees it through slSetD3DDevice.
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: desc.backends,
+            let sdk = self._session.clone();
+            let upgrade = self.upgrade_interface;
+            let register = self.set_d3d_device;
+            // The closure is retained by every HAL object owning a proxy. It
+            // captures the SDK lease, so neither shutdown nor unload can race
+            // the final COM Release, including renderer startup error paths.
+            let hook = unsafe {
+                wgpu::hal::dx12::CreationHook::new(move |native, kind| {
+                    let _keep_alive = &sdk;
+                    if kind == wgpu::hal::dx12::CreationInterface::Device {
+                        use windows::core::Interface;
+                        let mut owner = sdk
+                            .native_device
+                            .lock()
+                            .map_err(|_| "SDK device lock poisoned")?;
+                        if let Some(device) = owner.as_ref() {
+                            if device.as_raw() != native {
+                                return Err("Streamline device already registered".into());
+                            }
+                        } else {
+                            *owner = Some(windows::Win32::Graphics::Direct3D12::ID3D12Device::from_raw_borrowed(&native)
+                            .ok_or("DirectX 12 device missing")?.clone());
+                        }
+                        let code = register(native);
+                        if code != 0 {
+                            return Err(format!("Streamline device registration failed ({code})"));
+                        }
+                    }
+                    let proxy = upgrade_dx12_interface(native, upgrade)?;
+                    if kind == wgpu::hal::dx12::CreationInterface::Device {
+                        // Queue proxies borrow this object. Its final Release also
+                        // clears the SDK device; retain it until AFTER slShutdown.
+                        use windows::core::Interface;
+                        *sdk.proxy_device
+                            .lock()
+                            .map_err(|_| "SDK proxy lock poisoned")? = Some(
+                            windows::Win32::Graphics::Direct3D12::ID3D12Device::from_raw_borrowed(
+                                &proxy,
+                            )
+                            .ok_or("DirectX 12 proxy missing")?
+                            .clone(),
+                        );
+                    }
+                    Ok(proxy)
+                })
+            };
+            let descriptor = wgpu::hal::InstanceDescriptor {
+                name: "Horizon",
                 flags: desc.flags,
                 memory_budget_thresholds: desc.memory_budget_thresholds,
                 backend_options: desc.backend_options.clone(),
+                telemetry: None,
                 display: None,
-            });
+            };
+            let native =
+                unsafe { wgpu::hal::dx12::Instance::init_with_creation_hook(&descriptor, hook) }
+                    .map_err(|error| error.to_string())?;
+            let instance = unsafe { wgpu::Instance::from_hal::<wgpu::hal::api::Dx12>(native) };
             self.instance = Some(instance.clone());
             return Ok(instance);
         }
@@ -568,17 +656,20 @@ impl Runtime {
             return Err("Streamline device already registered".into());
         }
         if self.api == Api::Dx12 {
-            // Safety: the guard keeps the device alive. The pointer is the
-            // native ID3D12Device, which slSetD3DDevice copies from.
-            let ptr = unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }
-                .ok_or("DirectX 12 device missing")?
-                .raw_device_ptr();
-            if ptr.is_null() {
-                return Err("DirectX 12 device missing".into());
-            }
-            let result = unsafe { (self.set_d3d_device)(ptr) };
-            if result != 0 {
-                return Err(format!("Streamline device registration failed ({result})"));
+            // The selected device was registered by the HAL before its queue
+            // was created. Re-registering here would be too late for FG hooks.
+            use windows::core::Interface;
+            let hal = unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }
+                .ok_or("DirectX 12 device missing")?;
+            if !self
+                ._session
+                .native_device
+                .lock()
+                .map_err(|_| "SDK device lock poisoned")?
+                .as_ref()
+                .is_some_and(|native| native.as_raw() == hal.raw_device_ptr())
+            {
+                return Err("Device belongs to another DirectX 12 instance".into());
             }
             self.device = Some(device.clone());
             self.bind_features();
@@ -805,31 +896,21 @@ impl Runtime {
         )
     }
 
-    /// Install Streamline's DirectX 12 swapchain proxy so Present retires
-    /// frame tokens. No-op on Vulkan, where the interposer already does this.
-    /// Failure leaves the native swapchain in place.
+    /// Verify that configure used the interposed factory. Creation, GetBuffer,
+    /// ResizeBuffers and Present must use the same chain; a late upgrade cannot
+    /// reconstruct missed creation hooks or replace already cached back buffers.
     pub fn note_dx12_swapchain(&mut self, surface: &wgpu::Surface) -> Result<(), String> {
         if self.api != Api::Dx12 {
             return Ok(());
         }
-        let upgrade = self.upgrade_interface;
         let result = (|| {
-            // Safety: the guard and HAL's exclusive swapchain lock keep the
-            // native interface alive. HAL remembers successful upgrades on the
-            // owned chain itself, preserving that state across ResizeBuffers.
             let hal = unsafe { surface.as_hal::<wgpu::hal::api::Dx12>() }
                 .ok_or("DirectX 12 surface missing")?;
-            let mut error = "DX12 swapchain missing".to_owned();
-            let ok = unsafe {
-                hal.upgrade_swap_chain(|native| match upgrade_dx12_interface(native, upgrade) {
-                    Ok(proxy) => proxy,
-                    Err(reason) => {
-                        error = reason;
-                        std::ptr::null_mut()
-                    }
-                })
-            };
-            if ok { Ok(()) } else { Err(error) }
+            if hal.presentation_interposed() {
+                Ok(())
+            } else {
+                Err("DX12 swapchain was not created through Streamline".to_owned())
+            }
         })();
         let result = self.presentation.update(result);
         if result.is_err() {
@@ -877,7 +958,7 @@ impl Presentation {
     }
 }
 
-// Safety: called only under the HAL chain's exclusive lock. Success transfers
+// Safety: called while the borrowed native COM interface is alive. Success transfers
 // the SDK's owned proxy reference to HAL; failure transfers no ownership.
 unsafe fn upgrade_dx12_interface(
     native: *mut std::ffi::c_void,
@@ -970,9 +1051,10 @@ impl Drop for Runtime {
         if let Some(device) = &self.device {
             let _ = device.poll(wgpu::PollType::wait_indefinitely());
         }
-        // Safety: exclusive process-global owner, library still loaded.
-        unsafe {
-            (self.shutdown)();
+        // Vulkan has no COM owners: retain its original shutdown-before-device
+        // ordering. DX12 defers until HAL proxy owners release their SDK leases.
+        if self.api == Api::Vulkan {
+            self._session.shutdown();
         }
     }
 }

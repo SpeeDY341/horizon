@@ -85,6 +85,8 @@ mod descriptor;
 mod device;
 mod device_creation;
 mod instance;
+mod interposer;
+pub use interposer::{CreationHook, CreationInterface};
 mod pipeline_desc;
 mod sampler;
 mod shader_compilation;
@@ -540,6 +542,7 @@ pub struct Instance {
     compiler_container: Arc<shader_compilation::CompilerContainer>,
     options: wgt::Dx12BackendOptions,
     telemetry: Option<crate::Telemetry>,
+    creation_hook: Option<CreationHook>,
 }
 
 impl Instance {
@@ -559,6 +562,7 @@ impl Instance {
             swap_chain: RwLock::new(None),
             options: self.options.clone(),
             hdr_source: None,
+            creation_hook: self.creation_hook.clone(),
         }
     }
 
@@ -578,6 +582,7 @@ impl Instance {
             swap_chain: RwLock::new(None),
             options: self.options.clone(),
             hdr_source: None,
+            creation_hook: self.creation_hook.clone(),
         }
     }
 
@@ -596,6 +601,7 @@ impl Instance {
             swap_chain: RwLock::new(None),
             options: self.options.clone(),
             hdr_source: None,
+            creation_hook: self.creation_hook.clone(),
         }
     }
 }
@@ -643,6 +649,7 @@ pub struct Surface {
     /// HDR-info source for HWND-backed targets; `None` for composition /
     /// SwapChainPanel / surface-handle targets, which have no monitor identity.
     hdr_source: Option<auxil::dxgi::hdr::DxgiHdrSource>,
+    creation_hook: Option<CreationHook>,
 }
 
 unsafe impl Send for Surface {}
@@ -653,100 +660,18 @@ impl Surface {
         Some(self.swap_chain.read().as_ref()?.raw.clone())
     }
 
-    /// Replace the stored swap chain with a proxy, for Streamline manual hooking.
-    ///
-    /// `upgrade` receives the current `IDXGISwapChain3` pointer. It returns that
-    /// same pointer, null on failure, or a new `IDXGISwapChain3`/`IDXGISwapChain4`
-    /// the caller owns (one reference). Streamline's proxy AddRefs the native
-    /// chain, so dropping the previous pointer leaves the proxy's reference.
-    ///
-    /// # Safety
-    /// A different non-null pointer must be an `IDXGISwapChain3` with exactly
-    /// one owned reference.
-    pub unsafe fn upgrade_swap_chain(
-        &self,
-        upgrade: impl FnOnce(*mut ffi::c_void) -> *mut ffi::c_void,
-    ) -> bool {
-        let mut guard = self.swap_chain.write();
-        let Some(chain) = guard.as_mut() else {
-            return false;
-        };
-        let native = chain.raw.as_raw();
-        let proxy = upgrade_swap_chain_pointer(&mut chain.proxy_installed, native, upgrade);
-        if proxy.is_null() {
-            return false;
-        }
-        if proxy != native {
-            chain.raw = unsafe { Dxgi::IDXGISwapChain3::from_raw(proxy) };
-        }
-        true
+    /// True only when creation went through the instance's interposed factory.
+    pub fn presentation_interposed(&self) -> bool {
+        self.swap_chain
+            .read()
+            .as_ref()
+            .is_some_and(|chain| chain.proxy_installed)
     }
 
     /// Returns the waitable handle associated with this swap chain, if any.
     /// Handle is only valid while the swap chain is alive.
     pub unsafe fn waitable_handle(&self) -> Option<Foundation::HANDLE> {
         self.swap_chain.read().as_ref()?.waitable
-    }
-}
-
-// No pointer cache: a freshly created chain starts false even if COM reuses a
-// destroyed proxy's address. A ResizeBuffers keeps this same owned chain true.
-fn upgrade_swap_chain_pointer(
-    installed: &mut bool,
-    native: *mut ffi::c_void,
-    upgrade: impl FnOnce(*mut ffi::c_void) -> *mut ffi::c_void,
-) -> *mut ffi::c_void {
-    if *installed {
-        return native;
-    }
-    let proxy = upgrade(native);
-    *installed = !proxy.is_null();
-    proxy
-}
-
-#[cfg(test)]
-mod proxy_tests {
-    use super::upgrade_swap_chain_pointer;
-    use core::ffi::c_void;
-
-    #[test]
-    fn failure_preserves_native_and_retry_then_resize_is_idempotent() {
-        let native = core::ptr::dangling_mut::<c_void>();
-        let proxy = 2usize as *mut c_void;
-        let mut installed = false;
-        assert!(
-            upgrade_swap_chain_pointer(&mut installed, native, |_| core::ptr::null_mut()).is_null()
-        );
-        assert!(!installed);
-        assert_eq!(
-            upgrade_swap_chain_pointer(&mut installed, native, |p| {
-                assert_eq!(p, native);
-                proxy
-            }),
-            proxy
-        );
-        assert!(installed);
-        assert_eq!(
-            upgrade_swap_chain_pointer(&mut installed, proxy, |_| panic!(
-                "live proxy upgraded twice"
-            )),
-            proxy
-        );
-    }
-
-    #[test]
-    fn new_chain_at_recycled_address_must_still_be_upgraded() {
-        let recycled = 2usize as *mut c_void;
-        let new_proxy = 3usize as *mut c_void;
-        let mut installed = false; // newly constructed SwapChain
-        assert_eq!(
-            upgrade_swap_chain_pointer(&mut installed, recycled, |p| {
-                assert_eq!(p, recycled);
-                new_proxy
-            }),
-            new_proxy
-        );
-        assert!(installed);
     }
 }
 
@@ -801,6 +726,7 @@ pub struct Adapter {
     memory_budget_thresholds: wgt::MemoryBudgetThresholds,
     compiler_container: Arc<shader_compilation::CompilerContainer>,
     options: wgt::Dx12BackendOptions,
+    creation_hook: Option<CreationHook>,
 }
 
 unsafe impl Send for Adapter {}
@@ -885,6 +811,8 @@ pub struct Device {
     shader_cache: Mutex<ShaderCache>,
     counters: Arc<wgt::HalCounters>,
     limits: wgt::Limits,
+    _queue_device: Option<Direct3D12::ID3D12Device>,
+    creation_hook: Option<CreationHook>,
 }
 
 impl Drop for Device {
@@ -906,12 +834,16 @@ unsafe impl Sync for Device {}
 
 pub struct Queue {
     raw: Direct3D12::ID3D12CommandQueue,
+    native_device: Direct3D12::ID3D12Device,
     temp_lists: Mutex<Vec<Option<Direct3D12::ID3D12CommandList>>>,
     idle_fence: Direct3D12::ID3D12Fence,
     idle_event: Event,
     idle_fence_value: AtomicU64,
     pending_waits: Mutex<Vec<(Direct3D12::ID3D12Fence, u64)>>,
     pending_signals: Mutex<Vec<(Direct3D12::ID3D12Fence, u64)>>,
+    // Streamline queues borrow their creating proxy device (no AddRef).
+    _queue_device: Option<Direct3D12::ID3D12Device>,
+    _creation_hook: Option<CreationHook>,
 }
 
 impl Queue {
@@ -921,14 +853,9 @@ impl Queue {
 
     /// Device that created this queue. Null if the device cannot be queried.
     pub fn raw_device_ptr(&self) -> *mut ffi::c_void {
-        let mut device: Option<Direct3D12::ID3D12Device> = None;
-        if unsafe { self.raw.GetDevice(&mut device) }.is_err() {
-            return core::ptr::null_mut();
-        }
-        device
-            .as_ref()
-            .map(|device| device.as_raw())
-            .unwrap_or(core::ptr::null_mut())
+        // An interposed queue's GetDevice returns its proxy device. Resource
+        // identity/tagging uses the native device, as it did before interception.
+        self.native_device.as_raw()
     }
 
     /// Stage a `ID3D12CommandQueue::Wait(fence, value)` for the next
@@ -1625,7 +1552,7 @@ impl crate::Surface for Surface {
         // For high latency extra buffers seems excessive, so go with a minimum of 3 and beyond that add 1.
         let swap_chain_buffer = (config.maximum_frame_latency + 1).min(16);
 
-        let mut proxy_installed = false;
+        let mut proxy_installed = self.creation_hook.is_some();
         let swap_chain = match self.swap_chain.write().take() {
             //Note: this path doesn't properly re-initialize all of the things
             Some(sc) => {
@@ -1679,6 +1606,12 @@ impl crate::Surface for Surface {
                         }
                     }
                     SurfaceTarget::SurfaceHandle(handle) => {
+                        // Streamline has no IDXGIFactoryMedia creation hook.
+                        if self.creation_hook.is_some() {
+                            return Err(crate::SurfaceError::Other(
+                                "interposed surface handles unsupported",
+                            ));
+                        }
                         profiling::scope!(
                             "IDXGIFactoryMedia::CreateSwapChainForCompositionSurfaceHandle"
                         );

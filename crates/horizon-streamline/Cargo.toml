@@ -12,6 +12,10 @@ ash = { version = "0.38", default-features = false, features = ["loaded"] }
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "vulkan", "dx12", "wgsl"] }
 
 pollster = "0.4"
+windows = { version = "0.62.2", features = ["Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows = { version = "0.62.2", features = ["Win32_UI_WindowsAndMessaging"] }
 
 [lints]
 workspace = true
