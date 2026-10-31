@@ -62,9 +62,15 @@ and its logo are trademarks of the Microsoft group of companies; Horizon is not 
 
 ## NVIDIA Streamline public interface
 
-`crates/horizon-streamline/src/{abi,dlss_abi}.rs` translate selected declarations from the
+`crates/horizon-streamline/src/{abi,dlss_abi,reflex,frame_gen}.rs` translate selected declarations from the
 MIT-licensed public headers of NVIDIA Streamline 2.14.16, commit
 [625db07d4bca5abc67d781c42af7e7fb0761f1b6](https://github.com/NVIDIA-RTX/Streamline/tree/625db07d4bca5abc67d781c42af7e7fb0761f1b6).
-Copyright (c) 2022-2024 NVIDIA CORPORATION. All rights reserved.
-The MIT notice is preserved at the top of that file. No Nsight Perf or NGX source
+The Reflex ABI, report offsets, GUIDs and PCL markers in `reflex.rs` follow
+[`include/sl_reflex.h`](https://github.com/NVIDIA-RTX/Streamline/blob/625db07d4bca5abc67d781c42af7e7fb0761f1b6/include/sl_reflex.h)
+and [`include/sl_pcl.h`](https://github.com/NVIDIA-RTX/Streamline/blob/625db07d4bca5abc67d781c42af7e7fb0761f1b6/include/sl_pcl.h).
+The DLSS-G options, state, GUIDs and enums in `frame_gen.rs` follow
+[`include/sl_dlss_g.h`](https://github.com/NVIDIA-RTX/Streamline/blob/625db07d4bca5abc67d781c42af7e7fb0761f1b6/include/sl_dlss_g.h).
+Copyright (c) 2022-2024 NVIDIA CORPORATION (core/DLSS), 2022-2023 (Reflex/DLSS-G)
+and 2023 (PCL). All rights reserved.
+The original MIT notices are preserved at the top of each adapted file. No Nsight Perf or NGX source
 was read or copied, and no NVIDIA runtime binaries are included.

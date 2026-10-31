@@ -1,6 +1,16 @@
 # Developer test launcher: explicitly opts into DLSS in a fresh disposable home.
-param([switch]$Smoke)
+param(
+    [switch]$Smoke,
+    # Explicitly carry only graphics settings into a fresh run (for API restart).
+    [string]$GraphicsSettingsFrom
+)
 $ErrorActionPreference = 'Stop'
+if ($GraphicsSettingsFrom) {
+    $GraphicsSettingsFrom = (Resolve-Path -LiteralPath $GraphicsSettingsFrom).Path
+    if (!(Test-Path -LiteralPath $GraphicsSettingsFrom -PathType Leaf)) {
+        throw 'GraphicsSettingsFrom must name a graphics settings file.'
+    }
+}
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $game = Join-Path $root 'target/fast/horizon-client.exe'
 $sdk = Join-Path $root '.local/dlss/native'
@@ -18,8 +28,8 @@ if (!(Test-Path (Join-Path $resources 'horizon-resources.json'))) {
         } | Select-Object -First 1
 }
 if (!$resources) { throw 'Prepare Minecraft 26.3 once in the Horizon launcher, then run this test again.' }
-$scratch = Join-Path ([System.IO.Path]::GetTempPath()) 'horizon-dlss-test'
-New-Item -ItemType Directory -Force $scratch | Out-Null
+$scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('horizon-dlss-test-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory $scratch | Out-Null
 $env:HORIZON_HOME = Join-Path $scratch 'home'
 $env:HORIZON_LAUNCHER_HOME = Join-Path $scratch 'launcher'
 $env:XDG_DATA_HOME = Join-Path $scratch 'data'
@@ -29,20 +39,25 @@ $env:HORIZON_NO_AUDIO = '1'
 $env:HORIZON_LAUNCHER_TRASH = Join-Path $scratch 'trash'
 $env:HORIZON_LAUNCHER_CLIPBOARD = Join-Path $scratch 'clipboard'
 $env:HORIZON_LAUNCHER_DESKTOP = Join-Path $scratch 'desktop'
+foreach ($directory in @('home','launcher','data','config','trash','desktop')) {
+    New-Item -ItemType Directory (Join-Path $scratch $directory) | Out-Null
+}
 $env:HORIZON_STREAMLINE_SDK = $sdk
 Remove-Item Env:HORIZON_DLSS_FORCE_ERROR -ErrorAction SilentlyContinue
 Remove-Item Env:HORIZON_GRAPHICS_API -ErrorAction SilentlyContinue
 $graphics = Join-Path $scratch 'horizon-graphics.txt'
-if (!(Test-Path $graphics)) {
+if ($GraphicsSettingsFrom) {
+    Copy-Item -LiteralPath $GraphicsSettingsFrom -Destination $graphics
+} else {
     "graphicsApi:vulkan`ndlss:quality`nfxaa:false`ntaa:false`nupscaling:quality`noverlay:fps`nhdr:false`n" |
         Set-Content $graphics -Encoding ASCII
 }
 $options = Join-Path $scratch 'options.txt'
-if (!(Test-Path $options)) {
-    "renderDistance:8`nmaxFps:120`nguiScale:2`n" | Set-Content $options -Encoding ASCII
-}
+"renderDistance:8`nmaxFps:120`nguiScale:2`n" | Set-Content $options -Encoding ASCII
 Write-Host 'DLSS test. Sound is off. The game opens on the title screen.'
-Write-Host 'Settings in this folder are kept between launches.'
+Write-Host 'Each launch uses a fresh folder, world and logs.'
+Write-Host 'To carry graphics settings after an API change, restart with:'
+Write-Host ('  tools\Play-DLSS-Test.cmd -GraphicsSettingsFrom "' + $graphics + '"')
 Write-Host 'Options, Horizon Settings, Advanced Graphics: Anti-aliasing, Upscaler, Quality.'
 Write-Host 'Graphics API applies on the next launch. DLSS runs on Vulkan and DirectX 12.'
 Write-Host ('Test files and log: ' + $scratch)
