@@ -41,16 +41,21 @@ $options = Join-Path $scratch 'options.txt'
 if (!(Test-Path $options)) {
     "renderDistance:8`nmaxFps:120`nguiScale:2`n" | Set-Content $options -Encoding ASCII
 }
-Write-Host 'DLSS test world. Sound is off. Settings in this folder are kept between launches.'
-Write-Host 'Esc, Options, Horizon Settings, Advanced Graphics: Anti-aliasing, Upscaler, Quality.'
+Write-Host 'DLSS test. Sound is off. The game opens on the title screen.'
+Write-Host 'Settings in this folder are kept between launches.'
+Write-Host 'Options, Horizon Settings, Advanced Graphics: Anti-aliasing, Upscaler, Quality.'
 Write-Host 'Graphics API applies on the next launch. DLSS runs on Vulkan and DirectX 12.'
 Write-Host ('Test files and log: ' + $scratch)
 Push-Location $root
 try {
     $arguments = @('--resources',$resources,'--game-dir',$scratch,'--home',$env:HORIZON_HOME,
-        '--world','DLSS-Test','--test-terrain','--creative','--render-distance','8',
         '--width','1280','--height','720')
-    if ($Smoke) { $arguments += @('--world-frames','60','--smoke-report',(Join-Path $scratch 'report.json')) }
+    if ($Smoke) {
+        $arguments += @(
+            '--world','DLSS-Test','--test-terrain','--creative','--render-distance','8',
+            '--world-frames','60','--smoke-report',(Join-Path $scratch 'report.json')
+        )
+    }
     # Windows PowerShell 5.1 treats redirected native stderr as ErrorRecords.
     # Keep normal game logging out of PowerShell's terminating-error pipeline.
     # These arguments contain paths (which cannot contain quotes on Windows).
