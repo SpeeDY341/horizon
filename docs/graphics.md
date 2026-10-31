@@ -60,6 +60,8 @@ Anti-aliasing, the upscaler and that quality stay on the screen together. The up
 
 Reflex (`reflex` in the same file) is Off, On, or On + Boost. It is off by default, runs on that same Windows Vulkan and DirectX 12 path, leaves the frame cap where it is, and needs one restart the first time it is turned on. The performance overlay then shows the latency the library reports; zero means the frame markers are wrong.
 
+Frame Generation (`framegen` in the same file) is Off, 2x, 3x, 4x or 6x. It is off by default. Turning it on turns Reflex on; turning it off leaves Reflex. It runs on that same Windows Vulkan and DirectX 12 path and needs one restart the first time it is turned on. The overlay keeps the real frame rate and adds how many frames were shown. The HUD and the hand are still in the picture that gets generated, so they can smear. A menu, HDR, a shader pack, the title screen, a lost window or a resize shows the real frame for that present.
+
 Not implemented: anisotropic filtering (wgpu needs linear magnification for it, which blurs close blocks), MSAA (FXAA or TAA instead) and exclusive fullscreen (fullscreen is borderless).
 
 ## Benchmark

@@ -470,6 +470,67 @@ impl Reflex {
             .unwrap_or_default()
     }
 }
+
+/// DLSS Frame Generation. Off until the player turns it on. The first On needs
+/// a restart, because the plugin loads with the device. Turning it on turns
+/// Reflex on. Turning it off leaves Reflex where it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FrameGen {
+    #[default]
+    Off,
+    /// One generated frame per real frame.
+    X2,
+    X3,
+    X4,
+    X6,
+}
+impl FrameGen {
+    pub const ALL: [Self; 5] = [Self::Off, Self::X2, Self::X3, Self::X4, Self::X6];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::X2 => "2x",
+            Self::X3 => "3x",
+            Self::X4 => "4x",
+            Self::X6 => "6x",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::X2 => "2x",
+            Self::X3 => "3x",
+            Self::X4 => "4x",
+            Self::X6 => "6x",
+        }
+    }
+    /// Extra frames between real ones. 2× is 1. Zero is off.
+    pub fn generated(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::X2 => 1,
+            Self::X3 => 2,
+            Self::X4 => 3,
+            Self::X6 => 5,
+        }
+    }
+    /// Generated frames the driver can accept. `max` is that cap, and it is
+    /// treated as 1 until the driver reports a higher one.
+    pub fn clamp_generated(self, max: u32) -> u32 {
+        let wanted = self.generated();
+        if wanted == 0 {
+            0
+        } else {
+            wanted.min(max.max(1))
+        }
+    }
+    fn parse(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|v| v.name() == s)
+            .unwrap_or_default()
+    }
+}
 static DLSS_STATUS: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 pub fn report_dlss(status: impl Into<String>) {
     *DLSS_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = status.into();
@@ -490,6 +551,20 @@ pub fn report_reflex(line: impl Into<String>) {
 }
 pub fn reflex_overlay_line() -> Option<String> {
     let line = REFLEX_LINE.lock().unwrap_or_else(|e| e.into_inner());
+    if line.is_empty() {
+        None
+    } else {
+        Some(line.clone())
+    }
+}
+
+static FRAMEGEN_LINE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// The frame-generation line for the performance overlay. Empty hides it.
+pub fn report_framegen(line: impl Into<String>) {
+    *FRAMEGEN_LINE.lock().unwrap_or_else(|e| e.into_inner()) = line.into();
+}
+pub fn framegen_overlay_line() -> Option<String> {
+    let line = FRAMEGEN_LINE.lock().unwrap_or_else(|e| e.into_inner());
     if line.is_empty() {
         None
     } else {
@@ -583,6 +658,9 @@ pub struct Graphics {
     pub dlss_monitor: bool,
     /// Reflex low latency. Off until chosen. The first On needs a restart.
     pub reflex: Reflex,
+    /// Frame generation. Off until chosen. The first On needs a restart and
+    /// turns Reflex on.
+    pub framegen: FrameGen,
     /// HDR output (HDR10, or scRGB), where the display path offers it.
     pub hdr: bool,
     /// HDR paper white (where SDR white sits), in nits; 0 is Auto: the desktop's SDR
@@ -637,6 +715,7 @@ impl Default for Graphics {
             dlss_preset: DlssPreset::Auto,
             dlss_monitor: false,
             reflex: Reflex::Off,
+            framegen: FrameGen::Off,
             hdr: false,
             hdr_paper_white: 0,
             hdr_peak: 0,
@@ -721,6 +800,7 @@ impl Graphics {
                 "dlssPreset" => g.dlss_preset = DlssPreset::parse(value),
                 "dlssMonitor" => g.dlss_monitor = flag(g.dlss_monitor),
                 "reflex" => g.reflex = Reflex::parse(value),
+                "framegen" => g.framegen = FrameGen::parse(value),
                 "hdr" => g.hdr = flag(g.hdr),
                 "hdrPaperWhite" => {
                     g.hdr_paper_white = match number(g.hdr_paper_white) {
@@ -774,6 +854,11 @@ impl Graphics {
             }
         }
         g.dlss = g.dlss_mode();
+        // A hand-edited file can ask for frames without Reflex. The driver
+        // rejects that, so the saved mode and the SDK both start with Reflex on.
+        if g.framegen != FrameGen::Off && g.reflex == Reflex::Off {
+            g.reflex = Reflex::On;
+        }
         g
     }
     /// DLAA or DLSS is selected, so FXAA and TAA stay off.
@@ -832,7 +917,7 @@ impl Graphics {
     }
     pub fn serialize(&self) -> String {
         format!(
-            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nupscaler:{}\ndlss:{}\ndlssPreset:{}\ndlssMonitor:{}\nreflex:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrKey:{}\nbatteryMode:{}\ngraphicsApi:{}\npickedShaderPack:{}\n",
+            "preset:{}\nlodDistance:{}\nfarDetail:{}\ncaveCulling:{}\nentityCulling:{}\nchunkUpdates:{}\nuploadBudgetKiB:{}\nsky:{}\nfog:{}\nweather:{}\nanimatedTextures:{}\npresentMode:{}\nframePacing:{}\nworkers:{}\noverlay:{}\nresolutionScale:{}\nfxaa:{}\ntaa:{}\nupscaling:{}\nupscaler:{}\ndlss:{}\ndlssPreset:{}\ndlssMonitor:{}\nreflex:{}\nframegen:{}\nhdr:{}\nhdrPaperWhite:{}\nhdrPeak:{}\nhdrBlackLevel:{}\nhdrUiBrightness:{}\nhdrKey:{}\nbatteryMode:{}\ngraphicsApi:{}\npickedShaderPack:{}\n",
             self.preset.name(),
             self.lod_distance,
             self.far_detail.name(),
@@ -864,6 +949,7 @@ impl Graphics {
             self.dlss_preset.name(),
             bool_text(self.dlss_monitor),
             self.reflex.name(),
+            self.framegen.name(),
             bool_text(self.hdr),
             self.hdr_paper_white,
             self.hdr_peak,
@@ -1013,6 +1099,7 @@ mod tests {
             dlss_preset: DlssPreset::M,
             dlss_monitor: true,
             reflex: Reflex::Boost,
+            framegen: FrameGen::X4,
             hdr: true,
             hdr_paper_white: 240,
             hdr_peak: 1400,
@@ -1057,6 +1144,17 @@ mod tests {
         assert_eq!(Graphics::parse("reflex:boost\n").reflex, Reflex::Boost);
         assert_eq!(Graphics::parse("reflex:on\n").reflex, Reflex::On);
         assert_eq!(Graphics::parse("reflex:nope\n").reflex, Reflex::Off);
+        assert_eq!(Graphics::parse("framegen:4x\n").framegen, FrameGen::X4);
+        assert_eq!(Graphics::parse("framegen:4x\n").reflex, Reflex::On);
+        assert_eq!(
+            Graphics::parse("framegen:6x\nreflex:boost\n").reflex,
+            Reflex::Boost
+        );
+        assert_eq!(Graphics::parse("framegen:nope\n").framegen, FrameGen::Off);
+        assert_eq!(FrameGen::X6.clamp_generated(1), 1);
+        assert_eq!(FrameGen::X6.clamp_generated(5), 5);
+        assert_eq!(FrameGen::X4.clamp_generated(0), 1);
+        assert_eq!(FrameGen::Off.clamp_generated(5), 0);
         let mut chosen = Graphics::default();
         chosen.set_upscaler(Upscaler::Off);
         chosen.set_upscale_quality(Upscaling::Quality);

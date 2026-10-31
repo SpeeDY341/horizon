@@ -3,8 +3,8 @@
 //! input. How they look comes from `graphics_style`.
 use crate::{
     graphics::{
-        DlssPreset, FarDetail, GraphicsApi, Overlay, Pacing, PresentMode, Preset, Reflex, Upscaler,
-        Upscaling,
+        DlssPreset, FarDetail, FrameGen, GraphicsApi, Overlay, Pacing, PresentMode, Preset, Reflex,
+        Upscaler, Upscaling,
     },
     graphics_style::{Cost, STYLE},
     hud::{HudAtlas, HudBatch},
@@ -52,6 +52,7 @@ pub enum H {
     DlssRender,
     DlssMonitor,
     Reflex,
+    FrameGen,
     Hdr,
     /// Opens `Level::Hdr`.
     HdrSettings,
@@ -325,6 +326,11 @@ pub fn rows(level: Level) -> Vec<Row> {
                 "Lowers latency. Boost may cost frames. FPS cap stays. Restart once.",
             ),
             h(
+                H::FrameGen,
+                Low,
+                "Generated frames. Turns Reflex on. Real frames stay the simulation.",
+            ),
+            h(
                 H::HdrSettings,
                 None,
                 "HDR output on an HDR display: lava, fire and sunlight shine brighter.",
@@ -533,6 +539,7 @@ impl H {
             }
             H::DlssMonitor => labelled("DLSS Monitor", on_off(g.dlss_monitor)),
             H::Reflex => labelled("Reflex", g.reflex.label()),
+            H::FrameGen => labelled("Frame Generation", g.framegen.label()),
             H::Hdr => labelled("HDR", on_off(g.hdr)),
             H::HdrSettings => Text::literal(lang::get("HDR Settings...")),
             H::HdrPaperWhite => match g.hdr_paper_white {
@@ -655,7 +662,24 @@ impl H {
             | H::DlssRender => {}
             H::DlssPreset => g.dlss_preset = step(&DlssPreset::ALL, g.dlss_preset, back),
             H::DlssMonitor => g.dlss_monitor = !g.dlss_monitor,
-            H::Reflex => g.reflex = step(&Reflex::ALL, g.reflex, back),
+            H::Reflex => {
+                let previous = g.reflex;
+                g.reflex = step(&Reflex::ALL, g.reflex, back);
+                // Frame Generation rejects Reflex Off. Boost stays Boost.
+                if g.framegen != FrameGen::Off && g.reflex == Reflex::Off {
+                    g.reflex = if previous == Reflex::Boost {
+                        Reflex::Boost
+                    } else {
+                        Reflex::On
+                    };
+                }
+            }
+            H::FrameGen => {
+                g.framegen = step(&FrameGen::ALL, g.framegen, back);
+                if g.framegen != FrameGen::Off && g.reflex == Reflex::Off {
+                    g.reflex = Reflex::On;
+                }
+            }
             H::Hdr => g.hdr = !g.hdr,
             H::BatteryMode => g.battery = !g.battery,
             H::GraphicsApi => g.api = step(GraphicsApi::choices(), g.api, back),
@@ -783,6 +807,7 @@ impl Item {
                     | H::DlssRender
                     | H::DlssMonitor
                     | H::Reflex
+                    | H::FrameGen
             ) | Item::Vanilla(
                 Opt::GuiScale
                     | Opt::Fullscreen
@@ -1433,6 +1458,37 @@ mod tests {
         assert_eq!(s.horizon.dlss, Dlss::Off);
         assert!(s.horizon.taa);
         assert_eq!(aa.label(&s).plain(), "Anti-aliasing: TAA");
+    }
+
+    #[test]
+    fn frame_generation_turns_reflex_on_and_keeps_it() {
+        let mut s = Settings::default();
+        let framegen = Item::Horizon(H::FrameGen);
+        let reflex = Item::Horizon(H::Reflex);
+        assert_eq!(framegen.label(&s).plain(), "Frame Generation: Off");
+        assert!(
+            rows(Level::Advanced)
+                .iter()
+                .any(|row| { matches!(row, Row::Setting(setting) if setting.item == framegen) })
+        );
+        assert!(
+            !rows(Level::Simple)
+                .iter()
+                .any(|row| { matches!(row, Row::Setting(setting) if setting.item == framegen) })
+        );
+        framegen.cycle(&mut s, false, [1280, 720]);
+        assert_eq!(s.horizon.framegen, FrameGen::X2);
+        assert_eq!(s.horizon.reflex, Reflex::On);
+        reflex.cycle(&mut s, true, [1280, 720]);
+        assert_eq!(s.horizon.reflex, Reflex::On);
+        reflex.cycle(&mut s, false, [1280, 720]);
+        assert_eq!(s.horizon.reflex, Reflex::Boost);
+        reflex.cycle(&mut s, false, [1280, 720]);
+        assert_eq!(s.horizon.reflex, Reflex::Boost);
+        framegen.cycle(&mut s, true, [1280, 720]);
+        assert_eq!(s.horizon.framegen, FrameGen::Off);
+        assert_eq!(s.horizon.reflex, Reflex::Boost);
+        assert_eq!(s.horizon.preset, Preset::default());
     }
 
     #[test]
